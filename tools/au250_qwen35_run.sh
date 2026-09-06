@@ -12,6 +12,20 @@ cuda_compat_dir="${qwen_build_root}/cuda-compat"
 cuda_compat_math_header="${cuda_compat_dir}/math_functions.h"
 source /au250_xrt/env.sh >/dev/null
 
+proof_mount_args=()
+if [[ -n ${AU250_QWEN_PROOF_ROOT:-} ]]; then
+    proof_root=$(realpath -e -- "${AU250_QWEN_PROOF_ROOT}")
+    [[ -d ${proof_root} ]] || {
+        echo "Qwen proof root is not a directory: ${proof_root}" >&2
+        exit 1
+    }
+    case "${proof_root}" in
+        /mnt/disk0/*) ;;
+        *) echo "proof root must be beneath /mnt/disk0" >&2; exit 1 ;;
+    esac
+    proof_mount_args=(-v "${proof_root}:${proof_root}")
+fi
+
 # The platform helper expects nounset to be disabled while it builds its flag string.
 _au250_qwen_devflags() {
     set +u
@@ -64,6 +78,7 @@ temperature="$(_au250_fpga_temp)"
 }
 
 docker run --rm --gpus all --privileged $(_au250_qwen_devflags) \
+    "${proof_mount_args[@]}" \
     -v /sys:/sys \
     -v /lib/firmware/xilinx:/lib/firmware/xilinx:ro \
     -v /au250_xrt:/au250_xrt:ro \
