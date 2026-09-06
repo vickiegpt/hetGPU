@@ -793,6 +793,53 @@ impl LayerCoordinator {
         })
     }
 
+    pub(crate) fn snapshot_phase(
+        &self,
+        transaction_id: u64,
+        phase: super::iq1s_layer_trace::LayerPhase,
+    ) -> Result<super::iq1s_persistent_runtime::PhaseSnapshot, String> {
+        let transactions = self
+            .transactions
+            .lock()
+            .map_err(|_| "IQ1_S layer coordinator lock poisoned".to_string())?;
+        let transaction = transactions
+            .get(&(self.session_generation, transaction_id))
+            .ok_or_else(|| format!("unknown IQ1_S transaction ID {transaction_id}"))?;
+        let expected_state = match phase {
+            super::iq1s_layer_trace::LayerPhase::PhaseA => LayerState::PhaseACommitted,
+            super::iq1s_layer_trace::LayerPhase::PhaseB => LayerState::PhaseBCapture,
+        };
+        if transaction.state != expected_state || transaction.pending_routes.is_some() {
+            return Err(format!(
+                "IQ1_S {phase:?} snapshot is not ready from state {:?}",
+                transaction.state
+            ));
+        }
+        let projections = transaction
+            .projections
+            .values()
+            .filter(|projection| match phase {
+                super::iq1s_layer_trace::LayerPhase::PhaseA => {
+                    matches!(projection.role, Iq1sExpertRole::Gate | Iq1sExpertRole::Up)
+                }
+                super::iq1s_layer_trace::LayerPhase::PhaseB => {
+                    projection.role == Iq1sExpertRole::Down
+                }
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if projections.is_empty() {
+            return Err(format!("IQ1_S {phase:?} snapshot has no projections"));
+        }
+        Ok(super::iq1s_persistent_runtime::PhaseSnapshot {
+            key: transaction.key,
+            batch_count: transaction.batch_count,
+            routes: transaction.routes.clone(),
+            projections,
+            phase,
+        })
+    }
+
     pub(crate) fn commit_layer(&self, transaction_id: u64) -> Result<(), String> {
         self.with_transaction(transaction_id, |transaction| {
             if transaction
@@ -1243,6 +1290,40 @@ mod tests {
             .unwrap();
         coordinator.commit_layer(100).unwrap();
         assert_eq!(coordinator.state(100).unwrap(), LayerState::Closed);
+    }
+
+    #[test]
+    fn iq1s_persistent_runtime_snapshots_phase_data_without_holding_state_lock() {
+        let coordinator = LayerCoordinator::new(7, QWEN35_EXPERTS_PER_TOKEN).unwrap();
+        begin_three_role_layer(&coordinator, 102);
+        coordinator
+            .capture_projection(7, 102, 0xabc0, projection(12, Iq1sExpertRole::Gate, 2, 7))
+            .unwrap();
+        coordinator
+            .capture_projection(7, 102, 0xabc0, projection(12, Iq1sExpertRole::Up, 2, 7))
+            .unwrap();
+        coordinator.commit_phase_a(102).unwrap();
+
+        let phase_a = coordinator
+            .snapshot_phase(102, crate::r#impl::iq1s_layer_trace::LayerPhase::PhaseA)
+            .unwrap();
+        assert_eq!(phase_a.key.transaction_id, 102);
+        assert_eq!(phase_a.batch_count, 2);
+        assert_eq!(phase_a.routes.len(), 2 * QWEN35_EXPERTS_PER_TOKEN as usize);
+        assert_eq!(phase_a.projections.len(), 2);
+
+        coordinator.complete_phase_a(102).unwrap();
+        coordinator
+            .capture_projection(7, 102, 0xabc0, projection(12, Iq1sExpertRole::Down, 2, 7))
+            .unwrap();
+        let phase_b = coordinator
+            .snapshot_phase(102, crate::r#impl::iq1s_layer_trace::LayerPhase::PhaseB)
+            .unwrap();
+        assert_eq!(phase_b.projections.len(), 1);
+        assert_eq!(phase_b.projections[0].role, Iq1sExpertRole::Down);
+
+        coordinator.commit_layer(102).unwrap();
+        assert_eq!(coordinator.state(102).unwrap(), LayerState::Closed);
     }
 
     #[test]

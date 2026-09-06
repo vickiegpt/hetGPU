@@ -96,6 +96,9 @@ pub(crate) mod iq1s_layer_abi;
 pub(crate) mod iq1s_layer_trace;
 
 #[cfg(all(unix, feature = "nvidia", not(feature = "amd"), not(feature = "intel")))]
+pub(crate) mod iq1s_persistent_runtime;
+
+#[cfg(all(unix, feature = "nvidia", not(feature = "amd"), not(feature = "intel")))]
 pub(crate) mod iq1s_tmatmul;
 
 #[cfg(all(unix, feature = "nvidia", not(feature = "amd"), not(feature = "intel")))]

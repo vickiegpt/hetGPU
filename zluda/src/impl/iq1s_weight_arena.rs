@@ -1,6 +1,8 @@
+use super::iq1s_layer_abi::{IQ1S_ROLE_DOWN, IQ1S_ROLE_GATE, IQ1S_ROLE_UP};
 use super::iq1s_weight_registry::{
     classify_tensor_name, Iq1sExpertRole, Iq1sTensorIdentity, Iq1sTensorSource, Iq1sWeightRegistry,
 };
+use super::xrt_iq1s_persistent::{ArenaChunkSpec, ArenaShardSpec};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
@@ -812,6 +814,215 @@ pub(crate) fn load_arena<B: ArenaBackend>(
     })
 }
 
+fn validate_persistent_plan(plan: &ArenaPlan) -> Result<(), String> {
+    if !plan.hashes_verified || plan.generation == 0 || plan.model_sha256 == [0; 32] {
+        return Err("persistent IQ1_S chunks require a verified arena plan".to_string());
+    }
+    Ok(())
+}
+
+fn persistent_chunk_blueprint(
+    bank: u8,
+    superblock: u16,
+    shards: &mut [&ArenaShard],
+) -> Result<ArenaChunkSpec, String> {
+    if shards.is_empty() {
+        return Err("persistent IQ1_S chunk has no arena shards".to_string());
+    }
+    shards.sort_by_key(|shard| shard.offset);
+    let start = u64::from(superblock)
+        .checked_mul(ARENA_SUPERBLOCK_BYTES)
+        .ok_or("persistent IQ1_S chunk start overflow")?;
+    let limit = start
+        .checked_add(ARENA_SUPERBLOCK_BYTES)
+        .ok_or("persistent IQ1_S chunk limit overflow")?;
+    let mut cursor = start;
+    let mut specs = Vec::with_capacity(shards.len());
+    for shard in shards {
+        if shard.bank != bank || shard.superblock != superblock {
+            return Err("persistent IQ1_S chunk mixes bank or superblock identities".to_string());
+        }
+        let expected = align_up(cursor, ARENA_ALIGNMENT)?;
+        if shard.offset != expected {
+            return Err(format!(
+                "persistent IQ1_S chunk gap before {} expert {} is not alignment padding",
+                shard.tensor.name, shard.expert
+            ));
+        }
+        cursor = shard
+            .offset
+            .checked_add(shard.bytes)
+            .ok_or("persistent IQ1_S shard end overflow")?;
+        if cursor > limit {
+            return Err("persistent IQ1_S chunk exceeds 512 MiB".to_string());
+        }
+        let role = match shard.tensor.role {
+            Iq1sExpertRole::Gate => IQ1S_ROLE_GATE as u16,
+            Iq1sExpertRole::Up => IQ1S_ROLE_UP as u16,
+            Iq1sExpertRole::Down => IQ1S_ROLE_DOWN as u16,
+            Iq1sExpertRole::GateUp => {
+                return Err("fused gate_up cannot enter the persistent arena".to_string())
+            }
+        };
+        specs.push(ArenaShardSpec {
+            bank,
+            logical_offset: shard.offset,
+            bytes: usize::try_from(shard.bytes)
+                .map_err(|_| "persistent IQ1_S shard bytes do not fit usize")?,
+            layer_id: shard.tensor.layer,
+            role,
+            expert_id: shard.expert,
+            row_start: shard.row_start,
+            row_count: shard.row_count,
+            sha256: shard.sha256,
+        });
+    }
+    let bytes = usize::try_from(cursor - start)
+        .map_err(|_| "persistent IQ1_S chunk bytes do not fit usize")?;
+    if bytes == 0 || bytes as u64 > ARENA_SUPERBLOCK_BYTES {
+        return Err("persistent IQ1_S chunk has an invalid byte count".to_string());
+    }
+    Ok(ArenaChunkSpec {
+        bank,
+        logical_offset: start,
+        bytes,
+        sha256: [0; 32],
+        shards: specs,
+    })
+}
+
+fn persistent_chunk_blueprints(plan: &ArenaPlan) -> Result<Vec<ArenaChunkSpec>, String> {
+    validate_persistent_plan(plan)?;
+    let mut grouped = BTreeMap::<(u8, u16), Vec<&ArenaShard>>::new();
+    for shard in &plan.shards {
+        if usize::from(shard.bank) >= ARENA_BANK_COUNT || shard.sha256 == [0; 32] {
+            return Err(
+                "persistent IQ1_S chunk contains an invalid bank or shard hash".to_string(),
+            );
+        }
+        grouped
+            .entry((shard.bank, shard.superblock))
+            .or_default()
+            .push(shard);
+    }
+    if (0..ARENA_BANK_COUNT).any(|bank| {
+        !grouped
+            .keys()
+            .any(|(actual, _)| usize::from(*actual) == bank)
+    }) {
+        return Err("persistent IQ1_S chunks must populate all four banks".to_string());
+    }
+
+    let mut chunks = Vec::with_capacity(grouped.len());
+    for ((bank, superblock), mut shards) in grouped {
+        chunks.push(persistent_chunk_blueprint(bank, superblock, &mut shards)?);
+    }
+    chunks.sort_by_key(|chunk| (chunk.bank, chunk.logical_offset));
+    Ok(chunks)
+}
+
+fn assemble_persistent_chunk(
+    plan: &ArenaPlan,
+    sources: &[Arc<Iq1sTensorSource>],
+    chunk: &ArenaChunkSpec,
+    verify_chunk_hash: bool,
+) -> Result<Vec<u8>, String> {
+    if chunk.bytes == 0 || chunk.bytes as u64 > ARENA_SUPERBLOCK_BYTES {
+        return Err("persistent IQ1_S chunk exceeds the 512 MiB staging bound".to_string());
+    }
+    validate_persistent_plan(plan)?;
+    if chunk.logical_offset % ARENA_SUPERBLOCK_BYTES != 0 {
+        return Err("persistent IQ1_S chunk offset is not superblock aligned".to_string());
+    }
+    let superblock = u16::try_from(chunk.logical_offset / ARENA_SUPERBLOCK_BYTES)
+        .map_err(|_| "persistent IQ1_S chunk superblock does not fit u16")?;
+    let mut plan_shards = plan
+        .shards
+        .iter()
+        .filter(|shard| shard.bank == chunk.bank && shard.superblock == superblock)
+        .collect::<Vec<_>>();
+    let blueprint = persistent_chunk_blueprint(chunk.bank, superblock, &mut plan_shards)?;
+    if blueprint.bytes != chunk.bytes || blueprint.shards != chunk.shards {
+        return Err("persistent IQ1_S chunk metadata differs from the arena plan".to_string());
+    }
+    let source_map = sources
+        .iter()
+        .map(|source| (source.identity.name.clone(), source.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut files = HashMap::<String, File>::new();
+    let mut output = vec![0u8; chunk.bytes];
+    for (shard_spec, shard) in chunk.shards.iter().zip(plan_shards) {
+        let source = source_map
+            .get(&shard.tensor.name)
+            .ok_or_else(|| format!("missing IQ1_S arena source {}", shard.tensor.name))?;
+        if source.identity != *shard.tensor {
+            return Err(format!(
+                "IQ1_S arena source identity mismatch for {}",
+                shard.tensor.name
+            ));
+        }
+        if !files.contains_key(&shard.tensor.name) {
+            files.insert(
+                shard.tensor.name.clone(),
+                open_verified_source(&shard.tensor)?,
+            );
+        }
+        let bytes = read_shard_bytes(&files[&shard.tensor.name], shard)?;
+        if <[u8; 32]>::from(Sha256::digest(&bytes)) != shard_spec.sha256 {
+            return Err(format!(
+                "persistent IQ1_S shard hash mismatch for {} expert {} bank {}",
+                shard.tensor.name, shard.expert, shard.bank
+            ));
+        }
+        let relative = usize::try_from(shard.offset - chunk.logical_offset)
+            .map_err(|_| "persistent IQ1_S chunk offset does not fit usize")?;
+        let end = relative
+            .checked_add(bytes.len())
+            .ok_or("persistent IQ1_S chunk copy overflow")?;
+        output
+            .get_mut(relative..end)
+            .ok_or("persistent IQ1_S shard lies outside its chunk")?
+            .copy_from_slice(&bytes);
+    }
+    let digest: [u8; 32] = Sha256::digest(&output).into();
+    if verify_chunk_hash && digest != chunk.sha256 {
+        return Err("persistent IQ1_S chunk hash mismatch".to_string());
+    }
+    Ok(output)
+}
+
+pub(crate) fn persistent_chunk_specs(plan: &ArenaPlan) -> Result<Vec<ArenaChunkSpec>, String> {
+    let sources = plan
+        .shards
+        .iter()
+        .map(|shard| shard.tensor.clone())
+        .map(|identity| {
+            (
+                identity.name.clone(),
+                Arc::new(Iq1sTensorSource {
+                    identity: (*identity).clone(),
+                }),
+            )
+        })
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect::<Vec<_>>();
+    let mut chunks = persistent_chunk_blueprints(plan)?;
+    for chunk in &mut chunks {
+        let bytes = assemble_persistent_chunk(plan, &sources, chunk, false)?;
+        chunk.sha256 = Sha256::digest(bytes).into();
+    }
+    Ok(chunks)
+}
+
+pub(crate) fn read_persistent_chunk(
+    plan: &ArenaPlan,
+    sources: &[Arc<Iq1sTensorSource>],
+    chunk: &ArenaChunkSpec,
+) -> Result<Vec<u8>, String> {
+    assemble_persistent_chunk(plan, sources, chunk, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1061,6 +1272,46 @@ mod tests {
             resident.device_addresses,
             [0x1_0000, 0x2_0000, 0x3_0000, 0x4_0000]
         );
+    }
+
+    #[test]
+    fn iq1s_persistent_runtime_exposes_verified_bounded_chunks() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&vec![0x3c; 800]).unwrap();
+        file.flush().unwrap();
+        let metadata = file.as_file().metadata().unwrap();
+        let sources = vec![identity(
+            file.path().canonicalize().unwrap(),
+            0,
+            Iq1sExpertRole::Gate,
+            [256, 8, 2, 1],
+            [50, 50, 400, 800],
+            800,
+            [0x27; 32],
+            Some(&metadata),
+        )];
+        let plan = build_plan(&sources, 14, false, true).unwrap();
+        let chunks = persistent_chunk_specs(&plan).unwrap();
+
+        assert_eq!(chunks.len(), ARENA_BANK_COUNT);
+        for chunk in &chunks {
+            assert!(chunk.bytes as u64 <= ARENA_SUPERBLOCK_BYTES);
+            let bytes = read_persistent_chunk(&plan, &sources, chunk).unwrap();
+            assert_eq!(bytes.len(), chunk.bytes);
+            assert_eq!(<[u8; 32]>::from(Sha256::digest(bytes)), chunk.sha256);
+        }
+
+        let mut misaligned = chunks[0].clone();
+        misaligned.logical_offset += ARENA_ALIGNMENT;
+        assert!(read_persistent_chunk(&plan, &sources, &misaligned)
+            .unwrap_err()
+            .contains("superblock aligned"));
+
+        let mut gapped = plan;
+        gapped.shards[4].offset += ARENA_ALIGNMENT;
+        assert!(persistent_chunk_specs(&gapped)
+            .unwrap_err()
+            .contains("alignment padding"));
     }
 
     #[test]
