@@ -6,9 +6,9 @@ use super::iq1s_layer_trace::{
 };
 use super::iq1s_persistent_proof::{
     checked_proof_path_from_env, hex_sha256, PersistentPhaseRecord, PersistentProofLedger,
-    PhaseTimingsUs,
+    PhaseComparison, PhaseTimingsUs, LIBGGML_REFERENCE_BACKEND,
 };
-use super::iq1s_tmatmul::Q8_1_MMQ_BYTES;
+use super::iq1s_tmatmul::{libggml_iq1s_reference_outputs, GgmlType19Signature, Q8_1_MMQ_BYTES};
 use super::iq1s_trace::QWEN_MODEL_CONTEXT_LIMIT;
 use super::iq1s_weight_arena::{
     persistent_chunk_specs, plan_registered_arena, read_persistent_chunk, ArenaPlan, ArenaShard,
@@ -23,9 +23,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
 const QWEN_MODEL_SHA256: [u8; 32] = [
     0x0a, 0x32, 0xc2, 0x70, 0x2f, 0xbb, 0x61, 0x93, 0x49, 0x60, 0xcf, 0xee, 0xf3, 0x45, 0x24, 0xb8,
@@ -62,6 +63,8 @@ pub(crate) struct OutputBinding {
     pub(crate) row_count: u32,
     role: Iq1sExpertRole,
     lane_index: usize,
+    lane_count: usize,
+    input_offset: u64,
     output_offset: u64,
     shards: Vec<ArenaShard>,
 }
@@ -93,6 +96,7 @@ pub(crate) struct PersistentRuntime {
     sources: Vec<Arc<Iq1sTensorSource>>,
     pool: PersistentIq1sPool<RealXrt>,
     ledger: PersistentProofLedger,
+    sampled_comparison_complete: bool,
     poisoned: Option<String>,
 }
 
@@ -324,6 +328,8 @@ pub(crate) fn prepare_phase(
                     .map_err(|_| "persistent IQ1_S output rows do not fit u32")?,
                 role,
                 lane_index,
+                lane_count: lanes.len(),
+                input_offset: activation_offset,
                 output_offset,
                 shards: shards.clone(),
             });
@@ -467,6 +473,201 @@ fn validate_all_finite(outputs: &[PublishedOutput]) -> Result<(), String> {
     Ok(())
 }
 
+fn output_values(output: &PublishedOutput) -> Result<Vec<f32>, String> {
+    if output.bytes.len() % 4 != 0 {
+        return Err("persistent IQ1_S output contains a partial f32".to_string());
+    }
+    Ok(output
+        .bytes
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte float")))
+        .collect())
+}
+
+fn read_sample_matrix(binding: &OutputBinding) -> Result<Vec<u8>, String> {
+    let mut shards = binding.shards.iter().collect::<Vec<_>>();
+    shards.sort_by_key(|shard| shard.row_start);
+    let first = shards
+        .first()
+        .ok_or("persistent IQ1_S sampled binding has no matrix shards")?;
+    let identity = &first.tensor;
+    if shards.iter().any(|shard| {
+        shard.expert != binding.expert_id
+            || shard.tensor.as_ref() != identity.as_ref()
+            || shard.sha256 == [0; 32]
+    }) {
+        return Err("persistent IQ1_S sampled matrix shard identity mismatch".into());
+    }
+    let file = File::open(&identity.canonical_path)
+        .map_err(|error| format!("open sampled IQ1_S source: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect sampled IQ1_S source: {error}"))?;
+    let modified_ns = metadata
+        .modified()
+        .map_err(|error| format!("sampled IQ1_S source modification time: {error}"))?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "sampled IQ1_S source modification time predates epoch")?
+        .as_nanos();
+    if metadata.dev() != identity.device
+        || metadata.ino() != identity.inode
+        || modified_ns != identity.modified_ns
+    {
+        return Err("sampled IQ1_S source identity changed after registration".into());
+    }
+    let tensor_end = identity
+        .file_offset
+        .checked_add(identity.nbytes)
+        .ok_or("sampled IQ1_S tensor source range overflow")?;
+    if tensor_end > metadata.len() {
+        return Err("sampled IQ1_S tensor source exceeds its registered file".into());
+    }
+    let row_bytes = identity.ne[0]
+        .checked_div(256)
+        .and_then(|blocks| blocks.checked_mul(50))
+        .ok_or("sampled IQ1_S row byte count overflow")?;
+    if identity.nb[1] != row_bytes {
+        return Err("sampled IQ1_S reference requires tightly packed rows".into());
+    }
+    let expected_rows =
+        u32::try_from(identity.ne[1]).map_err(|_| "sampled IQ1_S row count does not fit u32")?;
+    let mut next_row = 0u32;
+    let mut matrix = Vec::new();
+    for shard in shards {
+        if shard.row_start != next_row {
+            return Err("sampled IQ1_S matrix shards have a gap or overlap".into());
+        }
+        let byte_count = u64::from(shard.row_count)
+            .checked_mul(row_bytes)
+            .ok_or("sampled IQ1_S shard byte count overflow")?;
+        if byte_count != shard.bytes {
+            return Err("sampled IQ1_S shard byte count mismatch".into());
+        }
+        let length = usize::try_from(byte_count)
+            .map_err(|_| "sampled IQ1_S shard does not fit host memory")?;
+        let mut bytes = vec![0u8; length];
+        let source_offset = identity
+            .file_offset
+            .checked_add(u64::from(binding.expert_id) * identity.nb[2])
+            .and_then(|offset| offset.checked_add(u64::from(shard.row_start) * row_bytes))
+            .ok_or("sampled IQ1_S source offset overflow")?;
+        file.read_exact_at(&mut bytes, source_offset)
+            .map_err(|error| format!("read sampled IQ1_S shard: {error}"))?;
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if digest != shard.sha256 {
+            return Err("sampled IQ1_S shard SHA-256 changed after arena load".into());
+        }
+        matrix.extend_from_slice(&bytes);
+        next_row = next_row
+            .checked_add(shard.row_count)
+            .ok_or("sampled IQ1_S row coverage overflow")?;
+    }
+    if next_row != expected_rows {
+        return Err("sampled IQ1_S matrix shards do not cover every row".into());
+    }
+    Ok(matrix)
+}
+
+fn sample_activation(prepared: &PreparedPhase, binding: &OutputBinding) -> Result<Vec<u8>, String> {
+    if binding.lane_count == 0 || binding.lane_index >= binding.lane_count {
+        return Err("persistent IQ1_S sampled activation lane is invalid".into());
+    }
+    let source = prepared
+        .buffers
+        .activations
+        .iter()
+        .find(|range| range.offset == binding.input_offset)
+        .ok_or("persistent IQ1_S sampled activation range is absent")?;
+    let records = usize::try_from(binding.shards[0].tensor.ne[0] / 128)
+        .map_err(|_| "persistent IQ1_S activation record count does not fit usize")?;
+    let expected = records
+        .checked_mul(binding.lane_count)
+        .and_then(|count| count.checked_mul(Q8_1_MMQ_BYTES))
+        .ok_or("persistent IQ1_S sampled activation extent overflow")?;
+    if source.bytes.len() != expected {
+        return Err("persistent IQ1_S sampled activation range has the wrong extent".into());
+    }
+    let mut activation = Vec::with_capacity(records * Q8_1_MMQ_BYTES);
+    for record in 0..records {
+        let offset = (record * binding.lane_count + binding.lane_index) * Q8_1_MMQ_BYTES;
+        activation.extend_from_slice(&source.bytes[offset..offset + Q8_1_MMQ_BYTES]);
+    }
+    Ok(activation)
+}
+
+fn compare_sampled_output(
+    prepared: &PreparedPhase,
+    outputs: &[PublishedOutput],
+) -> Result<PhaseComparison, String> {
+    let binding = prepared
+        .output_bindings
+        .first()
+        .ok_or("persistent IQ1_S phase has no sampled output binding")?;
+    let actual = outputs
+        .first()
+        .ok_or("persistent IQ1_S phase has no sampled output")?;
+    if actual.cuda_ptr != binding.cuda_ptr {
+        return Err("persistent IQ1_S sampled output binding order changed".into());
+    }
+    let matrix = read_sample_matrix(binding)?;
+    let activation = sample_activation(prepared, binding)?;
+    let tensor = &binding.shards[0].tensor;
+    let signature = GgmlType19Signature {
+        kernel: "mul_mat_q".to_string(),
+        ne00: tensor.ne[0],
+        ne01: tensor.ne[1],
+        stride01: tensor.nb[1] / 50,
+        ne10: tensor.ne[0],
+        ne11: 1,
+        stride11: 1,
+        ne0: tensor.ne[1],
+    };
+    let reference = libggml_iq1s_reference_outputs(&signature, &matrix, &activation, None)?;
+    let actual = output_values(actual)?;
+    if reference.len() != actual.len() {
+        return Err("persistent IQ1_S sampled reference/output length mismatch".into());
+    }
+    let mut max_abs_error = 0.0_f32;
+    let mut max_rel_error = 0.0_f32;
+    for (index, (&reference, &actual)) in reference.iter().zip(&actual).enumerate() {
+        if !reference.is_finite() || !actual.is_finite() {
+            return Err(format!(
+                "persistent IQ1_S sampled output {index} is nonfinite"
+            ));
+        }
+        let abs = (actual - reference).abs();
+        let rel = if reference == 0.0 {
+            abs
+        } else {
+            abs / reference.abs()
+        };
+        max_abs_error = max_abs_error.max(abs);
+        max_rel_error = max_rel_error.max(rel);
+        let limit = 1.0e-4 + 1.0e-3 * reference.abs();
+        if abs > limit {
+            return Err(format!(
+                "persistent IQ1_S libggml sample {index} is outside tolerance: actual={actual}, reference={reference}, absolute_error={abs}, limit={limit}"
+            ));
+        }
+    }
+    PhaseComparison::sampled_pass(
+        LIBGGML_REFERENCE_BACKEND,
+        actual.len(),
+        max_abs_error,
+        max_rel_error,
+    )
+}
+
+fn finite_only_comparison(outputs: &[PublishedOutput]) -> Result<PhaseComparison, String> {
+    validate_all_finite(outputs)?;
+    let elements = outputs.iter().try_fold(0usize, |total, output| {
+        total
+            .checked_add(output.bytes.len() / 4)
+            .ok_or("persistent IQ1_S finite element count overflow")
+    })?;
+    PhaseComparison::finite_only(elements)
+}
+
 fn env_truthy(name: &str) -> bool {
     std::env::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
@@ -558,6 +759,7 @@ fn initialize_runtime_from_env() -> Result<PersistentRuntime, String> {
         sources,
         pool,
         ledger,
+        sampled_comparison_complete: false,
         poisoned: None,
     })
 }
@@ -690,7 +892,12 @@ impl PersistentRuntime {
         let reconstruct_us =
             u64::try_from(reconstruct_start.elapsed().as_micros()).unwrap_or(u64::MAX);
         let compare_start = Instant::now();
-        validate_all_finite(&outputs)?;
+        let comparison = if self.sampled_comparison_complete {
+            finite_only_comparison(&outputs)?
+        } else {
+            validate_all_finite(&outputs)?;
+            compare_sampled_output(&prepared, &outputs)?
+        };
         let compare_us = u64::try_from(compare_start.elapsed().as_micros()).unwrap_or(u64::MAX);
         let commands_per_cu = std::array::from_fn(|cu| prepared.compiled.commands[cu].len());
         let completions_per_cu = std::array::from_fn(|cu| completed.completions[cu].len());
@@ -712,6 +919,7 @@ impl PersistentRuntime {
             commands_per_cu,
             completions_per_cu,
             completed.dma.weight_bytes,
+            comparison,
             PhaseTimingsUs {
                 capture: 0,
                 route_dma: 0,
@@ -732,6 +940,7 @@ impl PersistentRuntime {
         // Proof storage is a publication precondition: no CUDA destination is
         // updated if the compact phase record cannot be written.
         self.ledger.append_phase(proof)?;
+        self.sampled_comparison_complete = true;
         if env_truthy("HETGPU_QWEN_IQ1S_PROOF_SYNC_PHASE") {
             self.ledger.sync_boundary()?;
         }

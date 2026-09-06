@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2030,SC2031
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+model_sha256=0a32c2702fbb61934960cfeef34524b81ec6d9267158f246d45fc86f5aaa7568
+model_size=94155830880
+llama_revision=925e1179947ea0c0ebfb0032df18af3a729822be
+device_bdf=0000:64:00.1
+
+if [[ ${1:-} == --inside ]]; then
+    [[ $# -eq 5 ]] || {
+        echo "usage: $0 --inside PROFILE PROOF_DIR XCLBIN XCLBIN_SHA256" >&2
+        exit 2
+    }
+    profile=$2
+    proof_dir=$3
+    xclbin=$4
+    expected_xclbin_sha256=$5
+    [[ ${profile} == one-token ]] || { echo "inside profile must be one-token" >&2; exit 2; }
+    case ${proof_dir} in
+        /mnt/disk0/qwen397b-proof/*) ;;
+        *) echo "proof directory must be beneath /mnt/disk0/qwen397b-proof" >&2; exit 2 ;;
+    esac
+
+    model=/models/qwen/Qwen3.5-397B-A17B-UD-TQ1_0.gguf
+    manifest=/qwen-build/manifest.json
+    server=/qwen-build/llama-build/bin/llama-server
+    libnvcuda=/qwen-build/hetgpu-target/release/libnvcuda.so
+    launch_shim=/qwen-build/hetgpu-target/release/libqwen35_cuda13_launch_shim.so
+    evaluator=/work/tools/qwen35_au250_eval.py
+    auditor=/work/tools/qwen35_gguf_audit.py
+    build_preflight=/work/tools/qwen35_build_preflight.py
+    route_manifest=/work/tools/qwen35-iq1s-route-manifest.json
+    prompt_seed=/work/zluda/evaluation/fixtures/qwen35_prompt_seed.txt
+    validator=/work/zluda/tests/validate_qwen35_iq1s_persistent_gate.py
+    threads=${QWEN35_THREADS:-32}
+    if [[ ! ${threads} =~ ^[0-9]+$ ]] || (( threads < 1 || threads > 32 )); then
+        echo "QWEN35_THREADS must be an integer from 1 through 32" >&2
+        exit 2
+    fi
+
+    for required in "${model}" "${manifest}" "${server}" "${libnvcuda}" "${launch_shim}" \
+        "${evaluator}" "${auditor}" "${build_preflight}" "${route_manifest}" \
+        "${prompt_seed}" "${validator}" "${xclbin}"; do
+        [[ -f ${required} ]] || { echo "missing persistent E2E input ${required}" >&2; exit 1; }
+    done
+    [[ $(stat -c %s "${model}") == "${model_size}" ]] || { echo "model size mismatch" >&2; exit 1; }
+    actual_model_sha256=$(sha256sum "${model}" | awk '{print $1}')
+    [[ ${actual_model_sha256} == "${model_sha256}" ]] || { echo "model SHA-256 mismatch" >&2; exit 1; }
+    actual_xclbin_sha256=$(sha256sum "${xclbin}" | awk '{print $1}')
+    [[ ${actual_xclbin_sha256} == "${expected_xclbin_sha256}" ]] || {
+        echo "persistent xclbin SHA-256 changed before E2E" >&2
+        exit 1
+    }
+
+    install -d "${proof_dir}"
+    MODEL=${model} MODEL_SHA256=${model_sha256} OUTPUT=${proof_dir}/model-verification.json \
+        python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path(os.environ["MODEL"])
+stat = path.stat()
+record = {
+    "path": str(path),
+    "size": stat.st_size,
+    "device": stat.st_dev,
+    "inode": stat.st_ino,
+    "mtime_ns": stat.st_mtime_ns,
+    "ctime_ns": stat.st_ctime_ns,
+    "sha256": os.environ["MODEL_SHA256"],
+}
+output = Path(os.environ["OUTPUT"])
+temporary = output.with_suffix(".json.partial")
+temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.replace(temporary, output)
+PY
+    python3 "${auditor}" "${model}" \
+        --model-verification "${proof_dir}/model-verification.json" \
+        --output "${proof_dir}/model-tensor-audit.json"
+    python3 "${build_preflight}" \
+        --manifest "${manifest}" --build-root /qwen-build \
+        --llama-revision "${llama_revision}" \
+        --output "${proof_dir}/qwen-build-preflight.json"
+    verified_libggml=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["libggml_path"])' \
+        "${proof_dir}/qwen-build-preflight.json")
+    server_sha256=$(sha256sum "${server}" | awk '{print $1}')
+
+    xclbinutil --info --input "${xclbin}" > "${proof_dir}/xclbin-info.txt" 2>&1
+    for cu in iq1s_layer_big_1 iq1s_layer_big_2 iq1s_layer_big_3 iq1s_layer_small_1; do
+        grep -Fq "Instance:        ${cu}" "${proof_dir}/xclbin-info.txt" || {
+            echo "persistent xclbin is missing ${cu}" >&2
+            exit 1
+        }
+    done
+    xclbin_uuid=$(sed -n 's/^UUID (xclbin):[[:space:]]*//p' "${proof_dir}/xclbin-info.txt" | head -n1)
+    [[ ${xclbin_uuid} =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || {
+        echo "persistent xclbin UUID is absent or malformed" >&2
+        exit 1
+    }
+
+    nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader,nounits \
+        > "${proof_dir}/nvidia-memory-preflight.csv"
+    xbutil examine -d "${device_bdf}" -r dynamic-regions -r error -r firewall -r thermal \
+        > "${proof_dir}/xbutil-preflight.txt" 2>&1
+    grep -Fq 'Level 0 : 0x0 (GOOD)' "${proof_dir}/xbutil-preflight.txt" || {
+        echo "AU250 firewall is not GOOD before persistent E2E" >&2
+        exit 1
+    }
+    if grep -Eiq '(^|[^[:alpha:]])fatal([^[:alpha:]]|$)' "${proof_dir}/xbutil-preflight.txt"; then
+        echo "AU250 reports a fatal error before persistent E2E" >&2
+        exit 1
+    fi
+    {
+        printf 'model_sha256=%s\n' "${model_sha256}"
+        printf 'llama_server_sha256=%s\n' "${server_sha256}"
+        printf 'libnvcuda_sha256=%s\n' "$(sha256sum "${libnvcuda}" | awk '{print $1}')"
+        printf 'launch_shim_sha256=%s\n' "$(sha256sum "${launch_shim}" | awk '{print $1}')"
+        printf 'xclbin_sha256=%s\n' "${actual_xclbin_sha256}"
+        printf 'xclbin_uuid=%s\n' "${xclbin_uuid}"
+        printf 'build_threads=%s\n' "${QWEN35_BUILD_JOBS:-32}"
+        printf 'runtime_threads=%s\n' "${threads}"
+    } > "${proof_dir}/artifact-hashes.txt"
+
+    export LD_LIBRARY_PATH="/qwen-build/llama-build/bin:/usr/local/cuda-13.0/lib64:${LD_LIBRARY_PATH:-}"
+    export GGML_CUDA_DISABLE_GRAPHS=1
+    export CUDA_LAUNCH_BLOCKING=1
+    export CUBLAS_WORKSPACE_CONFIG=:4096:8
+    export HETGPU_QWEN_MODEL_SHA256=${model_sha256}
+    export HETGPU_QWEN35_CUDA_BUFFER_MAX_MIB=49152
+    export HETGPU_XRT_XCLBIN=${xclbin}
+    export HETGPU_XRT_TIMEOUT_MS=10000
+
+    (
+        export HETGPU_QWEN_IQ1S_PERSISTENT=0
+        export HETGPU_QWEN_IQ1S_STRICT=0
+        export HETGPU_BITNET_DISAGGREGATE=0
+        export HETGPU_BITNET_DISAGG_STRICT=0
+        export HETGPU_CUDART_PRELAUNCH_NAMED_KERNEL=0
+        unset HETGPU_TMATMUL_BACKEND HETGPU_TMATMUL_HARDWARE_MATMUL
+        unset HETGPU_BITNET_ROUTE_MANIFEST HETGPU_BITNET_ROUTE_LOG
+        unset HETGPU_QWEN_IQ1S_PROOF_LEDGER HETGPU_QWEN_IQ1S_SESSION_GENERATION
+        python3 "${evaluator}" \
+            --mode cuda --profile "${profile}" --evidence-kind iq1s \
+            --server "${server}" --server-preload "${launch_shim}:${libnvcuda}" \
+            --model "${model}" --prompt-seed "${prompt_seed}" \
+            --model-verification "${proof_dir}/model-verification.json" \
+            --model-audit "${proof_dir}/model-tensor-audit.json" \
+            --proof-dir "${proof_dir}/cuda-mode" --port 18100 --threads "${threads}" \
+            --model-size "${model_size}" --model-sha256 "${model_sha256}" \
+            --llama-revision "${llama_revision}" --binary-sha256 "${server_sha256}" \
+            --fpga-bdf "${device_bdf}"
+    )
+
+    run_hybrid_mode() {
+        local trace_mode=$1
+        local port=$2
+        local generation=$3
+        local mode_dir=${proof_dir}/${trace_mode}-mode
+        (
+            export HETGPU_QWEN_TQ1_XRT=0
+            export HETGPU_QWEN_TQ1_STRICT=0
+            export HETGPU_TMATMUL_BACKEND=xrt
+            export HETGPU_TMATMUL_HARDWARE_MATMUL=1
+            export HETGPU_BITNET_DISAGGREGATE=1
+            export HETGPU_BITNET_DISAGG_STRICT=1
+            export HETGPU_CUDART_PRELAUNCH_NAMED_KERNEL=1
+            export HETGPU_QWEN_IQ1S_DISABLE_CUDA_FUSION=1
+            export HETGPU_QWEN_IQ1S_STRICT=1
+            export HETGPU_QWEN_IQ1S_PERSISTENT=1
+            export HETGPU_QWEN_IQ1S_SESSION_GENERATION=${generation}
+            export HETGPU_QWEN_IQ1S_RING_CAPACITY=512
+            export HETGPU_QWEN_IQ1S_PROOF_LEDGER=${mode_dir}/phase-ledger.jsonl
+            export HETGPU_QWEN_IQ1S_PROOF_SYNC_PHASE=1
+            export HETGPU_QWEN_MODEL_CONTEXT_LIMIT=262144
+            export HETGPU_IQ1S_TRACE_MODE=${trace_mode}
+            export HETGPU_LIBGGML=${verified_libggml}
+            export HETGPU_BITNET_ROUTE_MANIFEST=${route_manifest}
+            export HETGPU_BITNET_GPU_KERNELS=attention,attn,flash,softmax,soft_max,rope,kq,qk,qkv,query,key,value,kv_cache
+            export HETGPU_BITNET_CXL_KERNELS=ggml_type19
+            export HETGPU_BITNET_ROUTE_LOG=${mode_dir}/routes.jsonl
+            unset HETGPU_XRT_EXECUTION_LOG HETGPU_TQ1_EVIDENCE_LOG
+            python3 "${evaluator}" \
+                --mode "${trace_mode}" --profile "${profile}" --evidence-kind iq1s \
+                --server "${server}" --server-preload "${launch_shim}:${libnvcuda}" \
+                --model "${model}" --prompt-seed "${prompt_seed}" \
+                --model-verification "${proof_dir}/model-verification.json" \
+                --model-audit "${proof_dir}/model-tensor-audit.json" \
+                --proof-dir "${mode_dir}" --port "${port}" --threads "${threads}" \
+                --model-size "${model_size}" --model-sha256 "${model_sha256}" \
+                --llama-revision "${llama_revision}" --binary-sha256 "${server_sha256}" \
+                --fpga-bdf "${device_bdf}" --route-evidence "${mode_dir}/routes.jsonl" \
+                --persistent-ledger "${mode_dir}/phase-ledger.jsonl" \
+                --require-routing-evidence
+        )
+    }
+
+    run_hybrid_mode handwritten 18101 1
+    run_hybrid_mode compiler 18102 2
+
+    PROOF_DIR=${proof_dir} MODEL_SHA256=${model_sha256} XCLBIN_SHA256=${actual_xclbin_sha256} \
+        XCLBIN_UUID=${xclbin_uuid} python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["PROOF_DIR"])
+fixed_routing = {
+    "u250_iq1s_tensors": 141,
+    "gpu_non_iq1s_tensors": 39,
+    "u250_non_iq1s_tensors": 0,
+    "attention": "gpu",
+}
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def latency(record):
+    values = record.get("measurements")
+    if not isinstance(values, list) or len(values) != 1:
+        raise SystemExit("one-token evaluator must emit exactly one measurement")
+    value = values[0].get("end_to_end_ms")
+    if not isinstance(value, (int, float)) or value <= 0:
+        raise SystemExit("one-token evaluator emitted invalid E2E latency")
+    return float(value)
+
+cuda_record = read(root / "cuda-mode" / "cuda.json")
+cuda_tokens = cuda_record["generated_token_ids"]
+aggregate = {
+    "schema_version": 1,
+    "kind": "iq1s_persistent_g4",
+    "profile": "one-token",
+    "model_sha256": os.environ["MODEL_SHA256"],
+    "xclbin_sha256": os.environ["XCLBIN_SHA256"],
+    "xclbin_uuid": os.environ["XCLBIN_UUID"],
+    "cuda": {
+        "generated_tokens": len(cuda_tokens),
+        "token_ids": cuda_tokens,
+        "e2e_latency_ms": latency(cuda_record),
+    },
+}
+for mode in ("handwritten", "compiler"):
+    mode_root = root / f"{mode}-mode"
+    record = read(mode_root / f"{mode}.json")
+    tokens = record["generated_token_ids"]
+    xrt = record["xrt"]
+    routes = record["routes"]
+    ledger = [json.loads(line) for line in (mode_root / "phase-ledger.jsonl").read_text(encoding="utf-8").splitlines()]
+    weight_dma = sum(item["weight_dma_bytes"] for item in ledger)
+    mode_summary = {
+        "schema_version": 1,
+        "kind": "iq1s_persistent_summary",
+        "profile": {
+            "name": "one-token", "request_count": 1, "max_active": 1,
+            "tokens_per_request": 1, "measurements": 1, "warmups": 0,
+        },
+        "mode": mode,
+        "routing": fixed_routing,
+        "fallbacks": routes["fallback"],
+        "token_ids": tokens,
+        "cuda_token_ids": cuda_tokens,
+    }
+    (mode_root / "summary.json").write_text(
+        json.dumps(mode_summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    aggregate[mode] = {
+        "generated_tokens": len(tokens),
+        "token_ids": tokens,
+        "routing": fixed_routing,
+        "eligible_direct_routes": 0,
+        "fallbacks": routes["fallback"],
+        "measured_weight_dma_bytes": weight_dma,
+        "completions_per_cu": xrt["per_cu_completions"],
+        "e2e_latency_ms": latency(record),
+    }
+(root / "g4-summary.json").write_text(
+    json.dumps(aggregate, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+    python3 "${validator}" --gate ledger "${proof_dir}/handwritten-mode"
+    python3 "${validator}" --gate ledger "${proof_dir}/compiler-mode"
+    python3 "${validator}" --gate g4 "${proof_dir}" | tee "${proof_dir}/validation.json"
+    exit 0
+fi
+
+gate=
+model=
+manifest=
+xclbin=
+proof_dir=
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --gate) gate=${2:-}; shift 2 ;;
+        --model) model=${2:-}; shift 2 ;;
+        --manifest) manifest=${2:-}; shift 2 ;;
+        --xclbin) xclbin=${2:-}; shift 2 ;;
+        --proof-dir) proof_dir=${2:-}; shift 2 ;;
+        *) echo "unknown argument $1" >&2; exit 2 ;;
+    esac
+done
+[[ ${gate} == one-token ]] || { echo "--gate must be one-token" >&2; exit 2; }
+[[ -n ${model} && -n ${manifest} && -n ${xclbin} && -n ${proof_dir} ]] || {
+    echo "usage: $0 --gate one-token --model MODEL --manifest MANIFEST --xclbin XCLBIN --proof-dir DIR" >&2
+    exit 2
+}
+[[ $(realpath -e "${model}") == /root/models/qwen35-tq1/Qwen3.5-397B-A17B-UD-TQ1_0.gguf ]] || {
+    echo "runner requires the pinned Qwen model" >&2; exit 1;
+}
+[[ $(realpath -e "${manifest}") == /root/qwen35-au250-build/manifest.json ]] || {
+    echo "runner requires the pinned Qwen build manifest" >&2; exit 1;
+}
+case $(realpath -e "${xclbin}") in
+    /au250_xrt/xclbins/qwen397b_iq1s_layer_persistent_*.xclbin) ;;
+    *) echo "runner requires a SHA-named installed persistent xclbin" >&2; exit 1 ;;
+esac
+proof_dir=$(realpath -m "${proof_dir}")
+case ${proof_dir} in
+    /mnt/disk0/qwen397b-proof/*) ;;
+    *) echo "proof directory must be beneath /mnt/disk0/qwen397b-proof" >&2; exit 2 ;;
+esac
+[[ ! -e ${proof_dir} ]] || { echo "refusing to reuse proof directory ${proof_dir}" >&2; exit 1; }
+install -d "${proof_dir}"
+xclbin_sha256=$(sha256sum "${xclbin}" | awk '{print $1}')
+
+source /au250_xrt/env.sh >/dev/null
+temperature=$(_au250_fpga_temp)
+[[ -z ${temperature} || ${temperature} -lt ${AU250_TEMP_LIMIT:-85} ]] || {
+    echo "AU250 temperature ${temperature}C exceeds launch guard" >&2
+    exit 1
+}
+AU250_QWEN_PROOF_ROOT=${proof_dir} QWEN35_BUILD_JOBS=32 CARGO_BUILD_JOBS=32 \
+    "${repo_root}/tools/au250_qwen35_run.sh" bash /work/tools/run_qwen35_iq1s_persistent_hybrid.sh \
+    --inside one-token "${proof_dir}" "$(realpath -e "${xclbin}")" "${xclbin_sha256}"

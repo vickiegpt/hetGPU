@@ -2166,6 +2166,94 @@ pub(crate) fn validated_grid(path: Option<&Path>) -> Result<Arc<GridTable>, Stri
     Ok(table)
 }
 
+/// Compute a bounded reference directly from the verified libggml IQ1_S
+/// dequantizer and the exact packed Q8_1 activation consumed by the CUDA MMQ
+/// kernel. This is intentionally used only by the pre-timed persistent sample.
+pub(crate) fn libggml_iq1s_reference_outputs(
+    signature: &GgmlType19Signature,
+    packed_matrix: &[u8],
+    packed_activations: &[u8],
+    path: Option<&Path>,
+) -> Result<Vec<f32>, String> {
+    signature.validate()?;
+    if signature.ne11 != 1 || signature.stride11 != 1 {
+        return Err("libggml IQ1_S reference requires one tightly packed activation lane".into());
+    }
+    if packed_matrix.len() != signature.matrix_storage_bytes()? {
+        return Err("libggml IQ1_S reference matrix extent mismatch".into());
+    }
+    if packed_activations.len() != signature.activation_storage_bytes()? {
+        return Err("libggml IQ1_S reference activation extent mismatch".into());
+    }
+    let selected = select_libggml_path(path)?;
+    let path = selected
+        .canonicalize()
+        .map_err(|error| format!("libggml {}: {error}", selected.display()))?;
+    let oracle = unsafe { OracleLibrary::open(&path)? };
+    let columns = usize::try_from(signature.ne00)
+        .map_err(|_| "libggml IQ1_S reference column count does not fit usize")?;
+    let rows = usize::try_from(signature.ne01)
+        .map_err(|_| "libggml IQ1_S reference row count does not fit usize")?;
+    let columns_i64 = i64::try_from(signature.ne00)
+        .map_err(|_| "libggml IQ1_S reference column count does not fit i64")?;
+    let row_stride = usize::try_from(signature.stride01)
+        .ok()
+        .and_then(|blocks| blocks.checked_mul(IQ1S_BLOCK_BYTES))
+        .ok_or("libggml IQ1_S reference row stride overflow")?;
+    let logical_row_bytes = columns
+        .checked_div(IQ1S_BLOCK_VALUES)
+        .and_then(|blocks| blocks.checked_mul(IQ1S_BLOCK_BYTES))
+        .ok_or("libggml IQ1_S reference row extent overflow")?;
+    if row_stride != logical_row_bytes {
+        return Err("libggml IQ1_S reference does not allow padded matrix rows".into());
+    }
+
+    let mut activation = Vec::with_capacity(columns);
+    for record in iter_q8_1_mmq(signature, packed_activations)? {
+        for block in record?.subblocks {
+            activation.extend(block.qs.map(|quant| block.d * f32::from(quant)));
+        }
+    }
+    if activation.len() != columns || activation.iter().any(|value| !value.is_finite()) {
+        return Err("libggml IQ1_S reference decoded an invalid activation".into());
+    }
+
+    let mut weights = vec![f32::NAN; columns];
+    let mut outputs = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let offset = row
+            .checked_mul(row_stride)
+            .ok_or("libggml IQ1_S reference row offset overflow")?;
+        unsafe {
+            (oracle.dequantize)(
+                packed_matrix[offset..offset + logical_row_bytes]
+                    .as_ptr()
+                    .cast(),
+                weights.as_mut_ptr().cast(),
+                columns_i64,
+            );
+        }
+        if weights.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "libggml IQ1_S reference produced a nonfinite weight in row {row}"
+            ));
+        }
+        let value = weights
+            .iter()
+            .zip(&activation)
+            .fold(0.0_f32, |sum, (&weight, &input)| {
+                (sum + (weight * input) as f32) as f32
+            });
+        if !value.is_finite() {
+            return Err(format!(
+                "libggml IQ1_S reference produced a nonfinite output in row {row}"
+            ));
+        }
+        outputs.push(value);
+    }
+    Ok(outputs)
+}
+
 impl OracleLibrary {
     unsafe fn open(path: &Path) -> Result<Self, String> {
         let c_path = CString::new(path.as_os_str().as_encoded_bytes())
@@ -2306,6 +2394,30 @@ mod tests {
             result.unwrap_err(),
             "strict Qwen IQ1_S mode requires verified HETGPU_LIBGGML"
         );
+    }
+
+    #[test]
+    fn libggml_reference_dequantizes_exact_packed_iq1s_rows() {
+        let qwen_libggml = Path::new("/root/qwen35-au250-build/llama-build/bin/libggml.so.0.22.0");
+        if !qwen_libggml.is_file() {
+            return;
+        }
+        let signature = GgmlType19Signature {
+            kernel: "mul_mat_q".to_string(),
+            ne00: 256,
+            ne01: 1,
+            stride01: 1,
+            ne10: 256,
+            ne11: 1,
+            stride11: 1,
+            ne0: 1,
+        };
+        let matrix = vec![0u8; IQ1S_BLOCK_BYTES];
+        let activations = vec![0u8; 2 * Q8_1_MMQ_BYTES];
+        let outputs =
+            libggml_iq1s_reference_outputs(&signature, &matrix, &activations, Some(qwen_libggml))
+                .unwrap();
+        assert_eq!(outputs, vec![0.0]);
     }
 
     fn grid() -> GridTable {

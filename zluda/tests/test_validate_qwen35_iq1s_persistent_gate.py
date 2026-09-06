@@ -27,9 +27,9 @@ TIMING_FIELDS = (
 )
 
 
-def phase(phase_name="A"):
+def phase(phase_name="A", sampled=True):
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "iq1s_persistent_phase",
         "transaction_id": 17,
         "layer_id": 7,
@@ -42,10 +42,13 @@ def phase(phase_name="A"):
         "completions_per_cu": [3, 3, 3, 3],
         "weight_dma_bytes": 0,
         "eligible_direct_routes": 0,
-        "max_abs_error": 0.0,
-        "max_rel_error": 0.0,
+        "comparison_sampled": sampled,
+        "reference_backend": "libggml_dequantize_row_iq1_s" if sampled else None,
+        "checked_elements": 1024,
+        "max_abs_error": 2.5e-5 if sampled else 0.0,
+        "max_rel_error": 4.0e-4 if sampled else 0.0,
         "nonfinite": 0,
-        "comparison_status": "pass",
+        "comparison_status": "pass" if sampled else "finite_only",
         "timing_us": {name: 1 for name in TIMING_FIELDS},
     }
 
@@ -152,6 +155,96 @@ def write_g3_bundle(root, hardware_summary=None):
     (root / "cargo.log").write_text("test result: ok. 1 passed; 0 failed\n", encoding="utf-8")
 
 
+def g4_mode(mode):
+    return {
+        "generated_tokens": 1,
+        "token_ids": [151643],
+        "routing": {
+            "u250_iq1s_tensors": 141,
+            "gpu_non_iq1s_tensors": 39,
+            "u250_non_iq1s_tensors": 0,
+            "attention": "gpu",
+        },
+        "eligible_direct_routes": 0,
+        "fallbacks": 0,
+        "measured_weight_dma_bytes": 0,
+        "completions_per_cu": [3, 3, 3, 3],
+        "e2e_latency_ms": 1234.5 if mode == "handwritten" else 1200.25,
+    }
+
+
+def g4_summary():
+    return {
+        "schema_version": 1,
+        "kind": "iq1s_persistent_g4",
+        "profile": "one-token",
+        "model_sha256": "0a32c2702fbb61934960cfeef34524b81ec6d9267158f246d45fc86f5aaa7568",
+        "xclbin_sha256": "aa" * 32,
+        "xclbin_uuid": "b1bafc64-09fd-32b0-a5b4-a881e554ae84",
+        "cuda": {
+            "generated_tokens": 1,
+            "token_ids": [151643],
+            "e2e_latency_ms": 1100.0,
+        },
+        "handwritten": g4_mode("handwritten"),
+        "compiler": g4_mode("compiler"),
+    }
+
+
+def write_g4_bundle(root, aggregate=None):
+    root.mkdir()
+    data = aggregate if aggregate is not None else g4_summary()
+    (root / "g4-summary.json").write_text(
+        json.dumps(data, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    for mode in ("handwritten", "compiler"):
+        mode_summary = summary()
+        mode_summary["mode"] = mode
+        write_bundle(root / f"{mode}-mode", [{**phase(), "trace_mode": mode}], mode_summary)
+
+
+def test_g4_accepts_exact_three_process_one_token_bundle(tmp_path):
+    root = tmp_path / "g4"
+    write_g4_bundle(root)
+    result = validate(root, "g4")
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["gate"] == "g4"
+    assert output["status"] == "pass"
+    assert output["token_ids"] == [151643]
+    assert output["latency_ms"] == {
+        "cuda": 1100.0,
+        "handwritten": 1234.5,
+        "compiler": 1200.25,
+    }
+    assert "tps" not in result.stdout.lower()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda data: data["handwritten"].__setitem__("generated_tokens", 2),
+        lambda data: data["compiler"].__setitem__("token_ids", [151644]),
+        lambda data: data["handwritten"]["routing"].__setitem__("u250_iq1s_tensors", 140),
+        lambda data: data["compiler"]["routing"].__setitem__("gpu_non_iq1s_tensors", 38),
+        lambda data: data["handwritten"]["routing"].__setitem__("attention", "u250"),
+        lambda data: data["compiler"].__setitem__("eligible_direct_routes", 1),
+        lambda data: data["handwritten"].__setitem__("fallbacks", 1),
+        lambda data: data["compiler"].__setitem__("measured_weight_dma_bytes", 1),
+        lambda data: data["handwritten"].__setitem__("completions_per_cu", [3, 3, 3, 0]),
+        lambda data: data["cuda"].__setitem__("e2e_latency_ms", float("nan")),
+    ),
+)
+def test_g4_rejects_each_one_token_contract_mutation(tmp_path, mutation):
+    root = tmp_path / "g4-bad"
+    data = g4_summary()
+    mutation(data)
+    write_g4_bundle(root, data)
+    result = validate(root, "g4")
+    assert result.returncode != 0
+    assert "tps" not in result.stdout.lower()
+
+
 def test_g3_accepts_exact_fail_closed_hardware_bundle(tmp_path):
     root = tmp_path / "g3"
     write_g3_bundle(root)
@@ -210,6 +303,29 @@ def test_compact_persistent_ledger_accepts_exact_one_token_bundle(tmp_path):
     assert "tps" not in result.stdout.lower()
 
 
+def test_compact_persistent_ledger_accepts_one_sample_and_finite_only_phases(tmp_path):
+    first = phase("A", sampled=True)
+    second = phase("B", sampled=False)
+    root = tmp_path / "sampled-and-finite"
+    write_bundle(root, [first, second])
+    result = validate(root)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "records",
+    (
+        [phase("A", sampled=False)],
+        [phase("A", sampled=True), {**phase("A", sampled=True), "transaction_id": 18}],
+    ),
+)
+def test_compact_persistent_ledger_requires_exactly_one_libggml_sample(tmp_path, records):
+    root = tmp_path / "bad-sample-count"
+    write_bundle(root, records)
+    result = validate(root)
+    assert result.returncode != 0
+
+
 @pytest.mark.parametrize("field", list(phase().keys()))
 def test_compact_persistent_ledger_rejects_every_missing_phase_field(tmp_path, field):
     broken = phase()
@@ -233,6 +349,8 @@ def test_compact_persistent_ledger_rejects_every_missing_phase_field(tmp_path, f
         lambda phases, mode: phases[0].__setitem__("max_rel_error", 1.1e-3),
         lambda phases, mode: phases[0].__setitem__("nonfinite", 1),
         lambda phases, mode: phases[0].__setitem__("comparison_status", "fail"),
+        lambda phases, mode: phases[0].__setitem__("reference_backend", "scalar_iq1s"),
+        lambda phases, mode: phases[0].__setitem__("checked_elements", 0),
         lambda phases, mode: mode["routing"].__setitem__("attention", "u250"),
         lambda phases, mode: mode["routing"].__setitem__("u250_iq1s_tensors", 140),
         lambda phases, mode: mode["routing"].__setitem__("gpu_non_iq1s_tensors", 38),

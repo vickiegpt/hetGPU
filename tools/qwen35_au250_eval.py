@@ -723,6 +723,169 @@ def _four_nonnegative_integers(value, label):
     return value
 
 
+PERSISTENT_TIMING_FIELDS = {
+    "capture", "route_dma", "trace_build_or_cache", "activation_pack",
+    "activation_sync", "ring_publish", "doorbell", "device_wait",
+    "completion_sync", "result_copy", "reconstruct", "compare", "log",
+    "phase_wall",
+}
+PERSISTENT_PHASE_FIELDS = {
+    "schema_version", "kind", "transaction_id", "layer_id", "phase",
+    "trace_mode", "session_generation", "program_sha256", "semantic_sha256",
+    "commands_per_cu", "completions_per_cu", "weight_dma_bytes",
+    "eligible_direct_routes", "comparison_sampled", "reference_backend",
+    "checked_elements", "max_abs_error", "max_rel_error", "nonfinite",
+    "comparison_status", "timing_us",
+}
+
+
+def _persistent_sha256(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value != "0" * 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def parse_persistent_iq1s_routing(route_records, phase_records, mode):
+    if mode not in ("handwritten", "compiler"):
+        raise EvaluationError("persistent IQ1_S evidence requires a hybrid trace mode")
+    if not isinstance(route_records, list) or not all(isinstance(item, dict) for item in route_records):
+        raise EvaluationError("persistent IQ1_S route evidence must be a list of objects")
+    if not isinstance(phase_records, list) or not phase_records or not all(
+        isinstance(item, dict) for item in phase_records
+    ):
+        raise EvaluationError("persistent IQ1_S ledger is empty or malformed")
+    direct = [item for item in route_records if is_iq1s_matmul(item.get("kernel"))]
+    if direct:
+        raise EvaluationError("persistent IQ1_S run emitted a legacy eligible direct route")
+    attention = sum(
+        is_attention(item.get("kernel")) and item.get("route") == "gpu"
+        for item in route_records
+    )
+    if attention <= 0:
+        raise EvaluationError("persistent IQ1_S run observed no native GPU attention")
+
+    per_cu_commands = [0, 0, 0, 0]
+    per_cu_completions = [0, 0, 0, 0]
+    sampled = []
+    seen = set()
+    transaction_phases = {}
+    generation = None
+    for index, record in enumerate(phase_records):
+        label = f"persistent phase[{index}]"
+        if set(record) != PERSISTENT_PHASE_FIELDS:
+            raise EvaluationError(f"{label} fields differ from schema")
+        if record["schema_version"] != 2 or record["kind"] != "iq1s_persistent_phase":
+            raise EvaluationError(f"{label} schema identity is invalid")
+        transaction = record["transaction_id"]
+        layer = record["layer_id"]
+        if not _is_integer(transaction) or transaction <= 0 or not _is_integer(layer) or not 0 <= layer < 60:
+            raise EvaluationError(f"{label} transaction/layer identity is invalid")
+        phase = record["phase"]
+        if phase not in ("A", "B") or record["trace_mode"] != mode:
+            raise EvaluationError(f"{label} phase or trace mode is invalid")
+        identity = (transaction, phase)
+        if identity in seen:
+            raise EvaluationError("persistent IQ1_S ledger duplicates a transaction/phase")
+        seen.add(identity)
+        sequence = transaction_phases.setdefault(transaction, [])
+        sequence.append(phase)
+        if sequence not in (["A"], ["A", "B"]):
+            raise EvaluationError("persistent IQ1_S phase order is not A then optional B")
+        current_generation = record["session_generation"]
+        if not _is_integer(current_generation) or current_generation <= 0:
+            raise EvaluationError(f"{label} session generation is invalid")
+        if generation is None:
+            generation = current_generation
+        elif generation != current_generation:
+            raise EvaluationError("persistent IQ1_S ledger spans session generations")
+        programs = record["program_sha256"]
+        if not isinstance(programs, list) or len(programs) != 4 or not all(
+            _persistent_sha256(value) for value in programs
+        ) or not _persistent_sha256(record["semantic_sha256"]):
+            raise EvaluationError(f"{label} trace hashes are invalid")
+        commands = _four_nonnegative_integers(record["commands_per_cu"], "persistent commands")
+        completions = _four_nonnegative_integers(record["completions_per_cu"], "persistent completions")
+        if not all(commands) or commands != completions:
+            raise EvaluationError(f"{label} did not complete nonzero work on all four CUs")
+        if record["weight_dma_bytes"] != 0 or record["eligible_direct_routes"] != 0:
+            raise EvaluationError(f"{label} used measured weight DMA or a direct route")
+        if record["nonfinite"] != 0:
+            raise EvaluationError(f"{label} contains a nonfinite output")
+        checked = record["checked_elements"]
+        if not _is_integer(checked) or checked <= 0:
+            raise EvaluationError(f"{label} checked element count is invalid")
+        try:
+            max_abs = float(record["max_abs_error"])
+            max_rel = float(record["max_rel_error"])
+        except (TypeError, ValueError) as error:
+            raise EvaluationError(f"{label} comparison errors are invalid") from error
+        if not math.isfinite(max_abs) or not math.isfinite(max_rel) or max_abs < 0 or max_rel < 0:
+            raise EvaluationError(f"{label} comparison errors are invalid")
+        if record["comparison_sampled"] is True:
+            if (
+                record["reference_backend"] != "libggml_dequantize_row_iq1_s"
+                or record["comparison_status"] != "pass"
+                or max_abs > 1.0e-4
+                or max_rel > 1.0e-3
+            ):
+                raise EvaluationError(f"{label} sampled libggml comparison did not pass")
+            sampled.append(record)
+        elif record["comparison_sampled"] is False:
+            if (
+                record["reference_backend"] is not None
+                or record["comparison_status"] != "finite_only"
+                or max_abs != 0.0
+                or max_rel != 0.0
+            ):
+                raise EvaluationError(f"{label} finite-only validation is invalid")
+        else:
+            raise EvaluationError(f"{label} comparison_sampled must be boolean")
+        timing = record["timing_us"]
+        if not isinstance(timing, dict) or set(timing) != PERSISTENT_TIMING_FIELDS or not all(
+            _is_integer(value) and value >= 0 for value in timing.values()
+        ):
+            raise EvaluationError(f"{label} timing breakdown is invalid")
+        per_cu_commands = [left + right for left, right in zip(per_cu_commands, commands)]
+        per_cu_completions = [left + right for left, right in zip(per_cu_completions, completions)]
+
+    if len(sampled) != 1:
+        raise EvaluationError("persistent IQ1_S ledger requires exactly one libggml sample")
+    sample = sampled[0]
+    xrt = zero_xrt_evidence()
+    xrt.update({
+        "submission_count": sum(per_cu_commands),
+        "completion_count": sum(per_cu_completions),
+        "per_cu_submissions": per_cu_commands,
+        "per_cu_completions": per_cu_completions,
+        "reference_checked_components": sample["checked_elements"],
+        "operation_count": len(phase_records),
+    })
+    routes = {
+        "eligible": len(phase_records),
+        "handled": len(phase_records),
+        "fallback": 0,
+        "error": 0,
+        "eligible_kernels": [
+            f"layer{record['layer_id']}.phase{record['phase']}" for record in phase_records
+        ],
+    }
+    comparison = {
+        "status": "pass",
+        "reference_backend": sample["reference_backend"],
+        "checked_elements": sample["checked_elements"],
+        "atol": 1.0e-4,
+        "rtol": 1.0e-3,
+        "max_absolute_error": float(sample["max_abs_error"]),
+        "max_relative_error": float(sample["max_rel_error"]),
+        "phase": "pre_timed",
+        "kernel": "iq1s_layer_persistent",
+    }
+    return routes, xrt, attention, comparison
+
+
 def parse_iq1s_routing(route_records, xrt_records):
     if not isinstance(route_records, list) or not all(
         isinstance(record, dict) for record in route_records
@@ -937,6 +1100,7 @@ def run(args):
     model_audit_sha256 = None
     route_evidence_path = None
     xrt_evidence_path = None
+    persistent_ledger_path = None
     if args.evidence_kind == "iq1s":
         if not args.model_audit:
             raise EvaluationError("IQ1_S evaluation requires --model-audit")
@@ -951,11 +1115,24 @@ def run(args):
             args.xrt_evidence
             or os.environ.get("HETGPU_XRT_EXECUTION_LOG", proof_dir / "xrt.jsonl")
         )
+        if args.persistent_ledger:
+            if args.mode == "cuda":
+                raise EvaluationError("CUDA-only evaluation cannot use a persistent ledger")
+            persistent_ledger_path = Path(args.persistent_ledger)
+            if persistent_ledger_path.name != "phase-ledger.jsonl":
+                raise EvaluationError("persistent ledger must be named phase-ledger.jsonl")
+            configured_ledger = os.environ.get("HETGPU_QWEN_IQ1S_PROOF_LEDGER")
+            if configured_ledger and Path(configured_ledger).resolve() != persistent_ledger_path.resolve():
+                raise EvaluationError("persistent ledger CLI path differs from runtime environment")
         expected_parent = proof_dir.resolve()
-        for path, label in (
+        evidence_paths = [
             (route_evidence_path, "route evidence"),
-            (xrt_evidence_path, "XRT evidence"),
-        ):
+        ]
+        if persistent_ledger_path is None:
+            evidence_paths.append((xrt_evidence_path, "XRT evidence"))
+        else:
+            evidence_paths.append((persistent_ledger_path, "persistent ledger"))
+        for path, label in evidence_paths:
             if path.resolve().parent != expected_parent:
                 raise EvaluationError(f"IQ1_S {label} must be directly beneath {proof_dir}")
             path.unlink(missing_ok=True)
@@ -1034,18 +1211,26 @@ def run(args):
                     "IQ1_S route evidence",
                     required=args.mode != "cuda",
                 )
-                semantic_xrt_records = load_jsonl_records(
-                    xrt_evidence_path,
-                    "IQ1_S XRT evidence",
-                    required=args.mode != "cuda",
+                semantic_xrt_records = [] if persistent_ledger_path is not None else load_jsonl_records(
+                    xrt_evidence_path, "IQ1_S XRT evidence", required=args.mode != "cuda"
                 )
                 if args.mode == "cuda":
                     if semantic_route_records or semantic_xrt_records:
                         raise EvaluationError("CUDA-only semantic gate unexpectedly created IQ1_S evidence")
                 else:
-                    gate_routes, gate_xrt, gate_attention = parse_iq1s_routing(
-                        semantic_route_records, semantic_xrt_records
-                    )
+                    if persistent_ledger_path is None:
+                        gate_routes, gate_xrt, gate_attention = parse_iq1s_routing(
+                            semantic_route_records, semantic_xrt_records
+                        )
+                    else:
+                        semantic_phases = load_jsonl_records(
+                            persistent_ledger_path,
+                            "persistent IQ1_S phase ledger",
+                            required=True,
+                        )
+                        gate_routes, gate_xrt, gate_attention, _ = parse_persistent_iq1s_routing(
+                            semantic_route_records, semantic_phases, args.mode
+                        )
                     if gate_attention <= 0:
                         raise EvaluationError("IQ1_S semantic gate observed no native GPU attention")
                     if not all(value > 0 for value in gate_xrt["per_cu_completions"]):
@@ -1092,7 +1277,11 @@ def run(args):
     log_text = stderr_path.read_text(encoding="utf-8", errors="replace")
     placement = parse_placement(log_text)
     load_ms = parse_load_ms(log_text)
-    sampled_ffn_comparison = parse_sampled_ffn_comparison(log_text, args.mode)
+    sampled_ffn_comparison = (
+        None
+        if persistent_ledger_path is not None
+        else parse_sampled_ffn_comparison(log_text, args.mode)
+    )
     if args.evidence_kind == "tq1":
         routes, xrt = parse_routing(
             args.mode, tq1_evidence_path, args.require_routing_evidence
@@ -1122,14 +1311,24 @@ def run(args):
             "IQ1_S route evidence",
             required=args.require_routing_evidence,
         )
-        xrt_records = load_jsonl_records(
-            xrt_evidence_path,
-            "IQ1_S XRT evidence",
-            required=args.require_routing_evidence,
-        )
-        routes, xrt, gpu_attention_routes = parse_iq1s_routing(
-            route_records, xrt_records
-        )
+        if persistent_ledger_path is None:
+            xrt_records = load_jsonl_records(
+                xrt_evidence_path,
+                "IQ1_S XRT evidence",
+                required=args.require_routing_evidence,
+            )
+            routes, xrt, gpu_attention_routes = parse_iq1s_routing(
+                route_records, xrt_records
+            )
+        else:
+            phase_records = load_jsonl_records(
+                persistent_ledger_path,
+                "persistent IQ1_S phase ledger",
+                required=True,
+            )
+            routes, xrt, gpu_attention_routes, sampled_ffn_comparison = (
+                parse_persistent_iq1s_routing(route_records, phase_records, args.mode)
+            )
     measurements = []
     for batch in measured:
         requests = batch["requests"]
@@ -1602,6 +1801,7 @@ def parser():
     result.add_argument("--health-fixture")
     result.add_argument("--route-evidence")
     result.add_argument("--xrt-evidence")
+    result.add_argument("--persistent-ledger")
     result.add_argument("--model-audit")
     result.add_argument("--require-routing-evidence", action="store_true")
     return result

@@ -41,6 +41,9 @@ PHASE_FIELDS = {
     "completions_per_cu",
     "weight_dma_bytes",
     "eligible_direct_routes",
+    "comparison_sampled",
+    "reference_backend",
+    "checked_elements",
     "max_abs_error",
     "max_rel_error",
     "nonfinite",
@@ -77,6 +80,28 @@ G3_DMA_FIELDS = {
     "program_ranges",
     "weight_ranges",
     "weight_bytes",
+}
+G4_FIELDS = {
+    "schema_version",
+    "kind",
+    "profile",
+    "model_sha256",
+    "xclbin_sha256",
+    "xclbin_uuid",
+    "cuda",
+    "handwritten",
+    "compiler",
+}
+G4_CUDA_FIELDS = {"generated_tokens", "token_ids", "e2e_latency_ms"}
+G4_HYBRID_FIELDS = {
+    "generated_tokens",
+    "token_ids",
+    "routing",
+    "eligible_direct_routes",
+    "fallbacks",
+    "measured_weight_dma_bytes",
+    "completions_per_cu",
+    "e2e_latency_ms",
 }
 
 
@@ -163,7 +188,7 @@ def read_text(path, label):
 def validate_phase(record, index, mode):
     label = f"phase[{index}]"
     exact_fields(record, PHASE_FIELDS, label)
-    if record["schema_version"] != 1 or record["kind"] != "iq1s_persistent_phase":
+    if record["schema_version"] != 2 or record["kind"] != "iq1s_persistent_phase":
         fail(f"{label} schema identity is invalid")
     integer(record["transaction_id"], f"{label}.transaction_id", 1)
     layer = integer(record["layer_id"], f"{label}.layer_id")
@@ -190,18 +215,37 @@ def validate_phase(record, index, mode):
         fail(f"{label} measured weight DMA must be zero")
     if integer(record["eligible_direct_routes"], f"{label}.eligible_direct_routes") != 0:
         fail(f"{label} eligible direct routes must be zero")
-    if finite_number(record["max_abs_error"], f"{label}.max_abs_error") > 1.0e-4:
+    checked_elements = integer(record["checked_elements"], f"{label}.checked_elements", 1)
+    max_abs_error = finite_number(record["max_abs_error"], f"{label}.max_abs_error")
+    max_rel_error = finite_number(record["max_rel_error"], f"{label}.max_rel_error")
+    if max_abs_error > 1.0e-4:
         fail(f"{label} absolute error exceeds tolerance")
-    if finite_number(record["max_rel_error"], f"{label}.max_rel_error") > 1.0e-3:
+    if max_rel_error > 1.0e-3:
         fail(f"{label} relative error exceeds tolerance")
     if integer(record["nonfinite"], f"{label}.nonfinite") != 0:
         fail(f"{label} contains nonfinite outputs")
-    if record["comparison_status"] != "pass":
-        fail(f"{label} comparison did not pass")
+    sampled = record["comparison_sampled"]
+    if not isinstance(sampled, bool):
+        fail(f"{label}.comparison_sampled must be boolean")
+    if sampled:
+        if (
+            record["reference_backend"] != "libggml_dequantize_row_iq1_s"
+            or record["comparison_status"] != "pass"
+        ):
+            fail(f"{label} sampled libggml comparison did not pass")
+    elif (
+        record["reference_backend"] is not None
+        or record["comparison_status"] != "finite_only"
+        or max_abs_error != 0.0
+        or max_rel_error != 0.0
+    ):
+        fail(f"{label} finite-only validation metadata is invalid")
+    _ = checked_elements
     timing = record["timing_us"]
     exact_fields(timing, set(TIMING_FIELDS), f"{label}.timing_us")
     for name in TIMING_FIELDS:
         integer(timing[name], f"{label}.timing_us.{name}")
+    return sampled
 
 
 def validate_summary(summary):
@@ -264,8 +308,9 @@ def validate_ledger(root):
     seen = set()
     transaction_phases = {}
     generation = None
+    sampled_comparisons = 0
     for index, record in enumerate(records):
-        validate_phase(record, index, mode)
+        sampled_comparisons += int(validate_phase(record, index, mode))
         identity = (record["transaction_id"], record["phase"])
         if identity in seen:
             fail("phase ledger duplicates a transaction/phase")
@@ -278,6 +323,8 @@ def validate_ledger(root):
             generation = record["session_generation"]
         elif record["session_generation"] != generation:
             fail("phase ledger spans multiple session generations")
+    if sampled_comparisons != 1:
+        fail("phase ledger must contain exactly one sampled libggml comparison")
     return {
         "gate": "ledger",
         "mode": mode,
@@ -367,6 +414,96 @@ def validate_g3(root):
     }
 
 
+def one_token_ids(value, label):
+    if not isinstance(value, list) or len(value) != 1:
+        fail(f"{label} must contain exactly one token ID")
+    integer(value[0], f"{label}[0]")
+    return value
+
+
+def validate_g4(root):
+    aggregate = read_json(root / "g4-summary.json", "g4-summary.json")
+    exact_fields(aggregate, G4_FIELDS, "G4 summary")
+    if (
+        aggregate["schema_version"] != 1
+        or aggregate["kind"] != "iq1s_persistent_g4"
+        or aggregate["profile"] != "one-token"
+    ):
+        fail("G4 summary schema or profile is invalid")
+    if aggregate["model_sha256"] != "0a32c2702fbb61934960cfeef34524b81ec6d9267158f246d45fc86f5aaa7568":
+        fail("G4 model SHA-256 differs from the pinned Qwen model")
+    sha256(aggregate["xclbin_sha256"], "G4 xclbin_sha256")
+    if not isinstance(aggregate["xclbin_uuid"], str) or UUID.fullmatch(aggregate["xclbin_uuid"]) is None:
+        fail("G4 xclbin_uuid is invalid")
+
+    cuda = aggregate["cuda"]
+    exact_fields(cuda, G4_CUDA_FIELDS, "G4 CUDA")
+    if integer(cuda["generated_tokens"], "G4 CUDA generated_tokens") != 1:
+        fail("G4 CUDA must generate exactly one token")
+    cuda_tokens = one_token_ids(cuda["token_ids"], "G4 CUDA token_ids")
+    cuda_latency = finite_number(cuda["e2e_latency_ms"], "G4 CUDA e2e_latency_ms")
+    if cuda_latency <= 0.0:
+        fail("G4 CUDA latency must be positive")
+
+    latencies = {"cuda": cuda_latency}
+    for mode_name in ("handwritten", "compiler"):
+        mode = aggregate[mode_name]
+        exact_fields(mode, G4_HYBRID_FIELDS, f"G4 {mode_name}")
+        if integer(mode["generated_tokens"], f"G4 {mode_name} generated_tokens") != 1:
+            fail(f"G4 {mode_name} must generate exactly one token")
+        if one_token_ids(mode["token_ids"], f"G4 {mode_name} token_ids") != cuda_tokens:
+            fail(f"G4 {mode_name} token IDs differ from CUDA")
+        routing = mode["routing"]
+        exact_fields(
+            routing,
+            {"u250_iq1s_tensors", "gpu_non_iq1s_tensors", "u250_non_iq1s_tensors", "attention"},
+            f"G4 {mode_name} routing",
+        )
+        if routing != {
+            "u250_iq1s_tensors": 141,
+            "gpu_non_iq1s_tensors": 39,
+            "u250_non_iq1s_tensors": 0,
+            "attention": "gpu",
+        }:
+            fail(f"G4 {mode_name} routing differs from the fixed split")
+        if integer(mode["eligible_direct_routes"], f"G4 {mode_name} eligible_direct_routes") != 0:
+            fail(f"G4 {mode_name} contains an eligible direct route")
+        if integer(mode["fallbacks"], f"G4 {mode_name} fallbacks") != 0:
+            fail(f"G4 {mode_name} contains a fallback")
+        if integer(mode["measured_weight_dma_bytes"], f"G4 {mode_name} measured_weight_dma_bytes") != 0:
+            fail(f"G4 {mode_name} transferred weights during measurement")
+        four_positive_integers(mode["completions_per_cu"], f"G4 {mode_name} completions_per_cu")
+        latency = finite_number(mode["e2e_latency_ms"], f"G4 {mode_name} e2e_latency_ms")
+        if latency <= 0.0:
+            fail(f"G4 {mode_name} latency must be positive")
+        latencies[mode_name] = latency
+
+        mode_root = root / f"{mode_name}-mode"
+        ledger_result = validate_ledger(mode_root)
+        if ledger_result["mode"] != mode_name:
+            fail(f"G4 {mode_name} ledger mode differs from its directory")
+        phase_records = read_ledger(mode_root / "phase-ledger.jsonl")
+        ledger_completions = [
+            sum(record["completions_per_cu"][cu] for record in phase_records)
+            for cu in range(4)
+        ]
+        if ledger_completions != mode["completions_per_cu"]:
+            fail(f"G4 {mode_name} completion counts differ from its phase ledger")
+        if sum(record["weight_dma_bytes"] for record in phase_records) != mode["measured_weight_dma_bytes"]:
+            fail(f"G4 {mode_name} weight DMA differs from its phase ledger")
+        mode_summary = read_json(mode_root / "summary.json", f"{mode_name} summary.json")
+        if mode_summary["token_ids"] != mode["token_ids"]:
+            fail(f"G4 {mode_name} aggregate tokens differ from its ledger summary")
+
+    return {
+        "gate": "g4",
+        "latency_ms": latencies,
+        "status": "pass",
+        "token_ids": cuda_tokens,
+        "xclbin_uuid": aggregate["xclbin_uuid"],
+    }
+
+
 def parser():
     result = argparse.ArgumentParser()
     result.add_argument("--gate", choices=("ledger", "g3", "g4", "g5"), required=True)
@@ -382,6 +519,8 @@ def main(argv=None):
             result = validate_ledger(root)
         elif args.gate == "g3":
             result = validate_g3(root)
+        elif args.gate == "g4":
+            result = validate_g4(root)
         else:
             fail(f"gate {args.gate} is not implemented by this build")
     except (ProofInvalid, OSError, TypeError, ValueError) as error:

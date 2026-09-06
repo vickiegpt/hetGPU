@@ -722,6 +722,86 @@ def valid_iq1s_routes():
     ]
 
 
+def persistent_phase(phase_name="A", sampled=True, transaction_id=17):
+    return {
+        "schema_version": 2,
+        "kind": "iq1s_persistent_phase",
+        "transaction_id": transaction_id,
+        "layer_id": 7,
+        "phase": phase_name,
+        "trace_mode": "handwritten",
+        "session_generation": 1,
+        "program_sha256": ["11" * 32] * 4,
+        "semantic_sha256": "22" * 32,
+        "commands_per_cu": [3, 3, 3, 3],
+        "completions_per_cu": [3, 3, 3, 3],
+        "weight_dma_bytes": 0,
+        "eligible_direct_routes": 0,
+        "comparison_sampled": sampled,
+        "reference_backend": "libggml_dequantize_row_iq1_s" if sampled else None,
+        "checked_elements": 1024,
+        "max_abs_error": 2.5e-5 if sampled else 0.0,
+        "max_rel_error": 4.0e-4 if sampled else 0.0,
+        "nonfinite": 0,
+        "comparison_status": "pass" if sampled else "finite_only",
+        "timing_us": {
+            name: 1
+            for name in (
+                "capture", "route_dma", "trace_build_or_cache", "activation_pack",
+                "activation_sync", "ring_publish", "doorbell", "device_wait",
+                "completion_sync", "result_copy", "reconstruct", "compare", "log",
+                "phase_wall",
+            )
+        },
+    }
+
+
+def test_parse_persistent_iq1s_routing_uses_ledger_without_direct_xrt_records():
+    evaluator = load_evaluator()
+    routes, xrt, attention, comparison = evaluator.parse_persistent_iq1s_routing(
+        [iq1s_route("flash_attn_f32", "gpu", False)],
+        [persistent_phase("A", True), persistent_phase("B", False)],
+        "handwritten",
+    )
+    assert routes["eligible"] == routes["handled"] == 2
+    assert routes["fallback"] == routes["error"] == 0
+    assert xrt["submission_count"] == xrt["completion_count"] == 24
+    assert xrt["per_cu_completions"] == [6, 6, 6, 6]
+    assert attention == 1
+    assert comparison == {
+        "status": "pass",
+        "reference_backend": "libggml_dequantize_row_iq1_s",
+        "checked_elements": 1024,
+        "atol": 1.0e-4,
+        "rtol": 1.0e-3,
+        "max_absolute_error": 2.5e-5,
+        "max_relative_error": 4.0e-4,
+        "phase": "pre_timed",
+        "kernel": "iq1s_layer_persistent",
+    }
+
+
+@pytest.mark.parametrize("mutation", ("direct", "no_attention", "no_sample", "two_samples", "dma", "trace"))
+def test_parse_persistent_iq1s_routing_rejects_unproven_paths(mutation):
+    evaluator = load_evaluator()
+    routes = [iq1s_route("flash_attn_f32", "gpu", False)]
+    phases = [persistent_phase("A", True), persistent_phase("B", False)]
+    if mutation == "direct":
+        routes.append(iq1s_route("mul_mat_vec_q_ggml_type19"))
+    elif mutation == "no_attention":
+        routes = []
+    elif mutation == "no_sample":
+        phases[0] = persistent_phase("A", False)
+    elif mutation == "two_samples":
+        phases[1] = persistent_phase("B", True)
+    elif mutation == "dma":
+        phases[0]["weight_dma_bytes"] = 1
+    elif mutation == "trace":
+        phases[0]["trace_mode"] = "compiler"
+    with pytest.raises(evaluator.EvaluationError):
+        evaluator.parse_persistent_iq1s_routing(routes, phases, "handwritten")
+
+
 def test_parse_iq1s_routing_selects_only_exact_type19_matmul_and_physical_xrt():
     evaluator = load_evaluator()
 

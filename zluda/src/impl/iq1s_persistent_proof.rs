@@ -5,6 +5,78 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const PHASE_KIND: &str = "iq1s_persistent_phase";
+pub(crate) const LIBGGML_REFERENCE_BACKEND: &str = "libggml_dequantize_row_iq1_s";
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct PhaseComparison {
+    pub(crate) sampled: bool,
+    pub(crate) reference_backend: Option<&'static str>,
+    pub(crate) checked_elements: usize,
+    pub(crate) max_abs_error: f32,
+    pub(crate) max_rel_error: f32,
+    pub(crate) nonfinite: u64,
+    pub(crate) status: &'static str,
+}
+
+impl PhaseComparison {
+    pub(crate) fn sampled_pass(
+        reference_backend: &'static str,
+        checked_elements: usize,
+        max_abs_error: f32,
+        max_rel_error: f32,
+    ) -> Result<Self, String> {
+        let comparison = Self {
+            sampled: true,
+            reference_backend: Some(reference_backend),
+            checked_elements,
+            max_abs_error,
+            max_rel_error,
+            nonfinite: 0,
+            status: "pass",
+        };
+        comparison.validate()?;
+        Ok(comparison)
+    }
+
+    pub(crate) fn finite_only(checked_elements: usize) -> Result<Self, String> {
+        let comparison = Self {
+            sampled: false,
+            reference_backend: None,
+            checked_elements,
+            max_abs_error: 0.0,
+            max_rel_error: 0.0,
+            nonfinite: 0,
+            status: "finite_only",
+        };
+        comparison.validate()?;
+        Ok(comparison)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let valid_sampled = self.sampled
+            && self.reference_backend == Some(LIBGGML_REFERENCE_BACKEND)
+            && self.checked_elements > 0
+            && self.status == "pass";
+        let valid_finite_only = !self.sampled
+            && self.reference_backend.is_none()
+            && self.checked_elements > 0
+            && self.status == "finite_only"
+            && self.max_abs_error == 0.0
+            && self.max_rel_error == 0.0;
+        if (!valid_sampled && !valid_finite_only)
+            || self.nonfinite != 0
+            || !self.max_abs_error.is_finite()
+            || !self.max_rel_error.is_finite()
+            || self.max_abs_error < 0.0
+            || self.max_rel_error < 0.0
+            || self.max_abs_error > 1.0e-4
+            || self.max_rel_error > 1.0e-3
+        {
+            return Err("persistent IQ1_S comparison violates its fail-closed schema".to_string());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct PhaseTimingsUs {
@@ -39,6 +111,9 @@ pub(crate) struct PersistentPhaseRecord {
     pub(crate) completions_per_cu: [usize; 4],
     pub(crate) weight_dma_bytes: u64,
     pub(crate) eligible_direct_routes: u64,
+    pub(crate) comparison_sampled: bool,
+    pub(crate) reference_backend: Option<&'static str>,
+    pub(crate) checked_elements: usize,
     pub(crate) max_abs_error: f32,
     pub(crate) max_rel_error: f32,
     pub(crate) nonfinite: u64,
@@ -58,10 +133,12 @@ impl PersistentPhaseRecord {
         commands_per_cu: [usize; 4],
         completions_per_cu: [usize; 4],
         weight_dma_bytes: u64,
+        comparison: PhaseComparison,
         timing_us: PhaseTimingsUs,
     ) -> Result<Self, String> {
+        comparison.validate()?;
         let record = Self {
-            schema_version: 1,
+            schema_version: 2,
             kind: PHASE_KIND,
             transaction_id,
             layer_id,
@@ -74,10 +151,13 @@ impl PersistentPhaseRecord {
             completions_per_cu,
             weight_dma_bytes,
             eligible_direct_routes: 0,
-            max_abs_error: 0.0,
-            max_rel_error: 0.0,
-            nonfinite: 0,
-            comparison_status: "pass",
+            comparison_sampled: comparison.sampled,
+            reference_backend: comparison.reference_backend,
+            checked_elements: comparison.checked_elements,
+            max_abs_error: comparison.max_abs_error,
+            max_rel_error: comparison.max_rel_error,
+            nonfinite: comparison.nonfinite,
+            comparison_status: comparison.status,
             timing_us,
         };
         record.validate()?;
@@ -85,7 +165,17 @@ impl PersistentPhaseRecord {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.transaction_id == 0
+        let comparison = PhaseComparison {
+            sampled: self.comparison_sampled,
+            reference_backend: self.reference_backend,
+            checked_elements: self.checked_elements,
+            max_abs_error: self.max_abs_error,
+            max_rel_error: self.max_rel_error,
+            nonfinite: self.nonfinite,
+            status: self.comparison_status,
+        };
+        if self.schema_version != 2
+            || self.transaction_id == 0
             || self.layer_id >= 60
             || !matches!(self.phase, "A" | "B")
             || !matches!(self.trace_mode.as_str(), "handwritten" | "compiler")
@@ -94,12 +184,7 @@ impl PersistentPhaseRecord {
             || self.commands_per_cu != self.completions_per_cu
             || self.weight_dma_bytes != 0
             || self.eligible_direct_routes != 0
-            || self.nonfinite != 0
-            || self.comparison_status != "pass"
-            || !self.max_abs_error.is_finite()
-            || !self.max_rel_error.is_finite()
-            || self.max_abs_error > 1.0e-4
-            || self.max_rel_error > 1.0e-3
+            || comparison.validate().is_err()
             || self.program_sha256.iter().any(|hash| !is_sha256(hash))
             || !is_sha256(&self.semantic_sha256)
         {
@@ -226,6 +311,8 @@ mod tests {
             [3; 4],
             [3; 4],
             0,
+            PhaseComparison::sampled_pass("libggml_dequantize_row_iq1_s", 1024, 2.5e-5, 4.0e-4)
+                .unwrap(),
             PhaseTimingsUs::default(),
         )
         .unwrap()
@@ -245,7 +332,13 @@ mod tests {
         assert_eq!(bytes.split(|byte| *byte == b'\n').count(), 2);
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["kind"], PHASE_KIND);
+        assert_eq!(parsed["schema_version"], 2);
         assert_eq!(parsed["commands_per_cu"], serde_json::json!([3, 3, 3, 3]));
+        assert_eq!(parsed["comparison_sampled"], true);
+        assert_eq!(parsed["reference_backend"], "libggml_dequantize_row_iq1_s");
+        assert_eq!(parsed["checked_elements"], 1024);
+        assert_eq!(parsed["max_abs_error"], 2.5e-5);
+        assert_eq!(parsed["max_rel_error"], 4.0e-4);
         assert!(parsed.get("outputs").is_none());
     }
 
@@ -257,5 +350,22 @@ mod tests {
         let mut incomplete = record();
         incomplete.completions_per_cu[3] = 0;
         assert!(incomplete.validate().is_err());
+    }
+
+    #[test]
+    fn iq1s_persistent_proof_distinguishes_finite_only_from_sampled_oracle() {
+        let finite = PhaseComparison::finite_only(4096).unwrap();
+        assert!(!finite.sampled);
+        assert_eq!(finite.reference_backend, None);
+        assert_eq!(finite.checked_elements, 4096);
+        assert_eq!(finite.status, "finite_only");
+
+        assert!(
+            PhaseComparison::sampled_pass("libggml_dequantize_row_iq1_s", 0, 0.0, 0.0,).is_err()
+        );
+        assert!(PhaseComparison::sampled_pass("scalar_iq1s", 1, 0.0, 0.0).is_err());
+        assert!(
+            PhaseComparison::sampled_pass("libggml_dequantize_row_iq1_s", 1, 1.1e-4, 0.0,).is_err()
+        );
     }
 }
