@@ -22,7 +22,7 @@ use super::iq1s_layer_abi::{
     IQ1S_REG_SESSION_GENERATION_LO_OFFSET, IQ1S_ROLE_DOWN, IQ1S_ROLE_GATE, IQ1S_ROLE_UP,
 };
 use super::iq1s_layer_trace::{
-    validate_compiled_layer_phase, ActivationRange, CompiledLayerPhase, ExpandedIq1sCounts,
+    validate_compiled_layer_phase, CompiledLayerPhase, ExpandedIq1sCounts,
 };
 use super::iq1s_trace::QWEN_MODEL_CONTEXT_LIMIT;
 use super::iq1s_weight_arena::{ARENA_ALIGNMENT, ARENA_BANK_COUNT, ARENA_SUPERBLOCK_BYTES};
@@ -211,12 +211,37 @@ impl PersistentDmaCounters {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostRange {
+    pub(crate) offset: u64,
+    pub(crate) bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PhaseBuffers {
+    pub(crate) activations: Vec<HostRange>,
+    pub(crate) token_maps: Vec<HostRange>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PersistentPhaseTimings {
+    pub(crate) activation_sync_us: u64,
+    pub(crate) ring_publish_us: u64,
+    pub(crate) doorbell_us: u64,
+    pub(crate) device_wait_us: u64,
+    pub(crate) completion_sync_us: u64,
+    pub(crate) result_copy_us: u64,
+    pub(crate) phase_wall_us: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompletedLayerPhase {
     pub(crate) transaction_id: u64,
     pub(crate) semantic_sha256: [u8; 32],
     pub(crate) completions: [Vec<Iq1sCompletion>; ARENA_BANK_COUNT],
+    pub(crate) results: [Vec<HostRange>; ARENA_BANK_COUNT],
     pub(crate) expanded: ExpandedIq1sCounts,
     pub(crate) dma: PersistentDmaCounters,
+    pub(crate) timings: PersistentPhaseTimings,
 }
 
 #[derive(Debug)]
@@ -343,7 +368,10 @@ fn command_crc(command: &Iq1sCommand) -> u32 {
     iq1s_command_crc32(&bytes)
 }
 
-fn merge_ranges(ranges: impl IntoIterator<Item = (usize, usize)>) -> Vec<(usize, usize)> {
+fn merge_adjacent_ranges(
+    ranges: impl IntoIterator<Item = (usize, usize)>,
+    name: &str,
+) -> Result<Vec<(usize, usize)>, PersistentError> {
     let mut ranges = ranges
         .into_iter()
         .filter(|(_, bytes)| *bytes != 0)
@@ -351,19 +379,70 @@ fn merge_ranges(ranges: impl IntoIterator<Item = (usize, usize)>) -> Vec<(usize,
     ranges.sort_unstable_by_key(|(offset, _)| *offset);
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (offset, bytes) in ranges {
-        let Some(end) = offset.checked_add(bytes) else {
-            return Vec::new();
-        };
+        let end = offset.checked_add(bytes).ok_or_else(|| {
+            PersistentError::InvalidPhase(format!("{name} range overflows usize"))
+        })?;
         if let Some((last_offset, last_bytes)) = merged.last_mut() {
-            let last_end = *last_offset + *last_bytes;
-            if offset <= last_end {
-                *last_bytes = last_end.max(end) - *last_offset;
+            let last_end = last_offset.checked_add(*last_bytes).ok_or_else(|| {
+                PersistentError::InvalidPhase(format!("{name} range overflows usize"))
+            })?;
+            if offset < last_end {
+                return Err(PersistentError::InvalidPhase(format!(
+                    "{name} ranges overlap"
+                )));
+            }
+            if offset == last_end {
+                *last_bytes = end - *last_offset;
                 continue;
             }
         }
         merged.push((offset, bytes));
     }
-    merged
+    Ok(merged)
+}
+
+fn validate_host_ranges(
+    ranges: &[HostRange],
+    capacity: usize,
+    name: &str,
+) -> Result<Vec<(usize, usize)>, PersistentError> {
+    if ranges.is_empty() || ranges.iter().any(|range| range.bytes.is_empty()) {
+        return Err(PersistentError::InvalidPhase(format!(
+            "{name} host ranges are empty"
+        )));
+    }
+    let checked = ranges
+        .iter()
+        .map(|range| {
+            let offset = usize::try_from(range.offset).map_err(|_| {
+                PersistentError::InvalidPhase(format!("{name} offset does not fit usize"))
+            })?;
+            let end = offset.checked_add(range.bytes.len()).ok_or_else(|| {
+                PersistentError::InvalidPhase(format!("{name} host range overflows"))
+            })?;
+            if end > capacity {
+                return Err(PersistentError::InvalidPhase(format!(
+                    "{name} host range exceeds its slab"
+                )));
+            }
+            Ok((offset, range.bytes.len()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    merge_adjacent_ranges(checked, name)
+}
+
+fn range_is_covered(ranges: &[(usize, usize)], offset: usize, bytes: usize) -> bool {
+    offset.checked_add(bytes).is_some_and(|end| {
+        ranges.iter().any(|(range_offset, range_bytes)| {
+            range_offset
+                .checked_add(*range_bytes)
+                .is_some_and(|range_end| offset >= *range_offset && end <= range_end)
+        })
+    })
+}
+
+fn elapsed_us(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn resident_model_tag(chunks: &[ArenaChunkSpec]) -> u64 {
@@ -974,9 +1053,9 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
     pub(crate) fn submit_phase(
         &mut self,
         phase: &CompiledLayerPhase,
-        activations: &[ActivationRange],
+        buffers: &PhaseBuffers,
     ) -> Result<CompletedLayerPhase, PersistentError> {
-        let result = self.submit_phase_inner(phase, activations);
+        let result = self.submit_phase_inner(phase, buffers);
         if let Err(error) = &result {
             if self.poisoned.is_none()
                 && !matches!(
@@ -997,8 +1076,10 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
     fn submit_phase_inner(
         &mut self,
         phase: &CompiledLayerPhase,
-        activations: &[ActivationRange],
+        buffers: &PhaseBuffers,
     ) -> Result<CompletedLayerPhase, PersistentError> {
+        let phase_wall_start = Instant::now();
+        let mut timings = PersistentPhaseTimings::default();
         if let Some(fault) = &self.poisoned {
             return Err(PersistentError::Poisoned(fault.clone()));
         }
@@ -1007,27 +1088,82 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
         }
         validate_compiled_layer_phase(phase, QWEN_MODEL_CONTEXT_LIMIT)
             .map_err(PersistentError::InvalidPhase)?;
-        if activations != phase.activations {
+        let activation_ranges =
+            validate_host_ranges(&buffers.activations, ACTIVATION_BYTES, "activation")?;
+        let token_map_ranges =
+            validate_host_ranges(&buffers.token_maps, TOKEN_MAP_BYTES, "token-map")?;
+        let mut activation_manifest = phase
+            .activations
+            .iter()
+            .map(|range| {
+                (
+                    range.slab_offset,
+                    usize::try_from(range.bytes).unwrap_or(usize::MAX),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut supplied_activations = buffers
+            .activations
+            .iter()
+            .map(|range| (range.offset, range.bytes.len()))
+            .collect::<Vec<_>>();
+        activation_manifest.sort_unstable();
+        supplied_activations.sort_unstable();
+        if supplied_activations != activation_manifest {
             return Err(PersistentError::InvalidPhase(
                 "activation manifest differs from compiled phase".to_string(),
             ));
         }
         let dma_before = self.dma;
-        let activation_ranges = merge_ranges(
-            activations
-                .iter()
-                .map(|range| (range.slab_offset as usize, range.bytes as usize)),
-        );
-        if activation_ranges.is_empty()
-            || activation_ranges.iter().any(|(offset, bytes)| {
-                offset
-                    .checked_add(*bytes)
+        let mut result_ranges: [Vec<(usize, usize)>; ARENA_BANK_COUNT] =
+            std::array::from_fn(|_| Vec::new());
+        for (cu, commands) in phase.commands.iter().enumerate() {
+            let mut outputs = Vec::with_capacity(commands.len());
+            for command in commands {
+                let input_offset = usize::try_from(command.input_offset).map_err(|_| {
+                    PersistentError::InvalidPhase(
+                        "descriptor activation offset does not fit usize".to_string(),
+                    )
+                })?;
+                let input_bytes = command.input_bytes as usize;
+                let output_offset = usize::try_from(command.output_offset).map_err(|_| {
+                    PersistentError::InvalidPhase(
+                        "descriptor output offset does not fit usize".to_string(),
+                    )
+                })?;
+                let output_bytes = command.output_bytes as usize;
+                let token_offset = usize::try_from(command.token_map_offset).map_err(|_| {
+                    PersistentError::InvalidPhase(
+                        "descriptor token-map offset does not fit usize".to_string(),
+                    )
+                })?;
+                let token_bytes =
+                    usize::from(command.lane_count)
+                        .checked_mul(4)
+                        .ok_or_else(|| {
+                            PersistentError::InvalidPhase(
+                                "descriptor token-map byte count overflow".to_string(),
+                            )
+                        })?;
+                if input_offset
+                    .checked_add(input_bytes)
                     .is_none_or(|end| end > ACTIVATION_BYTES)
-            })
-        {
-            return Err(PersistentError::InvalidPhase(
-                "activation DMA range is empty, overflowing, or outside the slab".to_string(),
-            ));
+                    || output_offset
+                        .checked_add(output_bytes)
+                        .is_none_or(|end| end > OUTPUT_BYTES)
+                    || token_offset
+                        .checked_add(token_bytes)
+                        .is_none_or(|end| end > TOKEN_MAP_BYTES)
+                    || !range_is_covered(&activation_ranges, input_offset, input_bytes)
+                    || !range_is_covered(&token_map_ranges, token_offset, token_bytes)
+                {
+                    return Err(PersistentError::InvalidPhase(format!(
+                        "CU {cu} descriptor is outside supplied activation, output, or token-map ranges"
+                    )));
+                }
+                outputs.push((output_offset, output_bytes));
+            }
+            result_ranges[cu] = merge_adjacent_ranges(outputs, "result")?;
         }
 
         let mut expected: [Vec<Iq1sCommand>; ARENA_BANK_COUNT] =
@@ -1129,16 +1265,24 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                     .copy_from_slice(struct_bytes(&command));
                 expected[cu].push(command);
             }
-            checked_code(
-                "write command ring",
-                self.ops
-                    .bo_write(self.cus[cu].command_bo, &self.cus[cu].command_shadow),
-            )?;
-            for (offset, bytes) in Self::descriptor_ranges(
+            let ring_publish_start = Instant::now();
+            let command_ranges = Self::descriptor_ranges(
                 producer,
                 phase.commands[cu].len(),
                 self.config.command_capacity,
-            ) {
+            );
+            for (offset, bytes) in command_ranges {
+                let end = offset.checked_add(bytes).ok_or_else(|| {
+                    PersistentError::InvalidPhase("command ring range overflow".to_string())
+                })?;
+                checked_code(
+                    "write command ring",
+                    self.ops.bo_write_range(
+                        self.cus[cu].command_bo,
+                        &self.cus[cu].command_shadow[offset..end],
+                        offset,
+                    ),
+                )?;
                 checked_code(
                     "sync command ring",
                     self.ops.bo_sync(
@@ -1150,32 +1294,79 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                 )?;
                 self.dma.command_ranges += 1;
             }
-            for (offset, bytes) in &activation_ranges {
+            let next_producer = producer.wrapping_add(count);
+            timings.ring_publish_us = timings
+                .ring_publish_us
+                .saturating_add(elapsed_us(ring_publish_start));
+
+            let activation_sync_start = Instant::now();
+            for range in &buffers.activations {
+                let offset = usize::try_from(range.offset).map_err(|_| {
+                    PersistentError::InvalidPhase(
+                        "activation offset does not fit usize".to_string(),
+                    )
+                })?;
+                checked_code(
+                    "write activation range",
+                    self.ops
+                        .bo_write_range(self.cus[cu].activation_bo, &range.bytes, offset),
+                )?;
                 checked_code(
                     "sync activation range",
                     self.ops.bo_sync(
                         self.cus[cu].activation_bo,
                         XRT_BO_SYNC_TO_DEVICE,
-                        *bytes,
-                        *offset,
+                        range.bytes.len(),
+                        offset,
                     ),
                 )?;
                 self.dma.activation_ranges += 1;
             }
-            let next_producer = producer.wrapping_add(count);
+            for range in &buffers.token_maps {
+                let offset = usize::try_from(range.offset).map_err(|_| {
+                    PersistentError::InvalidPhase("token-map offset does not fit usize".to_string())
+                })?;
+                checked_code(
+                    "write token-map range",
+                    self.ops
+                        .bo_write_range(self.cus[cu].token_map_bo, &range.bytes, offset),
+                )?;
+                checked_code(
+                    "sync token-map range",
+                    self.ops.bo_sync(
+                        self.cus[cu].token_map_bo,
+                        XRT_BO_SYNC_TO_DEVICE,
+                        range.bytes.len(),
+                        offset,
+                    ),
+                )?;
+            }
+            timings.activation_sync_us = timings
+                .activation_sync_us
+                .saturating_add(elapsed_us(activation_sync_start));
+            let producer_publish_start = Instant::now();
             self.reg_write(cu, IQ1S_REG_COMMAND_PRODUCER_OFFSET, next_producer)?;
+            timings.ring_publish_us = timings
+                .ring_publish_us
+                .saturating_add(elapsed_us(producer_publish_start));
+            let doorbell_start = Instant::now();
             self.reg_write(cu, IQ1S_REG_DOORBELL_OFFSET, 1)?;
+            timings.doorbell_us = timings
+                .doorbell_us
+                .saturating_add(elapsed_us(doorbell_start));
             self.cus[cu].command_producer = next_producer;
         }
 
         let deadline = Instant::now() + Duration::from_millis(u64::from(self.config.timeout_ms));
         let mut completed: [Vec<Iq1sCompletion>; ARENA_BANK_COUNT] =
             std::array::from_fn(|_| Vec::new());
+        let mut results: [Vec<HostRange>; ARENA_BANK_COUNT] = std::array::from_fn(|_| Vec::new());
         for cu in 0..ARENA_BANK_COUNT {
             let expected_end = self.cus[cu]
                 .completion_consumer
                 .wrapping_add(expected[cu].len() as u32);
             let mut backoff = 1u64;
+            let device_wait_start = Instant::now();
             let observed_producer = loop {
                 let fault_code = self.reg_read(cu, IQ1S_REG_FAULT_CODE_OFFSET)?;
                 if fault_code != IQ1S_FAULT_CODE_NONE {
@@ -1199,6 +1390,9 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                 std::thread::sleep(Duration::from_micros(backoff));
                 backoff = (backoff * 2).min(MAX_BACKOFF_US);
             };
+            timings.device_wait_us = timings
+                .device_wait_us
+                .saturating_add(elapsed_us(device_wait_start));
             if observed_producer != expected_end {
                 return self.poison(PersistentFault {
                     cu: Some(cu),
@@ -1208,6 +1402,7 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                     ),
                 });
             }
+            let completion_sync_start = Instant::now();
             for (offset, bytes) in Self::descriptor_ranges(
                 self.cus[cu].completion_consumer,
                 expected[cu].len(),
@@ -1222,14 +1417,21 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                         offset,
                     ),
                 )?;
+                let end = offset.checked_add(bytes).ok_or_else(|| {
+                    PersistentError::InvalidPhase("completion ring range overflow".to_string())
+                })?;
+                checked_code(
+                    "read completion ring",
+                    self.ops.bo_read_range(
+                        self.cus[cu].completion_bo,
+                        &mut self.cus[cu].completion_shadow[offset..end],
+                        offset,
+                    ),
+                )?;
             }
-            checked_code(
-                "read completion ring",
-                self.ops.bo_read(
-                    self.cus[cu].completion_bo,
-                    &mut self.cus[cu].completion_shadow,
-                ),
-            )?;
+            timings.completion_sync_us = timings
+                .completion_sync_us
+                .saturating_add(elapsed_us(completion_sync_start));
             for (index, command) in expected[cu].iter().enumerate() {
                 let counter = self.cus[cu].completion_consumer.wrapping_add(index as u32);
                 let slot = counter & (self.config.command_capacity - 1);
@@ -1267,7 +1469,8 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
             self.cus[cu].completion_consumer = expected_end;
             self.cus[cu].command_consumer = self.cus[cu].command_producer;
             self.reg_write(cu, IQ1S_REG_COMPLETION_CONSUMER_OFFSET, expected_end)?;
-            for (offset, bytes) in &activation_ranges {
+            let result_copy_start = Instant::now();
+            for (offset, bytes) in &result_ranges[cu] {
                 checked_code(
                     "sync result range",
                     self.ops.bo_sync(
@@ -1277,8 +1480,21 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                         *offset,
                     ),
                 )?;
+                let mut result = vec![0u8; *bytes];
+                checked_code(
+                    "read result range",
+                    self.ops
+                        .bo_read_range(self.cus[cu].output_bo, &mut result, *offset),
+                )?;
+                results[cu].push(HostRange {
+                    offset: *offset as u64,
+                    bytes: result,
+                });
                 self.dma.result_ranges += 1;
             }
+            timings.result_copy_us = timings
+                .result_copy_us
+                .saturating_add(elapsed_us(result_copy_start));
         }
         if self.measured
             && (self.dma.weight_ranges != self.measurement_baseline.weight_ranges
@@ -1304,12 +1520,15 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                         .saturating_add(program.expanded.delta_passes);
                     total
                 });
+        timings.phase_wall_us = elapsed_us(phase_wall_start);
         Ok(CompletedLayerPhase {
             transaction_id: phase.transaction_id,
             semantic_sha256: phase.semantic_sha256,
             completions: completed,
+            results,
             expanded,
             dma: self.dma.checked_delta(dma_before)?,
+            timings,
         })
     }
 
@@ -1364,7 +1583,7 @@ impl<O: XrtOps> Drop for PersistentIq1sPool<O> {
 mod tests {
     use super::*;
     use crate::r#impl::iq1s_layer_trace::{
-        compile_layer_phase, LayerPhase, LayerPhasePlan, SemanticIq1sCommand,
+        compile_layer_phase, ActivationRange, LayerPhase, LayerPhasePlan, SemanticIq1sCommand,
     };
     use crate::r#impl::iq1s_weight_arena::ArenaShard;
     use crate::r#impl::iq1s_weight_registry::{Iq1sExpertRole, Iq1sTensorIdentity};
@@ -1392,6 +1611,16 @@ mod tests {
         BoSync {
             bo: usize,
             direction: i32,
+            offset: usize,
+            bytes: usize,
+        },
+        BoWriteRange {
+            bo: usize,
+            offset: usize,
+            bytes: Vec<u8>,
+        },
+        BoReadRange {
+            bo: usize,
             offset: usize,
             bytes: usize,
         },
@@ -1428,6 +1657,7 @@ mod tests {
         doorbell_consumer: HashMap<u32, u32>,
         completion_mutation: Option<CompletionMutation>,
         hold_completions: bool,
+        fail_read_bo: Option<usize>,
     }
 
     struct FakeXrt {
@@ -1473,6 +1703,10 @@ mod tests {
             self.state.borrow_mut().completion_mutation = Some(mutation);
         }
 
+        fn fail_read(&self, bo: Handle) {
+            self.state.borrow_mut().fail_read_bo = Some(bo as usize);
+        }
+
         fn ring_doorbell(state: &mut FakeState, cu: u32) {
             if state.hold_completions {
                 return;
@@ -1489,6 +1723,10 @@ mod tests {
                     | (u64::from(
                         state.registers[&(cu, IQ1S_REG_COMPLETION_BASE_HI_OFFSET as u32)],
                     ) << 32);
+            let output_address =
+                u64::from(state.registers[&(cu, IQ1S_REG_RESULT_BASE_LO_OFFSET as u32)])
+                    | (u64::from(state.registers[&(cu, IQ1S_REG_RESULT_BASE_HI_OFFSET as u32)])
+                        << 32);
             let command_bo = *state
                 .addresses
                 .iter()
@@ -1501,6 +1739,12 @@ mod tests {
                 .find(|(_, address)| **address == completion_address)
                 .unwrap()
                 .0;
+            let output_bo = *state
+                .addresses
+                .iter()
+                .find(|(_, address)| **address == output_address)
+                .unwrap()
+                .0;
             let commands = state.memories[&command_bo].clone();
             for counter in start..command_producer {
                 let slot = counter & (capacity - 1);
@@ -1509,6 +1753,11 @@ mod tests {
                     &commands[offset..offset + IQ1S_COMMAND_BYTES],
                 )
                 .unwrap();
+                let output_offset =
+                    usize::try_from(command.output_offset - output_address).unwrap();
+                let output_end = output_offset + command.output_bytes as usize;
+                state.memories.get_mut(&output_bo).unwrap()[output_offset..output_end]
+                    .fill(0x40 + cu as u8);
                 let mut completion = Iq1sCompletion {
                     magic: IQ1S_COMPLETION_MAGIC,
                     abi_version: IQ1S_ABI_VERSION as u16,
@@ -1668,22 +1917,42 @@ mod tests {
         fn bo_address(&self, bo: Handle) -> u64 {
             self.state.borrow().addresses[&(bo as usize)]
         }
-        fn bo_write(&self, bo: Handle, bytes: &[u8]) -> i32 {
+        fn bo_write_range(&self, bo: Handle, bytes: &[u8], offset: usize) -> i32 {
             let mut state = self.state.borrow_mut();
             let memory = state.memories.get_mut(&(bo as usize)).unwrap();
-            if bytes.len() > memory.len() {
+            let Some(end) = offset.checked_add(bytes.len()) else {
+                return -1;
+            };
+            if end > memory.len() {
                 return -1;
             }
-            memory[..bytes.len()].copy_from_slice(bytes);
+            memory[offset..end].copy_from_slice(bytes);
+            state.events.push(Event::BoWriteRange {
+                bo: bo as usize,
+                offset,
+                bytes: bytes.to_vec(),
+            });
             0
         }
-        fn bo_read(&self, bo: Handle, bytes: &mut [u8]) -> i32 {
-            let state = self.state.borrow();
-            let memory = &state.memories[&(bo as usize)];
-            if bytes.len() > memory.len() {
+
+        fn bo_read_range(&self, bo: Handle, bytes: &mut [u8], offset: usize) -> i32 {
+            let mut state = self.state.borrow_mut();
+            if state.fail_read_bo == Some(bo as usize) {
                 return -1;
             }
-            bytes.copy_from_slice(&memory[..bytes.len()]);
+            let memory = &state.memories[&(bo as usize)];
+            let Some(end) = offset.checked_add(bytes.len()) else {
+                return -1;
+            };
+            if end > memory.len() {
+                return -1;
+            }
+            bytes.copy_from_slice(&memory[offset..end]);
+            state.events.push(Event::BoReadRange {
+                bo: bo as usize,
+                offset,
+                bytes: bytes.len(),
+            });
             0
         }
         fn bo_sync(&self, bo: Handle, direction: i32, size: usize, offset: usize) -> i32 {
@@ -1731,9 +2000,9 @@ mod tests {
                     expert_id: expert,
                     lane_mask: mask,
                     token_ids: tokens.clone(),
-                    input_offset: u64::from(expert) * 8192,
-                    output_offset: u64::from(expert) * 8192,
-                    token_map_offset: u64::from(expert) * 64,
+                    input_offset: 0x2000 + u64::from(expert) * 8192,
+                    output_offset: 0x8000 + u64::from(expert) * 8192,
+                    token_map_offset: 0x3000 + u64::from(expert) * 64,
                     row_shard: ArenaShard {
                         tensor: tensor.clone(),
                         expert,
@@ -1753,19 +2022,47 @@ mod tests {
                 transaction_id,
                 phase: LayerPhase::PhaseA,
                 commands,
-                activations: vec![
-                    ActivationRange {
-                        cuda_ptr: 0x10000,
-                        slab_offset: 0,
-                        bytes: 16384,
-                        stream: 1,
-                    },
-                ],
+                activations: vec![ActivationRange {
+                    cuda_ptr: 0x10000,
+                    slab_offset: 0x2000,
+                    bytes: if distinct { 32768 } else { 16384 },
+                    stream: 1,
+                }],
             },
             "compiler",
             QWEN_MODEL_CONTEXT_LIMIT,
         )
         .unwrap()
+    }
+
+    fn fixture_buffers(distinct: bool) -> PhaseBuffers {
+        let activation_bytes = if distinct { 32768 } else { 16384 };
+        PhaseBuffers {
+            activations: vec![HostRange {
+                offset: 0x2000,
+                bytes: vec![0x11; activation_bytes],
+            }],
+            token_maps: if distinct {
+                vec![
+                    HostRange {
+                        offset: 0x3000,
+                        bytes: 0u32.to_le_bytes().to_vec(),
+                    },
+                    HostRange {
+                        offset: 0x3040,
+                        bytes: 1u32.to_le_bytes().to_vec(),
+                    },
+                ]
+            } else {
+                vec![HostRange {
+                    offset: 0x3000,
+                    bytes: [0u32, 1u32]
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect(),
+                }]
+            },
+        }
     }
 
     fn pool(capacity: u32) -> PersistentIq1sPool<FakeXrt> {
@@ -1914,11 +2211,143 @@ mod tests {
     }
 
     #[test]
+    fn xrt_iq1s_persistent_range_io_writes_inputs_and_returns_output_ranges() {
+        let mut pool = pool(4);
+        let phase = fixture_phase(31, false);
+        let buffers = fixture_buffers(false);
+        let handles = pool
+            .cus
+            .iter()
+            .map(|cu| {
+                (
+                    cu.activation_bo as usize,
+                    cu.token_map_bo as usize,
+                    cu.output_bo as usize,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let completed = pool.submit_phase(&phase, &buffers).unwrap();
+        let events = pool.ops.events();
+        for (cu, (activation_bo, token_map_bo, output_bo)) in handles.into_iter().enumerate() {
+            assert!(events.iter().any(|event| matches!(event,
+                Event::BoWriteRange { bo, offset: 0x2000, bytes }
+                    if *bo == activation_bo && bytes == &buffers.activations[0].bytes)));
+            assert!(events.iter().any(|event| matches!(event,
+                Event::BoWriteRange { bo, offset: 0x3000, bytes }
+                    if *bo == token_map_bo && bytes == &buffers.token_maps[0].bytes)));
+            assert!(events.iter().any(|event| matches!(event,
+                Event::BoReadRange { bo, offset: 0x8000, bytes: 2048 }
+                    if *bo == output_bo)));
+            let last_input_sync = events
+                .iter()
+                .rposition(|event| matches!(event,
+                    Event::BoSync { bo, direction: XRT_BO_SYNC_TO_DEVICE, .. }
+                        if *bo == activation_bo || *bo == token_map_bo))
+                .unwrap();
+            let producer_publish = events
+                .iter()
+                .position(|event| matches!(event,
+                    Event::RegisterWrite { cu: actual, offset, value: 1 }
+                        if *actual == cu as u32
+                            && *offset == IQ1S_REG_COMMAND_PRODUCER_OFFSET as u32))
+                .unwrap();
+            let doorbell = events
+                .iter()
+                .position(|event| matches!(event,
+                    Event::RegisterWrite { cu: actual, offset, value: 1 }
+                        if *actual == cu as u32
+                            && *offset == IQ1S_REG_DOORBELL_OFFSET as u32))
+                .unwrap();
+            assert!(last_input_sync < producer_publish);
+            assert!(producer_publish < doorbell);
+            assert_eq!(completed.results[cu].len(), 1);
+            assert_eq!(completed.results[cu][0].offset, 0x8000);
+            assert_eq!(completed.results[cu][0].bytes, vec![0x40 + cu as u8; 2048]);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    Event::RegisterWrite { offset, value: 1, .. }
+                        if *offset == IQ1S_REG_DOORBELL_OFFSET as u32))
+                .count(),
+            4
+        );
+        assert_eq!(completed.dma.weight_bytes, 0);
+        pool.shutdown().unwrap();
+    }
+
+    fn assert_invalid_phase_poisons(
+        pool: &mut PersistentIq1sPool<FakeXrt>,
+        phase: &CompiledLayerPhase,
+        buffers: &PhaseBuffers,
+    ) {
+        assert!(matches!(
+            pool.submit_phase(phase, buffers),
+            Err(PersistentError::InvalidPhase(_)) | Err(PersistentError::Xrt { .. })
+        ));
+        assert!(matches!(
+            pool.submit_phase(phase, buffers),
+            Err(PersistentError::Poisoned(_))
+        ));
+    }
+
+    #[test]
+    fn xrt_iq1s_persistent_range_io_rejects_bad_host_and_device_ranges() {
+        {
+            let mut pool = pool(4);
+            let phase = fixture_phase(32, false);
+            let mut buffers = fixture_buffers(false);
+            buffers.activations = vec![HostRange {
+                offset: ACTIVATION_BYTES as u64 - 8,
+                bytes: vec![0; 16],
+            }];
+            assert_invalid_phase_poisons(&mut pool, &phase, &buffers);
+        }
+        {
+            let mut pool = pool(4);
+            let mut phase = fixture_phase(33, false);
+            for commands in &mut phase.commands {
+                commands[0].output_offset = OUTPUT_BYTES as u64 - 8;
+                commands[0].crc32 = 0;
+                commands[0].crc32 = command_crc(&commands[0]);
+            }
+            assert_invalid_phase_poisons(&mut pool, &phase, &fixture_buffers(false));
+        }
+        {
+            let mut pool = pool(4);
+            let phase = fixture_phase(34, false);
+            let mut buffers = fixture_buffers(false);
+            buffers.activations.push(HostRange {
+                offset: 0x3000,
+                bytes: vec![0; 0x1000],
+            });
+            assert_invalid_phase_poisons(&mut pool, &phase, &buffers);
+        }
+        {
+            let mut pool = pool(4);
+            let phase = fixture_phase(35, false);
+            let mut buffers = fixture_buffers(false);
+            buffers.token_maps.clear();
+            assert_invalid_phase_poisons(&mut pool, &phase, &buffers);
+        }
+    }
+
+    #[test]
+    fn xrt_iq1s_persistent_range_io_short_read_poisons_before_results() {
+        let mut pool = pool(4);
+        let phase = fixture_phase(36, false);
+        pool.ops.fail_read(pool.cus[0].output_bo);
+        assert_invalid_phase_poisons(&mut pool, &phase, &fixture_buffers(false));
+    }
+
+    #[test]
     fn xrt_iq1s_persistent_coalesces_dma_and_keeps_weights_resident() {
         let mut pool = pool(4);
         pool.measurement_begin().unwrap();
         let phase = fixture_phase(41, false);
-        let completed = pool.submit_phase(&phase, &phase.activations).unwrap();
+        let completed = pool.submit_phase(&phase, &fixture_buffers(false)).unwrap();
         assert_eq!(completed.completions.iter().map(Vec::len).sum::<usize>(), 4);
         let measured = pool.measurement_end().unwrap();
         assert_eq!(measured.weight_ranges, 0);
@@ -1934,7 +2363,7 @@ mod tests {
         let mut pool = pool(2);
         for transaction in 1..=3 {
             let phase = fixture_phase(transaction, true);
-            pool.submit_phase(&phase, &phase.activations).unwrap();
+            pool.submit_phase(&phase, &fixture_buffers(true)).unwrap();
         }
         assert_eq!(pool.cus[0].command_producer, 6);
         assert_eq!(pool.cus[0].completion_consumer, 6);
@@ -1955,11 +2384,11 @@ mod tests {
             pool.ops.set_completion_mutation(mutation);
             let phase = fixture_phase(51, false);
             assert!(matches!(
-                pool.submit_phase(&phase, &phase.activations),
+                pool.submit_phase(&phase, &fixture_buffers(false)),
                 Err(PersistentError::Fault(_))
             ));
             assert!(matches!(
-                pool.submit_phase(&phase, &phase.activations),
+                pool.submit_phase(&phase, &fixture_buffers(false)),
                 Err(PersistentError::Poisoned(_))
             ));
             pool.shutdown().unwrap();
@@ -1972,11 +2401,11 @@ mod tests {
         pool.cus[0].command_producer = 4;
         let phase = fixture_phase(61, false);
         assert!(matches!(
-            pool.submit_phase(&phase, &phase.activations),
+            pool.submit_phase(&phase, &fixture_buffers(false)),
             Err(PersistentError::RingFull { cu: 0, capacity: 4 })
         ));
         assert!(matches!(
-            pool.submit_phase(&phase, &phase.activations),
+            pool.submit_phase(&phase, &fixture_buffers(false)),
             Err(PersistentError::Poisoned(_))
         ));
         pool.shutdown().unwrap();

@@ -188,8 +188,14 @@ pub(crate) trait XrtOps {
     fn bo_alloc(&self, device: Handle, size: usize, flags: u64, group: u32) -> Handle;
     fn bo_free(&self, bo: Handle) -> i32;
     fn bo_address(&self, bo: Handle) -> u64;
-    fn bo_write(&self, bo: Handle, bytes: &[u8]) -> i32;
-    fn bo_read(&self, bo: Handle, bytes: &mut [u8]) -> i32;
+    fn bo_write_range(&self, bo: Handle, bytes: &[u8], offset: usize) -> i32;
+    fn bo_read_range(&self, bo: Handle, bytes: &mut [u8], offset: usize) -> i32;
+    fn bo_write(&self, bo: Handle, bytes: &[u8]) -> i32 {
+        self.bo_write_range(bo, bytes, 0)
+    }
+    fn bo_read(&self, bo: Handle, bytes: &mut [u8]) -> i32 {
+        self.bo_read_range(bo, bytes, 0)
+    }
     fn bo_sync(&self, bo: Handle, direction: i32, size: usize, offset: usize) -> i32;
 }
 
@@ -398,12 +404,12 @@ impl XrtOps for RealXrt {
         unsafe { (self.bo_address)(bo) }
     }
 
-    fn bo_write(&self, bo: Handle, bytes: &[u8]) -> i32 {
-        unsafe { (self.bo_write)(bo, bytes.as_ptr().cast(), bytes.len(), 0) }
+    fn bo_write_range(&self, bo: Handle, bytes: &[u8], offset: usize) -> i32 {
+        unsafe { (self.bo_write)(bo, bytes.as_ptr().cast(), bytes.len(), offset) }
     }
 
-    fn bo_read(&self, bo: Handle, bytes: &mut [u8]) -> i32 {
-        unsafe { (self.bo_read)(bo, bytes.as_mut_ptr().cast(), bytes.len(), 0) }
+    fn bo_read_range(&self, bo: Handle, bytes: &mut [u8], offset: usize) -> i32 {
+        unsafe { (self.bo_read)(bo, bytes.as_mut_ptr().cast(), bytes.len(), offset) }
     }
 
     fn bo_sync(&self, bo: Handle, direction: i32, size: usize, offset: usize) -> i32 {
@@ -2332,6 +2338,7 @@ mod tests {
         fail_register_write: Option<u32>,
         fail_register_read: Option<u32>,
         output_pattern: u8,
+        bo_sizes: HashMap<usize, usize>,
     }
 
     struct FakeXrt {
@@ -2349,6 +2356,7 @@ mod tests {
                     fail_register_write: None,
                     fail_register_read: None,
                     output_pattern: 0x5a,
+                    bo_sizes: HashMap::new(),
                 }),
             }
         }
@@ -2526,6 +2534,7 @@ mod tests {
             let mut state = self.state.borrow_mut();
             let bo = state.next_bo;
             state.next_bo += 1;
+            state.bo_sizes.insert(bo, size);
             state.events.push(Event::BoAlloc { bo, size, group });
             bo as Handle
         }
@@ -2542,16 +2551,29 @@ mod tests {
             0x1000 * (bo as usize - FIRST_BO_HANDLE + 1) as u64
         }
 
-        fn bo_write(&self, bo: Handle, bytes: &[u8]) -> i32 {
-            self.state.borrow_mut().events.push(Event::BoWrite {
+        fn bo_write_range(&self, bo: Handle, bytes: &[u8], offset: usize) -> i32 {
+            let mut state = self.state.borrow_mut();
+            if offset
+                .checked_add(bytes.len())
+                .is_none_or(|end| end > state.bo_sizes[&(bo as usize)])
+            {
+                return -1;
+            }
+            state.events.push(Event::BoWrite {
                 bo: bo as usize,
                 bytes: bytes.to_vec(),
             });
             0
         }
 
-        fn bo_read(&self, bo: Handle, bytes: &mut [u8]) -> i32 {
+        fn bo_read_range(&self, bo: Handle, bytes: &mut [u8], offset: usize) -> i32 {
             let mut state = self.state.borrow_mut();
+            if offset
+                .checked_add(bytes.len())
+                .is_none_or(|end| end > state.bo_sizes[&(bo as usize)])
+            {
+                return -1;
+            }
             bytes.fill(state.output_pattern);
             state.events.push(Event::BoRead {
                 bo: bo as usize,
