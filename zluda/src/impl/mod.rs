@@ -48,9 +48,6 @@ pub(super) mod pointer;
 // Checkpoint/resume support for GPU state
 pub mod checkpoint;
 pub(crate) mod concordia_delta;
-pub(crate) mod concordia_instrument;
-pub(crate) mod kimi_concordia;
-pub(crate) mod concordia_runtime;
 #[cfg(all(
     feature = "nvidia",
     not(feature = "amd"),
@@ -58,6 +55,10 @@ pub(crate) mod concordia_runtime;
     not(feature = "tenstorrent")
 ))]
 pub(crate) mod concordia_gpu;
+pub(crate) mod concordia_instrument;
+pub(crate) mod concordia_runtime;
+pub(crate) mod kimi_concordia;
+pub(crate) mod nccl_recovery;
 #[cfg(all(
     feature = "nvidia",
     not(feature = "amd"),
@@ -65,7 +66,6 @@ pub(crate) mod concordia_gpu;
     not(feature = "tenstorrent")
 ))]
 pub(crate) mod nvint4_tmatmul;
-pub(crate) mod nccl_recovery;
 pub(crate) mod persistent_router;
 
 // Record/replay support for heterogeneous GPU debugging
@@ -97,6 +97,9 @@ pub(crate) mod iq1s_layer_trace;
 
 #[cfg(all(unix, feature = "nvidia", not(feature = "amd"), not(feature = "intel")))]
 pub(crate) mod iq1s_persistent_runtime;
+
+#[cfg(all(unix, feature = "nvidia", not(feature = "amd"), not(feature = "intel")))]
+pub(crate) mod iq1s_persistent_proof;
 
 #[cfg(all(unix, feature = "nvidia", not(feature = "amd"), not(feature = "intel")))]
 pub(crate) mod iq1s_tmatmul;

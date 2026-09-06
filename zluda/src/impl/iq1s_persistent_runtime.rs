@@ -4,6 +4,10 @@ use super::iq1s_layer_trace::{
     compile_layer_phase, ActivationRange, CompiledLayerPhase, LayerPhase, LayerPhasePlan,
     SemanticIq1sCommand,
 };
+use super::iq1s_persistent_proof::{
+    checked_proof_path_from_env, hex_sha256, PersistentPhaseRecord, PersistentProofLedger,
+    PhaseTimingsUs,
+};
 use super::iq1s_tmatmul::Q8_1_MMQ_BYTES;
 use super::iq1s_trace::QWEN_MODEL_CONTEXT_LIMIT;
 use super::iq1s_weight_arena::{
@@ -21,6 +25,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 const QWEN_MODEL_SHA256: [u8; 32] = [
     0x0a, 0x32, 0xc2, 0x70, 0x2f, 0xbb, 0x61, 0x93, 0x49, 0x60, 0xcf, 0xee, 0xf3, 0x45, 0x24, 0xb8,
@@ -87,6 +92,7 @@ pub(crate) struct PersistentRuntime {
     arena: Arc<ArenaPlan>,
     sources: Vec<Arc<Iq1sTensorSource>>,
     pool: PersistentIq1sPool<RealXrt>,
+    ledger: PersistentProofLedger,
     poisoned: Option<String>,
 }
 
@@ -530,6 +536,8 @@ fn initialize_runtime_from_env() -> Result<PersistentRuntime, String> {
         .map_err(|_| "HETGPU_QWEN_IQ1S_RING_CAPACITY does not fit u32")?;
     let timeout_ms = u32::try_from(env_u64("HETGPU_XRT_TIMEOUT_MS", 10_000)?)
         .map_err(|_| "HETGPU_XRT_TIMEOUT_MS does not fit u32")?;
+    let ledger_path = checked_proof_path_from_env()?;
+    let ledger = PersistentProofLedger::create(&ledger_path)?;
     let chunks = persistent_chunk_specs(&arena)?;
     let ops = RealXrt::load(true).map_err(|error| error.to_string())?;
     let config =
@@ -549,6 +557,7 @@ fn initialize_runtime_from_env() -> Result<PersistentRuntime, String> {
         arena,
         sources,
         pool,
+        ledger,
         poisoned: None,
     })
 }
@@ -656,20 +665,76 @@ impl PersistentRuntime {
         &mut self,
         snapshot: PhaseSnapshot,
     ) -> Result<PhaseOutcome, String> {
+        let phase_wall_start = Instant::now();
         if snapshot.key.session_generation != self.identity.session_generation
             || self.sources.len() != ARENA_EXPECTED_TENSORS
         {
             return Err("persistent IQ1_S runtime/session identity mismatch".to_string());
         }
+        let layer_id = snapshot.key.layer_id;
+        let phase_name = match snapshot.phase {
+            LayerPhase::PhaseA => "A",
+            LayerPhase::PhaseB => "B",
+        };
         let trace_mode = std::env::var("HETGPU_IQ1S_TRACE_MODE")
             .map_err(|_| "HETGPU_IQ1S_TRACE_MODE is required".to_string())?;
+        let prepare_start = Instant::now();
         let prepared = prepare_phase(&self.arena, snapshot, &trace_mode)?;
+        let prepare_us = u64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(u64::MAX);
         let completed = self
             .pool
             .submit_phase(&prepared.compiled, &prepared.buffers)
             .map_err(|error| error.to_string())?;
+        let reconstruct_start = Instant::now();
         let outputs = reconstruct_full_rows(&prepared, &completed)?;
+        let reconstruct_us =
+            u64::try_from(reconstruct_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let compare_start = Instant::now();
         validate_all_finite(&outputs)?;
+        let compare_us = u64::try_from(compare_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let commands_per_cu = std::array::from_fn(|cu| prepared.compiled.commands[cu].len());
+        let completions_per_cu = std::array::from_fn(|cu| completed.completions[cu].len());
+        let program_sha256 = std::array::from_fn(|cu| {
+            let digest: [u8; 32] = Sha256::digest(&prepared.compiled.programs[cu].encoded).into();
+            hex_sha256(&digest)
+        });
+        let device_timings = completed.timings;
+        let phase_wall_us =
+            u64::try_from(phase_wall_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let proof = PersistentPhaseRecord::new(
+            prepared.compiled.transaction_id,
+            layer_id,
+            phase_name,
+            trace_mode,
+            self.identity.session_generation,
+            program_sha256,
+            hex_sha256(&prepared.compiled.semantic_sha256),
+            commands_per_cu,
+            completions_per_cu,
+            completed.dma.weight_bytes,
+            PhaseTimingsUs {
+                capture: 0,
+                route_dma: 0,
+                trace_build_or_cache: prepare_us,
+                activation_pack: 0,
+                activation_sync: device_timings.activation_sync_us,
+                ring_publish: device_timings.ring_publish_us,
+                doorbell: device_timings.doorbell_us,
+                device_wait: device_timings.device_wait_us,
+                completion_sync: device_timings.completion_sync_us,
+                result_copy: device_timings.result_copy_us,
+                reconstruct: reconstruct_us,
+                compare: compare_us,
+                log: 0,
+                phase_wall: phase_wall_us.max(device_timings.phase_wall_us),
+            },
+        )?;
+        // Proof storage is a publication precondition: no CUDA destination is
+        // updated if the compact phase record cannot be written.
+        self.ledger.append_phase(proof)?;
+        if env_truthy("HETGPU_QWEN_IQ1S_PROOF_SYNC_PHASE") {
+            self.ledger.sync_boundary()?;
+        }
         for output in &outputs {
             unsafe { copy_host_to_cuda(output.cuda_ptr, &output.bytes) }
                 .map_err(|error| error.to_string())?;

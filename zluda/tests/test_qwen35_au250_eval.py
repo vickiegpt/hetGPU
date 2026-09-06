@@ -274,12 +274,12 @@ class Handler(BaseHTTPRequestHandler):
             }
             with open(os.environ["FAKE_XRT_EVIDENCE"], "a", encoding="utf-8") as stream:
                 stream.write(json.dumps(xrt_record, sort_keys=True) + "\n")
-        tokens = ([777, 778] if hardware_probe else [777]) if semantic else list(range(1000, 1032))
-        pieces = (["OK", ""] if hardware_probe else ["OK"]) if semantic else [f"t{index}" for index in range(32)]
+        tokens = ([777, 778] if hardware_probe else [777]) if semantic else list(range(1000, 1000 + body["n_predict"]))
+        pieces = (["OK", ""] if hardware_probe else ["OK"]) if semantic else [f"t{index}" for index in range(body["n_predict"])]
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
-        result_indices = range(16) if batched else range(1)
+        result_indices = range(len(body["prompt"])) if batched else range(1)
         for result_index in result_indices:
             for processed in (0, 128, 256):
                 progress = {
@@ -338,7 +338,7 @@ def make_executable(path, content):
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def run_mode(tmp_path, mode, server, requests):
+def run_mode(tmp_path, mode, server, requests, profile="full"):
     proof = tmp_path / mode
     model = tmp_path / "model.gguf"
     model.write_bytes(b"model")
@@ -349,6 +349,7 @@ def run_mode(tmp_path, mode, server, requests):
             sys.executable,
             str(EVALUATOR),
             "--mode", mode,
+            "--profile", profile,
             "--server", str(server),
             "--model", str(model),
             "--prompt-seed", str(tmp_path / "seed.txt"),
@@ -370,6 +371,26 @@ def run_mode(tmp_path, mode, server, requests):
     )
     assert result.returncode == 0, result.stderr
     return json.loads((proof / f"{mode}.json").read_text())
+
+
+def test_evaluator_profiles_are_explicit_and_fixed():
+    evaluator = load_evaluator()
+    assert evaluator.PROFILES == {
+        "one-token": {
+            "request_count": 1,
+            "max_active": 1,
+            "tokens_per_request": 1,
+            "measurements": 1,
+            "warmups": 0,
+        },
+        "full": {
+            "request_count": 64,
+            "max_active": 16,
+            "tokens_per_request": 32,
+            "measurements": 3,
+            "warmups": 1,
+        },
+    }
 
 
 def test_fake_server_preserves_identical_requests_and_fixed_counts(tmp_path):
@@ -434,6 +455,29 @@ def test_fake_server_preserves_identical_requests_and_fixed_counts(tmp_path):
     assert all(body["temperature"] == 0.0 and body["seed"] == 42 for body in timed)
     assert all(body["ignore_eos"] is True for body in timed)
     assert all(body["cache_prompt"] is False for body in timed)
+
+
+def test_one_token_profile_records_exact_token_without_e2e_tps_label(tmp_path):
+    server = tmp_path / "fake-server.py"
+    make_executable(server, FAKE_SERVER)
+    (tmp_path / "seed.txt").write_text("seed " * 300, encoding="utf-8")
+    (tmp_path / "health.txt").write_text("Level 0 : 0x0 (GOOD)\n", encoding="utf-8")
+    requests = tmp_path / "requests.jsonl"
+
+    record = run_mode(tmp_path, "cuda", server, requests, profile="one-token")
+    assert record["profile"] == {
+        "name": "one-token",
+        "request_count": 1,
+        "max_active": 1,
+        "tokens_per_request": 1,
+        "measurements": 1,
+        "warmups": 0,
+    }
+    assert record["generated_token_ids"] == [1000]
+    assert record["generated_token_ids_by_request"] == [[1000]]
+    assert record["measurements"][0]["generated_tokens"] == 1
+    assert "aggregate_generated_tokens_per_second" not in record["measurements"][0]
+    assert "e2e_tps" not in json.dumps(record).lower()
 
 
 def test_rejects_non_roundtripping_prompt(tmp_path):
@@ -788,6 +832,7 @@ def run_iq1s_mode(tmp_path, inactive_cu=False):
             sys.executable,
             str(EVALUATOR),
             "--mode", "handwritten",
+            "--profile", "full",
             "--evidence-kind", "iq1s",
             "--server", str(server),
             "--model", str(model),

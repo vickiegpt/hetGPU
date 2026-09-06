@@ -17,11 +17,27 @@ import urllib.request
 from pathlib import Path
 
 
-WARMUPS = 1
-MEASUREMENTS = 3
-REQUEST_COUNT = 64
-MAX_ACTIVE_REQUESTS = 16
-PREDICT_TOKENS = 32
+PROFILES = {
+    "one-token": {
+        "request_count": 1,
+        "max_active": 1,
+        "tokens_per_request": 1,
+        "measurements": 1,
+        "warmups": 0,
+    },
+    "full": {
+        "request_count": 64,
+        "max_active": 16,
+        "tokens_per_request": 32,
+        "measurements": 3,
+        "warmups": 1,
+    },
+}
+WARMUPS = PROFILES["full"]["warmups"]
+MEASUREMENTS = PROFILES["full"]["measurements"]
+REQUEST_COUNT = PROFILES["full"]["request_count"]
+MAX_ACTIVE_REQUESTS = PROFILES["full"]["max_active"]
+PREDICT_TOKENS = PROFILES["full"]["tokens_per_request"]
 PROMPT_TOKENS = 256
 CONTEXT_TOKENS_PER_REQUEST = 512
 SERVER_CONTEXT_TOKENS = MAX_ACTIVE_REQUESTS * CONTEXT_TOKENS_PER_REQUEST
@@ -272,10 +288,10 @@ def exact_prompt(base_url, seed_path, timeout):
     return prompt_text, selected
 
 
-def completion_request(prompt):
+def completion_request(prompt, tokens_per_request=PREDICT_TOKENS):
     return {
         "prompt": prompt,
-        "n_predict": 32,
+        "n_predict": tokens_per_request,
         "temperature": 0.0,
         "seed": 42,
         "ignore_eos": True,
@@ -287,9 +303,9 @@ def completion_request(prompt):
     }
 
 
-def erase_all_slots(base_url, timeout):
+def erase_all_slots(base_url, timeout, max_active=MAX_ACTIVE_REQUESTS):
     erased = []
-    for id_slot in range(MAX_ACTIVE_REQUESTS):
+    for id_slot in range(max_active):
         response = post_json(base_url, f"/slots/{id_slot}?action=erase", {}, timeout)
         if response.get("id_slot") != id_slot:
             raise EvaluationError(f"slot erase response did not bind slot {id_slot}")
@@ -300,16 +316,21 @@ def erase_all_slots(base_url, timeout):
     return erased
 
 
-def run_continuous_batch(base_url, request_body, timeout):
+def run_continuous_batch(base_url, request_body, timeout, profile=None):
+    profile = dict(PROFILES["full"] if profile is None else profile)
+    request_count = profile["request_count"]
+    max_active = profile["max_active"]
+    tokens_per_request = profile["tokens_per_request"]
     batch_started = time.monotonic()
     requests = []
     wave_slot_erase_evidence = []
-    for wave_start in range(0, REQUEST_COUNT, MAX_ACTIVE_REQUESTS):
-        wave_stop = min(wave_start + MAX_ACTIVE_REQUESTS, REQUEST_COUNT)
+    for wave_start in range(0, request_count, max_active):
+        wave_stop = min(wave_start + max_active, request_count)
+        active = wave_stop - wave_start
         wave_started = time.monotonic()
         body = dict(request_body)
-        body["prompt"] = [request_body["prompt"] for _ in range(MAX_ACTIVE_REQUESTS)]
-        results = stream_completion_batch(base_url, body, MAX_ACTIVE_REQUESTS, timeout)
+        body["prompt"] = [request_body["prompt"] for _ in range(active)]
+        results = stream_completion_batch(base_url, body, active, timeout)
         for index, result in enumerate(results):
             request_id = wave_start + index
             item = dict(result)
@@ -322,17 +343,17 @@ def run_continuous_batch(base_url, request_body, timeout):
                 ) * 1000.0 + result["end_to_end_ms"],
             })
             requests.append(item)
-        if wave_stop < REQUEST_COUNT:
-            wave_slot_erase_evidence.append(erase_all_slots(base_url, timeout))
+        if wave_stop < request_count:
+            wave_slot_erase_evidence.append(erase_all_slots(base_url, timeout, max_active))
     batch_finished = time.monotonic()
     requests.sort(key=lambda item: item["request_id"])
-    if [item["request_id"] for item in requests] != list(range(REQUEST_COUNT)):
+    if [item["request_id"] for item in requests] != list(range(request_count)):
         raise EvaluationError("continuous batch request IDs are missing or duplicated")
     for item in requests:
         if (
-            item.get("tokens_predicted") != PREDICT_TOKENS
+            item.get("tokens_predicted") != tokens_per_request
             or item.get("tokens_evaluated") != PROMPT_TOKENS
-            or len(item.get("token_ids", [])) != PREDICT_TOKENS
+            or len(item.get("token_ids", [])) != tokens_per_request
         ):
             raise EvaluationError(
                 f"continuous request {item['request_id']} did not execute the fixed 256+32 workload"
@@ -340,20 +361,22 @@ def run_continuous_batch(base_url, request_body, timeout):
     wall_seconds = batch_finished - batch_started
     if not math.isfinite(wall_seconds) or wall_seconds <= 0:
         raise EvaluationError("continuous batch wall time is not positive and finite")
-    generated_tokens = REQUEST_COUNT * PREDICT_TOKENS
+    generated_tokens = request_count * tokens_per_request
     throughput = generated_tokens / wall_seconds
     if not math.isfinite(throughput) or throughput <= 0:
         raise EvaluationError("continuous batch throughput is not positive and finite")
-    return {
-        "request_count": REQUEST_COUNT,
-        "max_active": MAX_ACTIVE_REQUESTS,
-        "tokens_per_request": PREDICT_TOKENS,
+    result = {
+        "request_count": request_count,
+        "max_active": max_active,
+        "tokens_per_request": tokens_per_request,
         "generated_tokens": generated_tokens,
         "wall_seconds": wall_seconds,
-        "aggregate_generated_tokens_per_second": throughput,
         "wave_slot_erase_evidence": wave_slot_erase_evidence,
         "requests": requests,
     }
+    if profile == PROFILES["full"]:
+        result["aggregate_generated_tokens_per_second"] = throughput
+    return result
 
 
 def semantic_completion_request(prompt):
@@ -900,6 +923,8 @@ def stop_process(process):
 
 
 def run(args):
+    profile = {"name": args.profile, **PROFILES[args.profile]}
+    profile_values = PROFILES[args.profile]
     proof_dir = Path(args.proof_dir)
     proof_dir.mkdir(parents=True, exist_ok=False)
     model = Path(args.model)
@@ -939,9 +964,9 @@ def run(args):
     slot_save_path = proof_dir / "slot-state"
     slot_save_path.mkdir()
     command = [
-        str(server), "--model", str(model), "--ctx-size", str(SERVER_CONTEXT_TOKENS), "--n-gpu-layers", "999",
+        str(server), "--model", str(model), "--ctx-size", str(profile_values["max_active"] * CONTEXT_TOKENS_PER_REQUEST), "--n-gpu-layers", "999",
         "--threads", str(args.threads), "--host", "127.0.0.1", "--port", str(args.port),
-        "--seed", "42", "--parallel", "16", "--reasoning", "off", "--verbosity", "4",
+        "--seed", "42", "--parallel", str(profile_values["max_active"]), "--reasoning", "off", "--verbosity", "4",
         "--cache-ram", "0", "--flash-attn", "on", "--no-cache-prompt", "--slot-save-path", str(slot_save_path),
         "--no-warmup", "--no-webui",
     ]
@@ -1031,16 +1056,24 @@ def run(args):
                         "gpu_attention_routes": gate_attention,
                     }
 
-            timed_request = completion_request(prompt_ids)
+            timed_request = completion_request(prompt_ids, profile_values["tokens_per_request"])
             warmups = []
             slot_erase_evidence = []
-            for _ in range(WARMUPS):
-                slot_erase_evidence.append(erase_all_slots(base_url, args.request_timeout))
-                warmups.append(run_continuous_batch(base_url, timed_request, args.request_timeout))
+            for _ in range(profile_values["warmups"]):
+                slot_erase_evidence.append(
+                    erase_all_slots(base_url, args.request_timeout, profile_values["max_active"])
+                )
+                warmups.append(
+                    run_continuous_batch(base_url, timed_request, args.request_timeout, profile_values)
+                )
             measured = []
-            for _ in range(MEASUREMENTS):
-                slot_erase_evidence.append(erase_all_slots(base_url, args.request_timeout))
-                measured.append(run_continuous_batch(base_url, timed_request, args.request_timeout))
+            for _ in range(profile_values["measurements"]):
+                slot_erase_evidence.append(
+                    erase_all_slots(base_url, args.request_timeout, profile_values["max_active"])
+                )
+                measured.append(
+                    run_continuous_batch(base_url, timed_request, args.request_timeout, profile_values)
+                )
             generated_by_request = [
                 item["token_ids"] for item in measured[0]["requests"]
             ]
@@ -1100,15 +1133,12 @@ def run(args):
     measurements = []
     for batch in measured:
         requests = batch["requests"]
-        measurements.append({
+        measurement = {
             "model_load_ms": load_ms,
             "prompt_tokens_per_second": statistics.median(
                 item["timings"].get("prompt_per_second") for item in requests
             ),
             "ttft_ms": statistics.median(item["ttft_ms"] for item in requests),
-            "generation_tokens_per_second": batch[
-                "aggregate_generated_tokens_per_second"
-            ],
             "single_request_generation_tokens_per_second": statistics.median(
                 item["timings"].get("predicted_per_second") for item in requests
             ),
@@ -1121,11 +1151,17 @@ def run(args):
             "request_count": batch["request_count"],
             "max_active": batch["max_active"],
             "generated_tokens": batch["generated_tokens"],
-        })
+        }
+        if args.profile == "full":
+            measurement["generation_tokens_per_second"] = batch[
+                "aggregate_generated_tokens_per_second"
+            ]
+        measurements.append(measurement)
     record = {
         "schema_version": 2 if args.evidence_kind == "iq1s" else 1,
         "evidence_kind": args.evidence_kind,
         "mode": args.mode,
+        "profile": profile,
         "model_size": args.model_size,
         "model_sha256": args.model_sha256,
         "llama_revision": args.llama_revision,
@@ -1155,11 +1191,11 @@ def run(args):
         "device_health": {"before": before_health, "after": after_health},
         "request_contract": timed_request,
         "warmup_count": len(warmups),
-        "request_count": REQUEST_COUNT,
-        "max_active_requests": MAX_ACTIVE_REQUESTS,
-        "generated_tokens_per_request": PREDICT_TOKENS,
+        "request_count": profile_values["request_count"],
+        "max_active_requests": profile_values["max_active"],
+        "generated_tokens_per_request": profile_values["tokens_per_request"],
         "context_tokens_per_request": CONTEXT_TOKENS_PER_REQUEST,
-        "server_context_tokens": SERVER_CONTEXT_TOKENS,
+        "server_context_tokens": profile_values["max_active"] * CONTEXT_TOKENS_PER_REQUEST,
     }
     atomic_json(proof_dir / f"{args.mode}.json", record)
     return record
@@ -1545,6 +1581,7 @@ def parser():
     result.add_argument(
         "--mode", choices=("cuda", "handwritten", "compiler"), required=True
     )
+    result.add_argument("--profile", choices=tuple(PROFILES), required=True)
     result.add_argument("--evidence-kind", choices=("tq1", "iq1s"), default="tq1")
     result.add_argument("--server", required=True)
     result.add_argument("--model", required=True)

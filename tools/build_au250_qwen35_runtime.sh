@@ -93,11 +93,15 @@ test "${symbols}" = $'hetgpu_tq1_evaluate_raw_v1\nhetgpu_tq1_register_tensor_v1\
     echo "libnvcuda.so does not export exactly the three required TQ1 symbols" >&2
     exit 1
 }
-iq1s_symbols="$(nm -D "${nvcuda}" | awk '$3 ~ /^hetgpu_iq1s_(bind_device|register_tensor)_v1$/ { print $3 }' | LC_ALL=C sort -u)"
-test "${iq1s_symbols}" = $'hetgpu_iq1s_bind_device_v1\nhetgpu_iq1s_register_tensor_v1' || {
-    echo "libnvcuda.so does not export exactly the two required IQ1_S symbols" >&2
+iq1s_symbols="$(nm -D "${nvcuda}" | awk \
+  '$3 ~ /^hetgpu_iq1s_(bind_device_v1|register_tensor_v1|layer_(begin|set_routes|phase_commit|commit|abort)_v2)$/ { print $3 }' \
+  | LC_ALL=C sort -u)"
+expected_iq1s_symbols=$'hetgpu_iq1s_bind_device_v1\nhetgpu_iq1s_layer_abort_v2\nhetgpu_iq1s_layer_begin_v2\nhetgpu_iq1s_layer_commit_v2\nhetgpu_iq1s_layer_phase_commit_v2\nhetgpu_iq1s_layer_set_routes_v2\nhetgpu_iq1s_register_tensor_v1'
+test "${iq1s_symbols}" = "${expected_iq1s_symbols}" || {
+    echo "libnvcuda.so does not export the complete IQ1_S persistent ABI" >&2
     exit 1
 }
+iq1s_symbols_sha256="$(printf '%s\n' "${iq1s_symbols}" | sha256sum | awk '{print $1}')"
 relocations="$(ldd -r "${nvcuda}" 2>&1)"
 if grep -Fq 'undefined symbol:' <<<"${relocations}"; then
     printf '%s\n' "${relocations}" >&2
@@ -129,6 +133,8 @@ LIBGGML="${libggml}" \
 NVCUDA="${nvcuda}" \
 CUDA13_LAUNCH_SHIM="${cuda13_launch_shim}" \
 UPSTREAM_ORACLE="${upstream_oracle}" \
+IQ1S_SYMBOLS="${iq1s_symbols}" \
+IQ1S_SYMBOLS_SHA256="${iq1s_symbols_sha256}" \
 python3 - <<'PY'
 import hashlib
 import json
@@ -154,6 +160,8 @@ manifest = {
     "hetgpu_commit": os.environ["HETGPU_COMMIT"],
     "hetgpu_dirty_manifest_sha256": os.environ["DIRTY_MANIFEST_SHA256"],
     "cuda_math_header_sha256": os.environ["CUDA_MATH_HEADER_SHA256"],
+    "iq1s_persistent_abi_symbols": os.environ["IQ1S_SYMBOLS"].splitlines(),
+    "iq1s_persistent_abi_symbols_sha256": os.environ["IQ1S_SYMBOLS_SHA256"],
     "compilers": {
         "cc": version(["cc", "--version"]).splitlines()[0],
         "cxx": version(["c++", "--version"]).splitlines()[0],
