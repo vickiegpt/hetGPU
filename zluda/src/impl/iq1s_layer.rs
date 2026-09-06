@@ -815,6 +815,18 @@ impl LayerCoordinator {
                 transaction.state
             ));
         }
+        Self::snapshot_transaction(transaction, phase)
+    }
+
+    fn snapshot_transaction(
+        transaction: &LayerTransaction,
+        phase: super::iq1s_layer_trace::LayerPhase,
+    ) -> Result<super::iq1s_persistent_runtime::PhaseSnapshot, String> {
+        if transaction.pending_routes.is_some() {
+            return Err(format!(
+                "IQ1_S {phase:?} snapshot still has pending route DMA"
+            ));
+        }
         let projections = transaction
             .projections
             .values()
@@ -840,25 +852,86 @@ impl LayerCoordinator {
         })
     }
 
-    pub(crate) fn commit_layer(&self, transaction_id: u64) -> Result<(), String> {
+    pub(crate) fn prepare_phase_a(
+        &self,
+        transaction_id: u64,
+    ) -> Result<super::iq1s_persistent_runtime::PhaseSnapshot, String> {
+        self.commit_phase_a(transaction_id)?;
+        self.snapshot_phase(transaction_id, super::iq1s_layer_trace::LayerPhase::PhaseA)
+    }
+
+    pub(crate) fn prepare_phase_b(
+        &self,
+        transaction_id: u64,
+    ) -> Result<super::iq1s_persistent_runtime::PhaseSnapshot, String> {
+        self.with_transaction(transaction_id, |transaction| {
+            if transaction.state != LayerState::PhaseBCapture
+                || !transaction
+                    .expected_iq1s_roles
+                    .contains(&Iq1sExpertRole::Down)
+                || !transaction.projections.contains_key(&Iq1sExpertRole::Down)
+            {
+                return Err("IQ1_S Phase B preparation is missing the down projection".to_string());
+            }
+            let snapshot = Self::snapshot_transaction(
+                transaction,
+                super::iq1s_layer_trace::LayerPhase::PhaseB,
+            )?;
+            transaction.state = LayerState::PhaseBCommitted;
+            transaction.phase_b_committed = true;
+            Ok(snapshot)
+        })
+    }
+
+    pub(crate) fn complete_phase_b_and_close(&self, transaction_id: u64) -> Result<(), String> {
+        self.with_transaction(transaction_id, |transaction| {
+            if transaction.state != LayerState::PhaseBCommitted || !transaction.phase_b_committed {
+                return Err("IQ1_S Phase B completion is out of order".to_string());
+            }
+            transaction.state = LayerState::Closed;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn close_gpu_down(&self, transaction_id: u64) -> Result<(), String> {
         self.with_transaction(transaction_id, |transaction| {
             if transaction
                 .expected_iq1s_roles
                 .contains(&Iq1sExpertRole::Down)
+                || transaction.state != LayerState::PhaseADone
             {
-                if transaction.state != LayerState::PhaseBCapture
-                    || !transaction.projections.contains_key(&Iq1sExpertRole::Down)
-                {
-                    return Err("IQ1_S layer commit is missing the down projection".to_string());
-                }
-                transaction.state = LayerState::PhaseBCommitted;
-                transaction.phase_b_committed = true;
-            } else if transaction.state != LayerState::PhaseADone {
                 return Err("GPU-native down may close only after Phase A completion".to_string());
             }
             transaction.state = LayerState::Closed;
             Ok(())
         })
+    }
+
+    fn expects_down(&self, transaction_id: u64) -> Result<bool, String> {
+        let transactions = self
+            .transactions
+            .lock()
+            .map_err(|_| "IQ1_S layer coordinator lock poisoned".to_string())?;
+        let transaction = transactions
+            .get(&(self.session_generation, transaction_id))
+            .ok_or_else(|| format!("unknown IQ1_S transaction ID {transaction_id}"))?;
+        if matches!(transaction.state, LayerState::Closed | LayerState::Aborted) {
+            return Err(format!(
+                "IQ1_S transaction {transaction_id} is already terminal"
+            ));
+        }
+        Ok(transaction
+            .expected_iq1s_roles
+            .contains(&Iq1sExpertRole::Down))
+    }
+
+    pub(crate) fn commit_layer(&self, transaction_id: u64) -> Result<(), String> {
+        if self.expects_down(transaction_id)? {
+            self.prepare_phase_b(transaction_id)?;
+            self.complete_phase_b_and_close(transaction_id)
+        } else {
+            self.close_gpu_down(transaction_id)
+        }
     }
 
     pub(crate) fn abort(&self, transaction_id: u64, _reason: u32) -> Result<(), String> {
@@ -905,6 +978,102 @@ fn global_coordinator() -> &'static LayerCoordinator {
         LayerCoordinator::new(1, QWEN35_EXPERTS_PER_TOKEN)
             .expect("constant IQ1_S coordinator configuration")
     })
+}
+
+trait Iq1sLayerPhaseExecutor {
+    fn execute_phase(
+        &mut self,
+        snapshot: super::iq1s_persistent_runtime::PhaseSnapshot,
+    ) -> Result<(), String>;
+
+    fn poison(&mut self, error: &str);
+}
+
+struct GlobalPersistentPhaseExecutor;
+
+impl Iq1sLayerPhaseExecutor for GlobalPersistentPhaseExecutor {
+    fn execute_phase(
+        &mut self,
+        snapshot: super::iq1s_persistent_runtime::PhaseSnapshot,
+    ) -> Result<(), String> {
+        super::iq1s_persistent_runtime::with_global_persistent_runtime(|runtime| {
+            runtime.execute_phase(snapshot).map(|_| ())
+        })
+    }
+
+    fn poison(&mut self, error: &str) {
+        super::iq1s_persistent_runtime::poison_global_persistent_runtime(error);
+    }
+}
+
+fn execute_transaction_phase_with(
+    coordinator: &LayerCoordinator,
+    executor: &mut impl Iq1sLayerPhaseExecutor,
+    transaction_id: u64,
+    phase: super::iq1s_layer_trace::LayerPhase,
+) -> Result<(), String> {
+    let result = (|| {
+        let snapshot = match phase {
+            super::iq1s_layer_trace::LayerPhase::PhaseA => {
+                coordinator.prepare_phase_a(transaction_id)?
+            }
+            super::iq1s_layer_trace::LayerPhase::PhaseB => {
+                coordinator.prepare_phase_b(transaction_id)?
+            }
+        };
+        executor.execute_phase(snapshot)?;
+        match phase {
+            super::iq1s_layer_trace::LayerPhase::PhaseA => {
+                coordinator.complete_phase_a(transaction_id)
+            }
+            super::iq1s_layer_trace::LayerPhase::PhaseB => {
+                coordinator.complete_phase_b_and_close(transaction_id)
+            }
+        }
+    })();
+    if let Err(error) = result {
+        let _ = coordinator.abort(transaction_id, 0);
+        executor.poison(&error);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn commit_transaction_with(
+    coordinator: &LayerCoordinator,
+    executor: &mut impl Iq1sLayerPhaseExecutor,
+    transaction_id: u64,
+) -> Result<(), String> {
+    let result = (|| {
+        if coordinator.expects_down(transaction_id)? {
+            execute_transaction_phase_with(
+                coordinator,
+                executor,
+                transaction_id,
+                super::iq1s_layer_trace::LayerPhase::PhaseB,
+            )
+        } else {
+            coordinator.close_gpu_down(transaction_id)
+        }
+    })();
+    if let Err(error) = result {
+        let _ = coordinator.abort(transaction_id, 0);
+        executor.poison(&error);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn execute_transaction_phase(
+    transaction_id: u64,
+    phase: super::iq1s_layer_trace::LayerPhase,
+) -> Result<(), String> {
+    execute_transaction_phase_with(
+        global_coordinator(),
+        &mut GlobalPersistentPhaseExecutor,
+        transaction_id,
+        phase,
+    )
 }
 
 pub(crate) fn has_open_transaction(stream: usize) -> Result<bool, String> {
@@ -1081,12 +1250,7 @@ pub(crate) fn layer_phase_commit(abi_version: u32, transaction_id: u64, phase: u
         if phase != HETGPU_IQ1S_PHASE_A {
             return Err(format!("unsupported IQ1_S layer phase {phase}"));
         }
-        global_coordinator().commit_phase_a(transaction_id)?;
-        // A committed phase may only become done after the persistent four-CU
-        // executor proves completion. Until Task 10 installs that path, abort.
-        let error = "IQ1_S persistent Phase A executor is not wired".to_string();
-        let _ = global_coordinator().abort(transaction_id, 0);
-        Err(error)
+        execute_transaction_phase(transaction_id, super::iq1s_layer_trace::LayerPhase::PhaseA)
     })();
     ffi_result("phase_commit", result)
 }
@@ -1095,7 +1259,11 @@ pub(crate) fn layer_commit(abi_version: u32, transaction_id: u64) -> i32 {
     let result = if abi_version != HETGPU_IQ1S_LAYER_ABI_VERSION {
         Err(format!("unsupported IQ1_S layer ABI version {abi_version}"))
     } else {
-        global_coordinator().commit_layer(transaction_id)
+        commit_transaction_with(
+            global_coordinator(),
+            &mut GlobalPersistentPhaseExecutor,
+            transaction_id,
+        )
     };
     ffi_result("commit", result)
 }
@@ -1290,6 +1458,178 @@ mod tests {
             .unwrap();
         coordinator.commit_layer(100).unwrap();
         assert_eq!(coordinator.state(100).unwrap(), LayerState::Closed);
+    }
+
+    #[derive(Default)]
+    struct FakePhaseExecutor {
+        phases: Vec<(u64, crate::r#impl::iq1s_layer_trace::LayerPhase)>,
+        fail_once: Option<String>,
+        poisoned: Option<String>,
+    }
+
+    impl Iq1sLayerPhaseExecutor for FakePhaseExecutor {
+        fn execute_phase(
+            &mut self,
+            snapshot: crate::r#impl::iq1s_persistent_runtime::PhaseSnapshot,
+        ) -> Result<(), String> {
+            if let Some(error) = &self.poisoned {
+                return Err(format!("fake persistent runtime is poisoned: {error}"));
+            }
+            self.phases
+                .push((snapshot.key.transaction_id, snapshot.phase));
+            if let Some(error) = self.fail_once.take() {
+                return Err(error);
+            }
+            Ok(())
+        }
+
+        fn poison(&mut self, error: &str) {
+            if self.poisoned.is_none() {
+                self.poisoned = Some(error.to_string());
+            }
+        }
+    }
+
+    fn capture_phase_a(coordinator: &LayerCoordinator, transaction_id: u64) {
+        begin_three_role_layer(coordinator, transaction_id);
+        coordinator
+            .capture_projection(
+                coordinator.session_generation,
+                transaction_id,
+                0xabc0,
+                projection(12, Iq1sExpertRole::Gate, 2, coordinator.session_generation),
+            )
+            .unwrap();
+        coordinator
+            .capture_projection(
+                coordinator.session_generation,
+                transaction_id,
+                0xabc0,
+                projection(12, Iq1sExpertRole::Up, 2, coordinator.session_generation),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn qwen_iq1s_layer_integration_submits_phase_a_and_b_once() {
+        let coordinator = LayerCoordinator::new(7, QWEN35_EXPERTS_PER_TOKEN).unwrap();
+        let mut executor = FakePhaseExecutor::default();
+        capture_phase_a(&coordinator, 110);
+
+        execute_transaction_phase_with(
+            &coordinator,
+            &mut executor,
+            110,
+            crate::r#impl::iq1s_layer_trace::LayerPhase::PhaseA,
+        )
+        .unwrap();
+        assert_eq!(coordinator.state(110).unwrap(), LayerState::PhaseADone);
+        coordinator
+            .capture_projection(7, 110, 0xabc0, projection(12, Iq1sExpertRole::Down, 2, 7))
+            .unwrap();
+        commit_transaction_with(&coordinator, &mut executor, 110).unwrap();
+
+        assert_eq!(
+            executor.phases,
+            vec![
+                (110, crate::r#impl::iq1s_layer_trace::LayerPhase::PhaseA),
+                (110, crate::r#impl::iq1s_layer_trace::LayerPhase::PhaseB),
+            ]
+        );
+        assert_eq!(coordinator.state(110).unwrap(), LayerState::Closed);
+    }
+
+    #[test]
+    fn qwen_iq1s_layer_integration_first_executor_fault_aborts_and_poisons_session() {
+        for fault in [
+            "completion identity mismatch",
+            "persistent timeout",
+            "result contains nonfinite f32",
+        ] {
+            let coordinator = LayerCoordinator::new(7, QWEN35_EXPERTS_PER_TOKEN).unwrap();
+            let mut executor = FakePhaseExecutor {
+                fail_once: Some(fault.to_string()),
+                ..FakePhaseExecutor::default()
+            };
+            capture_phase_a(&coordinator, 120);
+            let error = execute_transaction_phase_with(
+                &coordinator,
+                &mut executor,
+                120,
+                crate::r#impl::iq1s_layer_trace::LayerPhase::PhaseA,
+            )
+            .unwrap_err();
+            assert!(error.contains(fault));
+            assert_eq!(coordinator.state(120).unwrap(), LayerState::Aborted);
+
+            capture_phase_a(&coordinator, 121);
+            let later = execute_transaction_phase_with(
+                &coordinator,
+                &mut executor,
+                121,
+                crate::r#impl::iq1s_layer_trace::LayerPhase::PhaseA,
+            )
+            .unwrap_err();
+            assert!(later.contains("poisoned"));
+            assert_eq!(coordinator.state(121).unwrap(), LayerState::Aborted);
+            assert_eq!(executor.phases.len(), 1);
+        }
+    }
+
+    #[test]
+    fn qwen_iq1s_layer_integration_missing_lifecycle_poisons_later_work() {
+        let coordinator = LayerCoordinator::new(7, QWEN35_EXPERTS_PER_TOKEN).unwrap();
+        let mut executor = FakePhaseExecutor::default();
+        let error = execute_transaction_phase_with(
+            &coordinator,
+            &mut executor,
+            130,
+            crate::r#impl::iq1s_layer_trace::LayerPhase::PhaseA,
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown IQ1_S transaction"), "{error}");
+        assert!(executor.poisoned.is_some());
+
+        capture_phase_a(&coordinator, 131);
+        let later = execute_transaction_phase_with(
+            &coordinator,
+            &mut executor,
+            131,
+            crate::r#impl::iq1s_layer_trace::LayerPhase::PhaseA,
+        )
+        .unwrap_err();
+        assert!(later.contains("poisoned"), "{later}");
+        assert_eq!(coordinator.state(131).unwrap(), LayerState::Aborted);
+        assert!(executor.phases.is_empty());
+    }
+
+    #[test]
+    fn qwen_iq1s_layer_integration_phase_b_fault_does_not_close_transaction() {
+        let coordinator = LayerCoordinator::new(7, QWEN35_EXPERTS_PER_TOKEN).unwrap();
+        let mut executor = FakePhaseExecutor::default();
+        capture_phase_a(&coordinator, 140);
+        execute_transaction_phase_with(
+            &coordinator,
+            &mut executor,
+            140,
+            crate::r#impl::iq1s_layer_trace::LayerPhase::PhaseA,
+        )
+        .unwrap();
+        coordinator
+            .capture_projection(7, 140, 0xabc0, projection(12, Iq1sExpertRole::Down, 2, 7))
+            .unwrap();
+        executor.fail_once = Some("Phase B completion identity mismatch".to_string());
+
+        let error = commit_transaction_with(&coordinator, &mut executor, 140).unwrap_err();
+        assert!(error.contains("identity mismatch"), "{error}");
+        assert_eq!(coordinator.state(140).unwrap(), LayerState::Aborted);
+        assert_eq!(
+            executor.phases,
+            vec![
+                (140, crate::r#impl::iq1s_layer_trace::LayerPhase::PhaseA),
+                (140, crate::r#impl::iq1s_layer_trace::LayerPhase::PhaseB),
+            ]
+        );
     }
 
     #[test]

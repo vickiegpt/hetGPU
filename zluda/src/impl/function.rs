@@ -10155,9 +10155,15 @@ where
         && layer_sink
             .has_open_transaction(stream)
             .map_err(NvidiaIq1sDispatchError::Capture)?;
-    if strict_persistent && modern_moe && !transaction_open {
+    if strict_persistent && (!modern_moe || !transaction_open) {
+        eprintln!(
+            "[hetgpu-iq1s-layer] eligible_direct_route=1 modern_moe={} transaction_open={}",
+            u8::from(modern_moe),
+            u8::from(transaction_open)
+        );
         return Err(NvidiaIq1sDispatchError::Capture(
-            "strict persistent IQ1_S launch has no layer transaction".to_string(),
+            "strict persistent IQ1_S eligible_direct_route=1 requires an open layer lifecycle"
+                .to_string(),
         ));
     }
     if transaction_open {
@@ -10254,9 +10260,12 @@ pub(crate) unsafe fn nvidia_try_launch_named_xrt_tmatmul(
     ) {
         Ok(dispatched) => dispatched,
         Err(NvidiaIq1sDispatchError::Capture(error)) => {
+            if strict_persistent {
+                super::iq1s_persistent_runtime::poison_global_persistent_runtime(&error);
+            }
             return Some(Err(format!(
                 "IQ1_S layer transaction capture failed without fallback: {error}"
-            )))
+            )));
         }
         Err(NvidiaIq1sDispatchError::Execute(error)) => {
             return nvidia_xrt_route_failure(kernel_name, decision.strict, error)
@@ -11885,6 +11894,44 @@ mod nvidia_bitnet_route_tests {
         .to_string();
 
         assert!(error.contains("no layer transaction"), "{error}");
+        assert_eq!(lightweight_captures.load(Ordering::SeqCst), 0);
+        assert_eq!(full_captures.load(Ordering::SeqCst), 0);
+        assert_eq!(execution_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn qwen_iq1s_layer_integration_strict_persistent_rejects_direct_executor_entry() {
+        let lightweight_captures = Arc::new(AtomicUsize::new(0));
+        let full_captures = Arc::new(AtomicUsize::new(0));
+        let execution_count = Arc::new(AtomicUsize::new(0));
+        let sink = FakeLayerCaptureSink {
+            open: true,
+            capture_error: None,
+            captured: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut executor = FakeCapturedExecutor {
+            executions: execution_count.clone(),
+        };
+
+        let error = super::nvidia_dispatch_iq1s_capture(
+            false,
+            true,
+            0xabc0,
+            &sink,
+            || {
+                lightweight_captures.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![nvidia_modern_iq1s_activation_fixture()])
+            },
+            || {
+                full_captures.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![nvidia_modern_iq1s_captured_fixture()])
+            },
+            &mut executor,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("eligible_direct_route=1"), "{error}");
         assert_eq!(lightweight_captures.load(Ordering::SeqCst), 0);
         assert_eq!(full_captures.load(Ordering::SeqCst), 0);
         assert_eq!(execution_count.load(Ordering::SeqCst), 0);

@@ -553,23 +553,99 @@ fn initialize_runtime_from_env() -> Result<PersistentRuntime, String> {
     })
 }
 
-static RUNTIME: OnceLock<Mutex<Result<PersistentRuntime, String>>> = OnceLock::new();
+enum GlobalRuntimeState {
+    Uninitialized,
+    Ready(PersistentRuntime),
+    Failed(String),
+    Poisoned {
+        error: String,
+        runtime: Option<PersistentRuntime>,
+    },
+}
+
+static RUNTIME: OnceLock<Mutex<GlobalRuntimeState>> = OnceLock::new();
+
+fn global_runtime_state() -> &'static Mutex<GlobalRuntimeState> {
+    RUNTIME.get_or_init(|| Mutex::new(GlobalRuntimeState::Uninitialized))
+}
+
+pub(crate) fn poison_global_persistent_runtime(error: &str) {
+    let Ok(mut state) = global_runtime_state().lock() else {
+        return;
+    };
+    let previous = std::mem::replace(&mut *state, GlobalRuntimeState::Uninitialized);
+    *state = match previous {
+        GlobalRuntimeState::Poisoned { error, runtime } => {
+            GlobalRuntimeState::Poisoned { error, runtime }
+        }
+        GlobalRuntimeState::Ready(mut runtime) => {
+            runtime.poisoned = Some(error.to_string());
+            GlobalRuntimeState::Poisoned {
+                error: error.to_string(),
+                runtime: Some(runtime),
+            }
+        }
+        GlobalRuntimeState::Failed(first_error) => GlobalRuntimeState::Poisoned {
+            error: first_error,
+            runtime: None,
+        },
+        GlobalRuntimeState::Uninitialized => GlobalRuntimeState::Poisoned {
+            error: error.to_string(),
+            runtime: None,
+        },
+    };
+}
 
 pub(crate) fn with_global_persistent_runtime<T>(
     operation: impl FnOnce(&mut PersistentRuntime) -> Result<T, String>,
 ) -> Result<T, String> {
-    let runtime = RUNTIME.get_or_init(|| Mutex::new(initialize_runtime_from_env()));
-    let mut guard = runtime
+    let mut state = global_runtime_state()
         .lock()
         .map_err(|_| "persistent IQ1_S runtime lock poisoned".to_string())?;
-    let runtime = guard.as_mut().map_err(|error| error.clone())?;
-    if let Some(error) = &runtime.poisoned {
-        return Err(format!("persistent IQ1_S runtime is poisoned: {error}"));
+    if matches!(*state, GlobalRuntimeState::Uninitialized) {
+        *state = match initialize_runtime_from_env() {
+            Ok(runtime) => GlobalRuntimeState::Ready(runtime),
+            Err(error) => GlobalRuntimeState::Failed(error),
+        };
     }
-    match operation(runtime) {
+    let result = match &mut *state {
+        GlobalRuntimeState::Ready(runtime) => operation(runtime),
+        GlobalRuntimeState::Failed(error) => Err(error.clone()),
+        GlobalRuntimeState::Poisoned { error, .. } => {
+            Err(format!("persistent IQ1_S runtime is poisoned: {error}"))
+        }
+        GlobalRuntimeState::Uninitialized => {
+            Err("persistent IQ1_S runtime remained uninitialized".to_string())
+        }
+    };
+    match result {
         Ok(value) => Ok(value),
         Err(error) => {
-            runtime.poisoned = Some(error.clone());
+            let previous = std::mem::replace(&mut *state, GlobalRuntimeState::Uninitialized);
+            *state = match previous {
+                GlobalRuntimeState::Ready(mut runtime) => {
+                    runtime.poisoned = Some(error.clone());
+                    GlobalRuntimeState::Poisoned {
+                        error: error.clone(),
+                        runtime: Some(runtime),
+                    }
+                }
+                GlobalRuntimeState::Poisoned {
+                    error: first_error,
+                    runtime,
+                } => GlobalRuntimeState::Poisoned {
+                    error: first_error,
+                    runtime,
+                },
+                GlobalRuntimeState::Failed(first_error) => GlobalRuntimeState::Poisoned {
+                    error: first_error,
+                    runtime: None,
+                },
+                GlobalRuntimeState::Uninitialized => GlobalRuntimeState::Poisoned {
+                    error: error.clone(),
+                    runtime: None,
+                },
+            };
             Err(error)
         }
     }
