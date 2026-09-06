@@ -1,4 +1,4 @@
-use super::iq1s_tmatmul::CapturedLaunch;
+use super::iq1s_tmatmul::CapturedActivationLaunch;
 use super::iq1s_weight_registry::{
     global_registry, Iq1sExpertRole, ResolvedIq1sWeight, HETGPU_IQ1S_ERROR, HETGPU_IQ1S_HANDLED,
 };
@@ -45,7 +45,7 @@ pub(crate) struct RouteAssignment {
 pub(crate) struct CapturedProjection {
     pub(crate) role: Iq1sExpertRole,
     pub(crate) weight: ResolvedIq1sWeight,
-    pub(crate) launches: Vec<CapturedLaunch>,
+    pub(crate) launches: Vec<CapturedActivationLaunch>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -866,7 +866,9 @@ pub(crate) fn has_open_transaction(stream: usize) -> Result<bool, String> {
         .is_some())
 }
 
-pub(crate) fn resolve_captured_role(launches: &[CapturedLaunch]) -> Result<Iq1sExpertRole, String> {
+pub(crate) fn resolve_captured_role(
+    launches: &[CapturedActivationLaunch],
+) -> Result<Iq1sExpertRole, String> {
     let launch = launches
         .first()
         .ok_or("IQ1_S projection contains no captured launches")?;
@@ -889,7 +891,7 @@ pub(crate) fn resolve_captured_role(launches: &[CapturedLaunch]) -> Result<Iq1sE
 
 fn resolve_registered_projection(
     role: Iq1sExpertRole,
-    launches: Vec<CapturedLaunch>,
+    launches: Vec<CapturedActivationLaunch>,
 ) -> Result<CapturedProjection, String> {
     if launches.is_empty() {
         return Err("IQ1_S projection contains no captured launches".to_string());
@@ -956,7 +958,7 @@ fn resolve_registered_projection(
 pub(crate) fn capture_projection(
     stream: usize,
     role: Iq1sExpertRole,
-    launches: Vec<CapturedLaunch>,
+    launches: Vec<CapturedActivationLaunch>,
 ) -> Result<(), String> {
     let open = global_coordinator()
         .open_transaction_for_stream(stream)?
@@ -1074,8 +1076,7 @@ fn ffi_result(operation: &str, result: Result<(), String>) -> i32 {
 mod tests {
     use super::*;
     use crate::r#impl::iq1s_tmatmul::{
-        capture_from_host, GgmlType19Signature, GridTable, LogicalLaunch, GRID_ENTRIES,
-        IQ1S_BLOCK_BYTES, Q8_1_MMQ_BYTES,
+        capture_activation_from_host, GgmlType19Signature, LogicalLaunch, Q8_1_MMQ_BYTES,
     };
     use crate::r#impl::iq1s_weight_registry::{
         Iq1sExpertRole, Iq1sTensorIdentity, ResolvedIq1sWeight,
@@ -1155,9 +1156,7 @@ mod tests {
             stride11: 1,
             ne0: 1,
         };
-        let packed_matrix = [0u8; IQ1S_BLOCK_BYTES];
         let packed_activations = vec![0u8; 2 * Q8_1_MMQ_BYTES];
-        let grid: GridTable = [[0; 8]; GRID_ENTRIES];
         let tensor_base = 0x10_0000 + role_tag * 0x1_0000;
         let launches = routes(batch_count)
             .into_iter()
@@ -1171,7 +1170,7 @@ mod tests {
                     content_hash,
                     signature: signature.clone(),
                 };
-                capture_from_host(launch, &packed_matrix, &packed_activations, &grid)
+                capture_activation_from_host(launch, &packed_activations)
                     .expect("synthetic projection must be valid")
             })
             .collect();

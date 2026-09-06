@@ -901,6 +901,35 @@ pub(crate) struct CapturedLaunch {
     packed_activations: Arc<[u8]>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedActivationLaunch {
+    pub(crate) launch: LogicalLaunch,
+    packed_activations: Arc<[u8]>,
+}
+
+impl CapturedActivationLaunch {
+    pub(crate) fn packed_activations(&self) -> &[u8] {
+        &self.packed_activations
+    }
+}
+
+pub(crate) trait VecCaptureCopies {
+    fn copy_matrix(&self, pointer: usize, bytes: usize) -> Result<Vec<u8>, String>;
+    fn copy_activation(&self, pointer: usize, bytes: usize) -> Result<Vec<u8>, String>;
+}
+
+struct CudaVecCaptureCopies;
+
+impl VecCaptureCopies for CudaVecCaptureCopies {
+    fn copy_matrix(&self, pointer: usize, bytes: usize) -> Result<Vec<u8>, String> {
+        unsafe { copy_cuda_to_host(pointer, bytes) }.map_err(|error| error.to_string())
+    }
+
+    fn copy_activation(&self, pointer: usize, bytes: usize) -> Result<Vec<u8>, String> {
+        unsafe { copy_cuda_to_host(pointer, bytes) }.map_err(|error| error.to_string())
+    }
+}
+
 impl CapturedLaunch {
     pub(crate) fn activation_blocks(
         &self,
@@ -984,6 +1013,29 @@ pub(crate) fn capture_from_host(
     })
 }
 
+pub(crate) fn capture_activation_from_host(
+    launch: LogicalLaunch,
+    packed_activations: &[u8],
+) -> Result<CapturedActivationLaunch, String> {
+    launch.validate_before_copy()?;
+    if launch.content_hash == [0; 32] {
+        return Err("persistent IQ1_S capture requires a registered nonzero content hash".into());
+    }
+    let activation_bytes = launch.signature.activation_storage_bytes()?;
+    if packed_activations.len() != activation_bytes {
+        return Err(
+            "captured CUDA activation length does not match the qualified signature".into(),
+        );
+    }
+    for block in iter_q8_1_mmq(&launch.signature, packed_activations)? {
+        block?;
+    }
+    Ok(CapturedActivationLaunch {
+        launch,
+        packed_activations: Arc::from(packed_activations),
+    })
+}
+
 pub(crate) unsafe fn capture_launch(launch: LogicalLaunch) -> Result<CapturedLaunch, String> {
     let mut launch = launch;
     launch.validate_before_copy()?;
@@ -1032,6 +1084,57 @@ pub(crate) fn canonicalize_q8_1_vector(
         }
     }
     Ok(canonical)
+}
+
+pub(crate) fn capture_vec_activation_with(
+    matrix_ptr: usize,
+    activation_ptr: usize,
+    output_ptr: usize,
+    allocation_generation: u64,
+    content_hash: [u8; 32],
+    signature: GgmlType19VecSignature,
+    copies: &impl VecCaptureCopies,
+) -> Result<CapturedActivationLaunch, String> {
+    let signature = signature.validate()?;
+    if matrix_ptr == 0 || activation_ptr == 0 || output_ptr == 0 {
+        return Err("IQ1_S vector launch contains a null CUDA pointer".into());
+    }
+    if content_hash == [0; 32] {
+        return Err("persistent IQ1_S capture requires a registered nonzero content hash".into());
+    }
+    let raw_activations =
+        copies.copy_activation(activation_ptr, signature.activation_storage_bytes()?)?;
+    let activations = canonicalize_q8_1_vector(&signature, &raw_activations)?;
+    capture_activation_from_host(
+        LogicalLaunch {
+            matrix_ptr,
+            activation_ptr,
+            output_ptr,
+            allocation_generation,
+            content_hash,
+            signature: signature.mmq_signature()?,
+        },
+        &activations,
+    )
+}
+
+pub(crate) unsafe fn capture_vec_activation(
+    matrix_ptr: usize,
+    activation_ptr: usize,
+    output_ptr: usize,
+    allocation_generation: u64,
+    content_hash: [u8; 32],
+    signature: GgmlType19VecSignature,
+) -> Result<CapturedActivationLaunch, String> {
+    capture_vec_activation_with(
+        matrix_ptr,
+        activation_ptr,
+        output_ptr,
+        allocation_generation,
+        content_hash,
+        signature,
+        &CudaVecCaptureCopies,
+    )
 }
 
 pub(crate) unsafe fn capture_vec_launch(
@@ -2154,6 +2257,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::fmt::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     static CAPTURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -2429,6 +2533,79 @@ mod tests {
             stride11: 8064,
             ne0: 2048,
         }
+    }
+
+    struct CountingVecCopies {
+        matrix_reads: AtomicUsize,
+        activation_reads: AtomicUsize,
+        activation: Vec<u8>,
+    }
+
+    impl VecCaptureCopies for CountingVecCopies {
+        fn copy_matrix(&self, _pointer: usize, bytes: usize) -> Result<Vec<u8>, String> {
+            self.matrix_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0; bytes])
+        }
+
+        fn copy_activation(&self, _pointer: usize, bytes: usize) -> Result<Vec<u8>, String> {
+            self.activation_reads.fetch_add(1, Ordering::SeqCst);
+            if bytes != self.activation.len() {
+                return Err(format!(
+                    "activation copy requested {bytes} bytes, fixture has {}",
+                    self.activation.len()
+                ));
+            }
+            Ok(self.activation.clone())
+        }
+    }
+
+    #[test]
+    fn persistent_vec_capture_copies_activation_without_matrix() {
+        let signature = GgmlType19VecSignature {
+            kernel: "mul_mat_vec_q_ggml_type19".to_string(),
+            ncols_x: 4096,
+            nrows_x: 1024,
+            nrows_y: 4096,
+            nrows_dst: 1024,
+        };
+        let copies = CountingVecCopies {
+            matrix_reads: AtomicUsize::new(0),
+            activation_reads: AtomicUsize::new(0),
+            activation: vec![0; 4096 / 32 * Q8_1_BLOCK_BYTES],
+        };
+
+        let capture =
+            capture_vec_activation_with(0x1000, 0x2000, 0x3000, 7, [0x55; 32], signature, &copies)
+                .unwrap();
+
+        assert_eq!(copies.matrix_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(copies.activation_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(capture.packed_activations().len(), 4096 / 128 * 144);
+        assert_eq!(capture.launch.matrix_ptr, 0x1000);
+    }
+
+    #[test]
+    fn persistent_vec_capture_rejects_zero_hash_before_activation_copy() {
+        let signature = GgmlType19VecSignature {
+            kernel: "mul_mat_vec_q_ggml_type19".to_string(),
+            ncols_x: 4096,
+            nrows_x: 1024,
+            nrows_y: 4096,
+            nrows_dst: 1024,
+        };
+        let copies = CountingVecCopies {
+            matrix_reads: AtomicUsize::new(0),
+            activation_reads: AtomicUsize::new(0),
+            activation: vec![0; 4096 / 32 * Q8_1_BLOCK_BYTES],
+        };
+
+        let error =
+            capture_vec_activation_with(0x1000, 0x2000, 0x3000, 7, [0; 32], signature, &copies)
+                .unwrap_err();
+
+        assert!(error.contains("nonzero content hash"), "{error}");
+        assert_eq!(copies.matrix_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(copies.activation_reads.load(Ordering::SeqCst), 0);
     }
 
     fn batched_signature(batch: u64, stride11: u64) -> GgmlType19Signature {

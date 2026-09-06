@@ -9903,11 +9903,11 @@ unsafe fn nvidia_capture_modern_iq1s_xrt_mmvq(
     not(feature = "intel"),
     not(feature = "tenstorrent")
 ))]
-unsafe fn nvidia_capture_modern_iq1s_xrt_moe_mmvq(
+unsafe fn nvidia_plan_modern_iq1s_xrt_moe_mmvq_launch(
     kernel_name: &str,
     kernel_params: *mut *mut ::core::ffi::c_void,
     grid: (u32, u32, u32),
-) -> Result<Vec<super::iq1s_tmatmul::CapturedLaunch>, String> {
+) -> Result<Vec<(NvidiaModernMmvqPlan, u64, [u8; 32])>, String> {
     if !nvidia_is_modern_iq1s_moe_mmvq(kernel_name) {
         return Err(format!(
             "kernel '{kernel_name}' is not the pinned two-row IQ1_S MoE MMVQ ABI"
@@ -9981,10 +9981,8 @@ unsafe fn nvidia_capture_modern_iq1s_xrt_moe_mmvq(
                 plan.signature.nrows_x,
                 row_stride_bytes,
             )?;
-            super::iq1s_tmatmul::capture_vec_launch(
-                plan.matrix_ptr,
-                plan.activation_ptr,
-                plan.output_ptr,
+            Ok((
+                plan,
                 identity
                     .as_ref()
                     .map(|identity| identity.allocation_generation)
@@ -9993,6 +9991,57 @@ unsafe fn nvidia_capture_modern_iq1s_xrt_moe_mmvq(
                     .as_ref()
                     .map(|identity| identity.content_hash)
                     .unwrap_or([0; 32]),
+            ))
+        })
+        .collect()
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+unsafe fn nvidia_capture_modern_iq1s_xrt_moe_mmvq(
+    kernel_name: &str,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    grid: (u32, u32, u32),
+) -> Result<Vec<super::iq1s_tmatmul::CapturedLaunch>, String> {
+    nvidia_plan_modern_iq1s_xrt_moe_mmvq_launch(kernel_name, kernel_params, grid)?
+        .into_iter()
+        .map(|(plan, allocation_generation, content_hash)| {
+            super::iq1s_tmatmul::capture_vec_launch(
+                plan.matrix_ptr,
+                plan.activation_ptr,
+                plan.output_ptr,
+                allocation_generation,
+                content_hash,
+                plan.signature,
+            )
+        })
+        .collect()
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+unsafe fn nvidia_capture_modern_iq1s_xrt_moe_activations(
+    kernel_name: &str,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    grid: (u32, u32, u32),
+) -> Result<Vec<super::iq1s_tmatmul::CapturedActivationLaunch>, String> {
+    nvidia_plan_modern_iq1s_xrt_moe_mmvq_launch(kernel_name, kernel_params, grid)?
+        .into_iter()
+        .map(|(plan, allocation_generation, content_hash)| {
+            super::iq1s_tmatmul::capture_vec_activation(
+                plan.matrix_ptr,
+                plan.activation_ptr,
+                plan.output_ptr,
+                allocation_generation,
+                content_hash,
                 plan.signature,
             )
         })
@@ -10010,7 +10059,7 @@ trait NvidiaIq1sLayerCaptureSink {
     fn capture_projection(
         &self,
         stream: usize,
-        captured: Vec<super::iq1s_tmatmul::CapturedLaunch>,
+        captured: Vec<super::iq1s_tmatmul::CapturedActivationLaunch>,
     ) -> Result<(), String>;
 }
 
@@ -10036,7 +10085,7 @@ impl NvidiaIq1sLayerCaptureSink for NvidiaIq1sGlobalLayerCaptureSink {
     fn capture_projection(
         &self,
         stream: usize,
-        captured: Vec<super::iq1s_tmatmul::CapturedLaunch>,
+        captured: Vec<super::iq1s_tmatmul::CapturedActivationLaunch>,
     ) -> Result<(), String> {
         let role = super::iq1s_layer::resolve_captured_role(&captured)?;
         super::iq1s_layer::capture_projection(stream, role, captured)
@@ -10088,24 +10137,38 @@ impl std::fmt::Display for NvidiaIq1sDispatchError {
     not(feature = "intel"),
     not(feature = "tenstorrent")
 ))]
-fn nvidia_dispatch_captured_iq1s<E: super::iq1s_xrt::CapturedLaunchExecutor>(
+fn nvidia_dispatch_iq1s_capture<E, A, F>(
     modern_moe: bool,
+    strict_persistent: bool,
     stream: usize,
-    captured: Vec<super::iq1s_tmatmul::CapturedLaunch>,
     layer_sink: &impl NvidiaIq1sLayerCaptureSink,
+    capture_activations: A,
+    capture_full: F,
     executor: &mut E,
-) -> Result<NvidiaIq1sDispatch<E::Output>, NvidiaIq1sDispatchError> {
+) -> Result<NvidiaIq1sDispatch<E::Output>, NvidiaIq1sDispatchError>
+where
+    E: super::iq1s_xrt::CapturedLaunchExecutor,
+    A: FnOnce() -> Result<Vec<super::iq1s_tmatmul::CapturedActivationLaunch>, String>,
+    F: FnOnce() -> Result<Vec<super::iq1s_tmatmul::CapturedLaunch>, String>,
+{
     let transaction_open = modern_moe
         && layer_sink
             .has_open_transaction(stream)
             .map_err(NvidiaIq1sDispatchError::Capture)?;
+    if strict_persistent && modern_moe && !transaction_open {
+        return Err(NvidiaIq1sDispatchError::Capture(
+            "strict persistent IQ1_S launch has no layer transaction".to_string(),
+        ));
+    }
     if transaction_open {
+        let captured = capture_activations().map_err(NvidiaIq1sDispatchError::Capture)?;
         layer_sink
             .capture_projection(stream, captured)
             .map_err(NvidiaIq1sDispatchError::Capture)?;
         return Ok(NvidiaIq1sDispatch::Buffered);
     }
 
+    let captured = capture_full().map_err(NvidiaIq1sDispatchError::Capture)?;
     let mut executed = Vec::with_capacity(captured.len());
     for component in captured {
         let output = executor
@@ -10164,49 +10227,29 @@ pub(crate) unsafe fn nvidia_try_launch_named_xrt_tmatmul(
             }
         }
     }
-    let captured = match kernel_kind {
-        NvidiaIq1sXrtKernel::Mmq => nvidia_capture_iq1s_xrt_mmq(kernel_name, kernel_params),
-        NvidiaIq1sXrtKernel::Mmvq if modern_moe => {
-            nvidia_capture_modern_iq1s_xrt_moe_mmvq(kernel_name, kernel_params, grid)
-        }
-        NvidiaIq1sXrtKernel::Mmvq if modern_multi => {
-            nvidia_capture_modern_iq1s_xrt_mmvq(kernel_name, kernel_params, grid)
-        }
-        NvidiaIq1sXrtKernel::Mmvq => nvidia_capture_iq1s_xrt_mmvq(kernel_name, kernel_params),
-    };
-    let captured = match captured {
-        Ok(captured) => captured,
-        Err(error) => return nvidia_xrt_route_failure(kernel_name, decision.strict, error),
-    };
-    eprintln!(
-        "[XRT TMatmul][NVIDIA] launching {} IQ1_S component(s) from '{}' on the persistent AU250 four-CU pool",
-        captured.len(), kernel_name
-    );
-    let compare_max_launches = match nvidia_xrt_compare_max_launches() {
-        Ok(value) => value,
-        Err(error) => return nvidia_xrt_route_failure(kernel_name, decision.strict, error),
-    };
-    for _component in &captured {
-        if modern_multi {
-            if let Err(error) = super::bitnet_disagg::append_route_log_from_env(
-                &decision,
-                super::bitnet_disagg::RouteHardware::xrt(true),
-            ) {
-                eprintln!(
-                    "[BitNet Disagg][NVIDIA XRT] route log failed for '{kernel_name}': {error}"
-                );
-                if decision.strict {
-                    return Some(Err(format!("route log failed: {error}")));
-                }
-            }
-        }
-    }
+    let strict_persistent = nvidia_env_truthy("HETGPU_QWEN_IQ1S_PERSISTENT");
     let mut executor = super::iq1s_xrt::DirectCapturedLaunchExecutor;
-    let dispatched = match nvidia_dispatch_captured_iq1s(
+    let dispatched = match nvidia_dispatch_iq1s_capture(
         modern_moe,
+        strict_persistent,
         stream.0 as usize,
-        captured,
         &NvidiaIq1sGlobalLayerCaptureSink,
+        || {
+            if !modern_moe {
+                return Err("activation-only capture requires a modern IQ1_S MoE launch".into());
+            }
+            nvidia_capture_modern_iq1s_xrt_moe_activations(kernel_name, kernel_params, grid)
+        },
+        || match kernel_kind {
+            NvidiaIq1sXrtKernel::Mmq => nvidia_capture_iq1s_xrt_mmq(kernel_name, kernel_params),
+            NvidiaIq1sXrtKernel::Mmvq if modern_moe => {
+                nvidia_capture_modern_iq1s_xrt_moe_mmvq(kernel_name, kernel_params, grid)
+            }
+            NvidiaIq1sXrtKernel::Mmvq if modern_multi => {
+                nvidia_capture_modern_iq1s_xrt_mmvq(kernel_name, kernel_params, grid)
+            }
+            NvidiaIq1sXrtKernel::Mmvq => nvidia_capture_iq1s_xrt_mmvq(kernel_name, kernel_params),
+        },
         &mut executor,
     ) {
         Ok(dispatched) => dispatched,
@@ -10222,6 +10265,30 @@ pub(crate) unsafe fn nvidia_try_launch_named_xrt_tmatmul(
     let NvidiaIq1sDispatch::Executed(executed) = dispatched else {
         return Some(Ok(()));
     };
+    eprintln!(
+        "[XRT TMatmul][NVIDIA] launching {} IQ1_S component(s) from '{}' on the AU250 direct path",
+        executed.len(),
+        kernel_name
+    );
+    let compare_max_launches = match nvidia_xrt_compare_max_launches() {
+        Ok(value) => value,
+        Err(error) => return nvidia_xrt_route_failure(kernel_name, decision.strict, error),
+    };
+    for _component in &executed {
+        if modern_multi {
+            if let Err(error) = super::bitnet_disagg::append_route_log_from_env(
+                &decision,
+                super::bitnet_disagg::RouteHardware::xrt(true),
+            ) {
+                eprintln!(
+                    "[BitNet Disagg][NVIDIA XRT] route log failed for '{kernel_name}': {error}"
+                );
+                if decision.strict {
+                    return Some(Err(format!("route log failed: {error}")));
+                }
+            }
+        }
+    }
     for (component, result) in executed {
         let comparison_ordinal = nvidia_xrt_reserve_comparison(compare_max_launches);
         let comparison = match comparison_ordinal {
@@ -11663,7 +11730,7 @@ mod nvidia_bitnet_route_tests {
         fn capture_projection(
             &self,
             _stream: usize,
-            captured: Vec<crate::r#impl::iq1s_tmatmul::CapturedLaunch>,
+            captured: Vec<crate::r#impl::iq1s_tmatmul::CapturedActivationLaunch>,
         ) -> Result<(), String> {
             if let Some(error) = self.capture_error {
                 return Err(error.to_string());
@@ -11719,9 +11786,37 @@ mod nvidia_bitnet_route_tests {
         capture_from_host(launch, &matrix, &activations, &grid).unwrap()
     }
 
+    fn nvidia_modern_iq1s_activation_fixture(
+    ) -> crate::r#impl::iq1s_tmatmul::CapturedActivationLaunch {
+        use crate::r#impl::iq1s_tmatmul::{
+            capture_activation_from_host, GgmlType19Signature, LogicalLaunch, Q8_1_MMQ_BYTES,
+        };
+
+        let launch = LogicalLaunch {
+            matrix_ptr: 0x10_0000,
+            activation_ptr: 0x20_0000,
+            output_ptr: 0x30_0000,
+            allocation_generation: 7,
+            content_hash: [0x5a; 32],
+            signature: GgmlType19Signature {
+                kernel: "mul_mat_q".to_string(),
+                ne00: 256,
+                ne01: 1,
+                stride01: 1,
+                ne10: 256,
+                ne11: 1,
+                stride11: 1,
+                ne0: 1,
+            },
+        };
+        let activations = vec![0u8; 2 * Q8_1_MMQ_BYTES];
+        capture_activation_from_host(launch, &activations).unwrap()
+    }
+
     #[test]
-    fn nvidia_modern_iq1s_open_transaction_buffers_ten_without_execution() {
-        let captured = vec![nvidia_modern_iq1s_captured_fixture(); 10];
+    fn nvidia_modern_iq1s_strict_persistent_captures_before_direct_execution() {
+        let lightweight_captures = Arc::new(AtomicUsize::new(0));
+        let full_captures = Arc::new(AtomicUsize::new(0));
         let captured_count = Arc::new(AtomicUsize::new(0));
         let execution_count = Arc::new(AtomicUsize::new(0));
         let sink = FakeLayerCaptureSink {
@@ -11733,9 +11828,91 @@ mod nvidia_bitnet_route_tests {
             executions: execution_count.clone(),
         };
 
-        let disposition =
-            super::nvidia_dispatch_captured_iq1s(true, 0xabc0, captured, &sink, &mut executor)
-                .unwrap();
+        let disposition = super::nvidia_dispatch_iq1s_capture(
+            true,
+            true,
+            0xabc0,
+            &sink,
+            || {
+                lightweight_captures.fetch_add(10, Ordering::SeqCst);
+                Ok(vec![nvidia_modern_iq1s_activation_fixture(); 10])
+            },
+            || {
+                full_captures.fetch_add(10, Ordering::SeqCst);
+                Ok(vec![nvidia_modern_iq1s_captured_fixture(); 10])
+            },
+            &mut executor,
+        )
+        .unwrap();
+
+        assert!(matches!(disposition, super::NvidiaIq1sDispatch::Buffered));
+        assert_eq!(lightweight_captures.load(Ordering::SeqCst), 10);
+        assert_eq!(full_captures.load(Ordering::SeqCst), 0);
+        assert_eq!(captured_count.load(Ordering::SeqCst), 10);
+        assert_eq!(execution_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn nvidia_modern_iq1s_strict_persistent_requires_transaction_before_capture() {
+        let lightweight_captures = Arc::new(AtomicUsize::new(0));
+        let full_captures = Arc::new(AtomicUsize::new(0));
+        let execution_count = Arc::new(AtomicUsize::new(0));
+        let sink = FakeLayerCaptureSink {
+            open: false,
+            capture_error: None,
+            captured: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut executor = FakeCapturedExecutor {
+            executions: execution_count.clone(),
+        };
+
+        let error = super::nvidia_dispatch_iq1s_capture(
+            true,
+            true,
+            0xabc0,
+            &sink,
+            || {
+                lightweight_captures.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![nvidia_modern_iq1s_activation_fixture()])
+            },
+            || {
+                full_captures.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![nvidia_modern_iq1s_captured_fixture()])
+            },
+            &mut executor,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("no layer transaction"), "{error}");
+        assert_eq!(lightweight_captures.load(Ordering::SeqCst), 0);
+        assert_eq!(full_captures.load(Ordering::SeqCst), 0);
+        assert_eq!(execution_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn nvidia_modern_iq1s_open_transaction_buffers_ten_without_execution() {
+        let captured_count = Arc::new(AtomicUsize::new(0));
+        let execution_count = Arc::new(AtomicUsize::new(0));
+        let sink = FakeLayerCaptureSink {
+            open: true,
+            capture_error: None,
+            captured: captured_count.clone(),
+        };
+        let mut executor = FakeCapturedExecutor {
+            executions: execution_count.clone(),
+        };
+
+        let disposition = super::nvidia_dispatch_iq1s_capture(
+            true,
+            false,
+            0xabc0,
+            &sink,
+            || Ok(vec![nvidia_modern_iq1s_activation_fixture(); 10]),
+            || Ok(vec![nvidia_modern_iq1s_captured_fixture(); 10]),
+            &mut executor,
+        )
+        .unwrap();
 
         assert!(matches!(disposition, super::NvidiaIq1sDispatch::Buffered));
         assert_eq!(captured_count.load(Ordering::SeqCst), 10);
@@ -11755,11 +11932,13 @@ mod nvidia_bitnet_route_tests {
             let mut executor = FakeCapturedExecutor {
                 executions: execution_count.clone(),
             };
-            let error = super::nvidia_dispatch_captured_iq1s(
+            let error = super::nvidia_dispatch_iq1s_capture(
                 true,
+                false,
                 0xabc0,
-                vec![nvidia_modern_iq1s_captured_fixture(); 10],
                 &sink,
+                || Ok(vec![nvidia_modern_iq1s_activation_fixture(); 10]),
+                || Ok(vec![nvidia_modern_iq1s_captured_fixture(); 10]),
                 &mut executor,
             )
             .unwrap_err()
@@ -11782,11 +11961,13 @@ mod nvidia_bitnet_route_tests {
             let mut executor = FakeCapturedExecutor {
                 executions: execution_count.clone(),
             };
-            let disposition = super::nvidia_dispatch_captured_iq1s(
+            let disposition = super::nvidia_dispatch_iq1s_capture(
                 modern_moe,
+                false,
                 0xabc0,
-                vec![nvidia_modern_iq1s_captured_fixture(); 10],
                 &sink,
+                || Ok(vec![nvidia_modern_iq1s_activation_fixture(); 10]),
+                || Ok(vec![nvidia_modern_iq1s_captured_fixture(); 10]),
                 &mut executor,
             )
             .unwrap();
