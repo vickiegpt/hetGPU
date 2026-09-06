@@ -27,14 +27,14 @@ TIMING_FIELDS = (
 )
 
 
-def phase(phase_name="A", sampled=True):
+def phase(phase_name="A", sampled=True, transaction_id=17, layer_id=7, mode="handwritten"):
     return {
         "schema_version": 2,
         "kind": "iq1s_persistent_phase",
-        "transaction_id": 17,
-        "layer_id": 7,
+        "transaction_id": transaction_id,
+        "layer_id": layer_id,
         "phase": phase_name,
-        "trace_mode": "handwritten",
+        "trace_mode": mode,
         "session_generation": 1,
         "program_sha256": ["11" * 32] * 4,
         "semantic_sha256": "22" * 32,
@@ -168,7 +168,7 @@ def g4_mode(mode):
         "eligible_direct_routes": 0,
         "fallbacks": 0,
         "measured_weight_dma_bytes": 0,
-        "completions_per_cu": [3, 3, 3, 3],
+        "completions_per_cu": [273, 273, 273, 273],
         "e2e_latency_ms": 1234.5 if mode == "handwritten" else 1200.25,
     }
 
@@ -200,7 +200,28 @@ def write_g4_bundle(root, aggregate=None):
     for mode in ("handwritten", "compiler"):
         mode_summary = summary()
         mode_summary["mode"] = mode
-        write_bundle(root / f"{mode}-mode", [{**phase(), "trace_mode": mode}], mode_summary)
+        records = []
+        for layer in range(50):
+            records.append(
+                phase(
+                    "A",
+                    sampled=layer == 0,
+                    transaction_id=layer + 1,
+                    layer_id=layer,
+                    mode=mode,
+                )
+            )
+            if layer < 41:
+                records.append(
+                    phase(
+                        "B",
+                        sampled=False,
+                        transaction_id=layer + 1,
+                        layer_id=layer,
+                        mode=mode,
+                    )
+                )
+        write_bundle(root / f"{mode}-mode", records, mode_summary)
 
 
 def test_g4_accepts_exact_three_process_one_token_bundle(tmp_path):
@@ -231,7 +252,7 @@ def test_g4_accepts_exact_three_process_one_token_bundle(tmp_path):
         lambda data: data["compiler"].__setitem__("eligible_direct_routes", 1),
         lambda data: data["handwritten"].__setitem__("fallbacks", 1),
         lambda data: data["compiler"].__setitem__("measured_weight_dma_bytes", 1),
-        lambda data: data["handwritten"].__setitem__("completions_per_cu", [3, 3, 3, 0]),
+        lambda data: data["handwritten"].__setitem__("completions_per_cu", [273, 273, 273, 0]),
         lambda data: data["cuda"].__setitem__("e2e_latency_ms", float("nan")),
     ),
 )
@@ -243,6 +264,43 @@ def test_g4_rejects_each_one_token_contract_mutation(tmp_path, mutation):
     result = validate(root, "g4")
     assert result.returncode != 0
     assert "tps" not in result.stdout.lower()
+
+
+def test_g4_rejects_missing_audited_phase_b_layer_even_when_counts_match(tmp_path):
+    root = tmp_path / "g4-missing-phase-b"
+    data = g4_summary()
+    write_g4_bundle(root, data)
+    ledger_path = root / "handwritten-mode" / "phase-ledger.jsonl"
+    records = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
+    removed = next(
+        index
+        for index, record in enumerate(records)
+        if record["phase"] == "B" and record["layer_id"] == 40
+    )
+    records.pop(removed)
+    ledger_path.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    data["handwritten"]["completions_per_cu"] = [270, 270, 270, 270]
+    (root / "g4-summary.json").write_text(
+        json.dumps(data, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    result = validate(root, "g4")
+    assert result.returncode != 0
+
+
+def test_compact_ledger_rejects_transaction_spanning_multiple_layers(tmp_path):
+    root = tmp_path / "cross-layer-transaction"
+    write_bundle(
+        root,
+        [
+            phase("A", sampled=True, transaction_id=17, layer_id=7),
+            phase("B", sampled=False, transaction_id=17, layer_id=8),
+        ],
+    )
+    result = validate(root)
+    assert result.returncode != 0
 
 
 def test_g3_accepts_exact_fail_closed_hardware_bundle(tmp_path):

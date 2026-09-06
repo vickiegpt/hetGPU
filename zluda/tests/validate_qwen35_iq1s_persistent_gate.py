@@ -307,6 +307,7 @@ def validate_ledger(root):
     records = read_ledger(root / "phase-ledger.jsonl")
     seen = set()
     transaction_phases = {}
+    transaction_layers = {}
     generation = None
     sampled_comparisons = 0
     for index, record in enumerate(records):
@@ -319,6 +320,9 @@ def validate_ledger(root):
         phases.append(record["phase"])
         if phases not in (["A"], ["A", "B"]):
             fail("phase ledger transaction order is not A followed by optional B")
+        previous_layer = transaction_layers.setdefault(record["transaction_id"], record["layer_id"])
+        if previous_layer != record["layer_id"]:
+            fail("phase ledger transaction spans multiple layers")
         if generation is None:
             generation = record["session_generation"]
         elif record["session_generation"] != generation:
@@ -483,6 +487,27 @@ def validate_g4(root):
         if ledger_result["mode"] != mode_name:
             fail(f"G4 {mode_name} ledger mode differs from its directory")
         phase_records = read_ledger(mode_root / "phase-ledger.jsonl")
+        phase_a_layers = {record["layer_id"] for record in phase_records if record["phase"] == "A"}
+        phase_b_layers = {record["layer_id"] for record in phase_records if record["phase"] == "B"}
+        if len(phase_a_layers) != 50 or len(phase_b_layers) != 41 or not phase_b_layers < phase_a_layers:
+            fail(f"G4 {mode_name} phase layers differ from the audited 50/50/41 manifest")
+        per_transaction = {}
+        per_layer_a = {layer: 0 for layer in phase_a_layers}
+        for record in phase_records:
+            transaction = per_transaction.setdefault(
+                record["transaction_id"], {"layer": record["layer_id"], "phases": []}
+            )
+            if transaction["layer"] != record["layer_id"]:
+                fail(f"G4 {mode_name} transaction spans multiple layers")
+            transaction["phases"].append(record["phase"])
+            if record["phase"] == "A":
+                per_layer_a[record["layer_id"]] += 1
+        if len(set(per_layer_a.values())) != 1:
+            fail(f"G4 {mode_name} did not traverse every Phase A layer equally")
+        for transaction in per_transaction.values():
+            expected = ["A", "B"] if transaction["layer"] in phase_b_layers else ["A"]
+            if transaction["phases"] != expected:
+                fail(f"G4 {mode_name} transaction phases differ from its layer manifest")
         ledger_completions = [
             sum(record["completions_per_cu"][cu] for record in phase_records)
             for cu in range(4)

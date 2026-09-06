@@ -84,6 +84,32 @@ PY
         --manifest "${manifest}" --build-root /qwen-build \
         --llama-revision "${llama_revision}" \
         --output "${proof_dir}/qwen-build-preflight.json"
+    MANIFEST=${manifest} SERVER=${server} LIBNVCUDA=${libnvcuda} LAUNCH_SHIM=${launch_shim} \
+        LLAMA_REVISION=${llama_revision} python3 - <<'PY'
+import hashlib
+import json
+import os
+
+def digest(path):
+    value = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+manifest = json.load(open(os.environ["MANIFEST"], encoding="utf-8"))
+if manifest.get("schema_version") != 1 or manifest.get("llama_revision") != os.environ["LLAMA_REVISION"]:
+    raise SystemExit("build manifest revision/schema mismatch")
+for name, variable in (
+    ("llama_server", "SERVER"),
+    ("libnvcuda", "LIBNVCUDA"),
+    ("cuda13_launch_shim", "LAUNCH_SHIM"),
+):
+    artifact = manifest.get("artifacts", {}).get(name, {})
+    path = os.environ[variable]
+    if artifact.get("path") != path or artifact.get("sha256") != digest(path):
+        raise SystemExit(f"build manifest artifact mismatch: {name}")
+PY
     verified_libggml=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["libggml_path"])' \
         "${proof_dir}/qwen-build-preflight.json")
     server_sha256=$(sha256sum "${server}" | awk '{print $1}')
@@ -103,6 +129,28 @@ PY
 
     nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader,nounits \
         > "${proof_dir}/nvidia-memory-preflight.csv"
+    MODEL_SIZE=${model_size} python3 - "${proof_dir}/nvidia-memory-preflight.csv" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+free_mib = sum(
+    int(line.rsplit(",", 1)[-1].strip())
+    for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+)
+required = int(os.environ["MODEL_SIZE"]) + 2 * 1024**3
+if free_mib * 1024**2 < required:
+    raise SystemExit(
+        f"insufficient aggregate free GPU memory: {free_mib} MiB, need {required} bytes"
+    )
+PY
+    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits \
+        > "${proof_dir}/cuda-compute-apps-before.csv"
+    [[ ! -s ${proof_dir}/cuda-compute-apps-before.csv ]] || {
+        echo "refusing persistent E2E while another CUDA compute process is active" >&2
+        exit 1
+    }
     xbutil examine -d "${device_bdf}" -r dynamic-regions -r error -r firewall -r thermal \
         > "${proof_dir}/xbutil-preflight.txt" 2>&1
     grep -Fq 'Level 0 : 0x0 (GOOD)' "${proof_dir}/xbutil-preflight.txt" || {
