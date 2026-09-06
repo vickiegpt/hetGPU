@@ -2,16 +2,17 @@
 """Fail-closed validation of the pinned Qwen runtime's libggml artifact."""
 
 import argparse
-import ctypes
 import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 
 REQUIRED_SYMBOLS = ("dequantize_row_iq1_s", "ggml_init", "ggml_free")
+CONTAINER_BUILD_ROOT = Path("/qwen-build")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -35,6 +36,49 @@ def load_manifest(path):
     if not isinstance(value, dict):
         raise PreflightError("build manifest root must be an object")
     return value
+
+
+def verify_required_symbols(library_path):
+    loader_path = str(library_path.parent)
+    environment = os.environ.copy()
+    if environment.get("LD_LIBRARY_PATH"):
+        loader_path = f"{loader_path}:{environment['LD_LIBRARY_PATH']}"
+    environment["LD_LIBRARY_PATH"] = loader_path
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import ctypes
+import sys
+
+try:
+    library = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_LOCAL)
+except OSError as error:
+    print(error, file=sys.stderr)
+    raise SystemExit(2)
+for symbol in sys.argv[2:]:
+    try:
+        getattr(library, symbol)
+    except AttributeError:
+        print(f"verified libggml is missing required symbol {symbol}", file=sys.stderr)
+        raise SystemExit(3)
+""",
+            str(library_path),
+            *REQUIRED_SYMBOLS,
+        ],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    detail = probe.stderr.strip() or f"symbol probe exited with status {probe.returncode}"
+    if probe.returncode == 3:
+        raise PreflightError(detail)
+    if probe.returncode != 0:
+        raise PreflightError(f"cannot load verified libggml artifact: {detail}")
 
 
 def verify(manifest_path, build_root, expected_revision):
@@ -62,6 +106,8 @@ def verify(manifest_path, build_root, expected_revision):
         raise PreflightError("build manifest libggml SHA-256 is invalid")
 
     library_path = Path(raw_path)
+    if library_path.is_relative_to(CONTAINER_BUILD_ROOT):
+        library_path = canonical_root / library_path.relative_to(CONTAINER_BUILD_ROOT)
     try:
         canonical_library = library_path.resolve(strict=True)
     except OSError as error:
@@ -78,14 +124,9 @@ def verify(manifest_path, build_root, expected_revision):
         raise PreflightError("libggml SHA-256 does not match the build manifest")
 
     try:
-        library = ctypes.CDLL(str(canonical_library), mode=ctypes.RTLD_LOCAL)
-    except OSError as error:
-        raise PreflightError(f"cannot load verified libggml artifact: {error}") from error
-    for symbol in REQUIRED_SYMBOLS:
-        try:
-            getattr(library, symbol)
-        except AttributeError as error:
-            raise PreflightError(f"verified libggml is missing required symbol {symbol}") from error
+        verify_required_symbols(canonical_library)
+    except subprocess.TimeoutExpired as error:
+        raise PreflightError("verified libggml symbol probe timed out") from error
 
     return {
         "schema_version": 1,

@@ -37,6 +37,50 @@ def build_library(path, symbols=REQUIRED_SYMBOLS):
     )
 
 
+def build_library_with_sibling_dependency(path):
+    dependency_source = path.parent / "preflight-dependency.c"
+    dependency_source.write_text("void preflight_dependency(void) {}\n", encoding="utf-8")
+    dependency = path.parent / "libpreflight-dependency.so.0"
+    subprocess.run(
+        [
+            "cc",
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libpreflight-dependency.so.0",
+            "-o",
+            str(dependency),
+            str(dependency_source),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    (path.parent / "libpreflight-dependency.so").symlink_to(dependency.name)
+    source = path.with_suffix(".c")
+    source.write_text(
+        "extern void preflight_dependency(void);\n"
+        "void dequantize_row_iq1_s(void) {}\n"
+        "void ggml_init(void) { preflight_dependency(); }\n"
+        "void ggml_free(void) {}\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "cc",
+            "-shared",
+            "-fPIC",
+            "-o",
+            str(path),
+            str(source),
+            f"-L{path.parent}",
+            "-lpreflight-dependency",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
 def write_manifest(path, library, *, schema=1, revision=PINNED_REVISION, digest=None):
     path.write_text(
         json.dumps(
@@ -99,6 +143,43 @@ def test_accepts_hashed_regular_libggml_with_required_symbols(tmp_path):
         "status": "pass",
     }
     assert not output.with_suffix(".json.partial").exists()
+
+
+def test_remaps_container_libggml_path_to_host_build_root(tmp_path):
+    build_root = tmp_path / "build"
+    build_root.mkdir()
+    library = build_root / "llama-build" / "bin" / "libggml.so"
+    library.parent.mkdir(parents=True)
+    manifest = build_root / "manifest.json"
+    output = tmp_path / "verified.json"
+    build_library(library)
+    write_manifest(manifest, Path("/qwen-build/llama-build/bin/libggml.so"), digest=sha256(library))
+
+    result = run_preflight(build_root, manifest, output)
+
+    assert result.returncode == 0, result.stderr
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["build_root"] == str(build_root.resolve())
+    assert record["libggml_path"] == str(library.resolve())
+    assert record["libggml_sha256"] == sha256(library)
+
+
+def test_loads_verified_libggml_with_sibling_dependency(tmp_path):
+    build_root = tmp_path / "build"
+    build_root.mkdir()
+    library = build_root / "llama-build" / "bin" / "libggml.so"
+    library.parent.mkdir(parents=True)
+    manifest = build_root / "manifest.json"
+    output = tmp_path / "verified.json"
+    build_library_with_sibling_dependency(library)
+    write_manifest(manifest, Path("/qwen-build/llama-build/bin/libggml.so"), digest=sha256(library))
+
+    result = run_preflight(build_root, manifest, output)
+
+    assert result.returncode == 0, result.stderr
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["status"] == "pass"
+    assert record["libggml_path"] == str(library.resolve())
 
 
 @pytest.mark.parametrize(
