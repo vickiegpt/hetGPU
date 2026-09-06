@@ -9,7 +9,7 @@ device_bdf=0000:64:00.1
 
 capture_health() {
     local destination=$1
-    xrt-smi examine -d "${device_bdf}" \
+    xbutil examine -d "${device_bdf}" \
         -r dynamic-regions -r error -r firewall -r thermal 2>&1 | tee "${destination}"
 }
 
@@ -131,8 +131,10 @@ proof_dir=$(realpath -e "$1")
 
 set +u
 source /au250_xrt/env.sh >/dev/null
-set -u
 temperature=$(_au250_fpga_temp)
+device_flags_text=$(_au250_devflags)
+set -u
+read -r -a device_flags <<< "${device_flags_text}"
 [[ -z ${temperature} || ${temperature} -lt ${AU250_TEMP_LIMIT:-85} ]] || {
     echo "AU250 temperature ${temperature}C exceeds launch guard" >&2
     exit 1
@@ -141,7 +143,7 @@ git_common_dir=$(git -C "${repo_root}" rev-parse --path-format=absolute --git-co
 qwen_build_root=${AU250_QWEN_BUILD_ROOT:-/root/qwen35-au250-build}
 cuda_root=${AU250_CUDA_ROOT:-/usr/local/cuda-13.0}
 
-docker run --rm --gpus all --privileged $(_au250_devflags) \
+docker run --rm --gpus all --privileged "${device_flags[@]}" \
     -e HETGPU_PERSISTENT_SMOKE_INSIDE=1 \
     -v /sys:/sys \
     -v /lib/firmware/xilinx:/lib/firmware/xilinx:ro \
