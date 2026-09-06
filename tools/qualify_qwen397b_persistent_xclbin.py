@@ -72,6 +72,7 @@ def _validate_provenance(provenance: Mapping[str, object]) -> str:
         "build_log_sha256",
         "timing_report_sha256",
         "route_report_sha256",
+        "synthesis_logs_sha256",
     ):
         _require_digest(field, provenance.get(field, ""))
     if provenance.get("build_exit_code") != 0:
@@ -186,12 +187,48 @@ def _parse_route(route_text: str) -> dict[str, int]:
     return result
 
 
+def _validate_synthesis_logs(
+    synthesis_logs: Mapping[str, str],
+) -> dict[str, dict[str, object]]:
+    if set(synthesis_logs) != set(EXPECTED_CUS):
+        raise QualificationError(
+            "synthesis log set mismatch: "
+            f"expected {sorted(EXPECTED_CUS)}, got {sorted(synthesis_logs)}"
+        )
+    result: dict[str, dict[str, object]] = {}
+    for instance in sorted(EXPECTED_CUS):
+        text = synthesis_logs[instance]
+        if "Synth 8-4445" in text:
+            raise QualificationError(
+                f"{instance} contains Synth 8-4445 missing-readmem evidence"
+            )
+        if re.search(r"grid_rom.*does not have driver", text, re.IGNORECASE):
+            raise QualificationError(f"{instance} contains undriven grid ROM evidence")
+        if not re.search(
+            r"Synth 8-3876.*\$readmem data file ['\"].*IQ1S_GRID\.memh['\"] "
+            r"is read successfully",
+            text,
+        ):
+            raise QualificationError(f"{instance} is missing grid read-success evidence")
+        if (
+            "Synthesis finished with 0 errors, 0 critical warnings" not in text
+            or "synth_design completed successfully" not in text
+        ):
+            raise QualificationError(f"{instance} is missing clean completion evidence")
+        result[instance] = {
+            "grid_read_success": True,
+            "log_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+    return result
+
+
 def qualify_from_text(
     *,
     candidate: Path,
     info_text: str,
     timing_text: str,
     route_text: str,
+    synthesis_logs: Mapping[str, str],
     expected_sha256: str,
     expected_uuid: str,
     provenance: Mapping[str, object],
@@ -210,11 +247,13 @@ def qualify_from_text(
         )
     timing = _parse_timing(timing_text)
     routing = _parse_route(route_text)
+    synthesis = _validate_synthesis_logs(synthesis_logs)
     provenance_digest = _validate_provenance(provenance)
     return {
         "arguments": list(EXPECTED_ARGS),
         "cu_banks": cu_banks,
         "routing": routing,
+        "synthesis": synthesis,
         "sha256": actual_sha256,
         "source_provenance": dict(provenance),
         "source_provenance_sha256": provenance_digest,
@@ -305,8 +344,29 @@ def _hash_untracked_sources(rtl_root: Path) -> tuple[str, list[dict[str, str]]]:
     return hashlib.sha256(_canonical_bytes(entries)).hexdigest(), entries
 
 
-def _collect_provenance(rtl_root: Path, build_root: Path) -> tuple[dict[str, object], Path, Path, Path]:
-    build_log = build_root / "v++_kernel.resume-s2-i8.log"
+def _collect_synthesis_logs(
+    build_root: Path,
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    log_root = build_root / "_x/logs/link/syn"
+    texts: dict[str, str] = {}
+    entries: list[dict[str, str]] = []
+    for instance in sorted(EXPECTED_CUS):
+        path = log_root / f"ulp_{instance}_0_synth_1_runme.log"
+        if not path.is_file():
+            raise QualificationError(f"required synthesis evidence is missing: {path}")
+        texts[instance] = path.read_text(encoding="utf-8", errors="replace")
+        entries.append({"instance": instance, "path": str(path), "sha256": sha256(path)})
+    return texts, entries
+
+
+def _collect_provenance(
+    rtl_root: Path, build_root: Path
+) -> tuple[dict[str, object], Path, Path, Path, dict[str, str]]:
+    build_logs = (
+        build_root / "v++_kernel.gridrom-fixed.log",
+        build_root / "v++_kernel.resume-s2-i8.log",
+    )
+    build_log = next((path for path in build_logs if path.is_file()), build_logs[0])
     timing_report = (
         build_root / "_x/reports/link/imp/impl_1_hw_bb_locked_timing_summary_postroute_physopted.rpt"
     )
@@ -317,6 +377,7 @@ def _collect_provenance(rtl_root: Path, build_root: Path) -> tuple[dict[str, obj
     head = _run_bytes(["git", "rev-parse", "HEAD"], cwd=rtl_root).decode().strip()
     tracked_diff = _run_bytes(["git", "diff", "--binary", "HEAD", "--"], cwd=rtl_root)
     untracked_digest, untracked_entries = _hash_untracked_sources(rtl_root)
+    synthesis_logs, synthesis_entries = _collect_synthesis_logs(build_root)
     build_text = build_log.read_text(encoding="utf-8", errors="replace")
     exit_matches = re.findall(r"^EXIT=(\d+)\s*$", build_text, re.MULTILINE)
     if not exit_matches:
@@ -328,6 +389,10 @@ def _collect_provenance(rtl_root: Path, build_root: Path) -> tuple[dict[str, obj
         "route_report": str(route_report),
         "route_report_sha256": sha256(route_report),
         "rtl_head": head,
+        "synthesis_logs": synthesis_entries,
+        "synthesis_logs_sha256": hashlib.sha256(
+            _canonical_bytes(synthesis_entries)
+        ).hexdigest(),
         "timing_report": str(timing_report),
         "timing_report_sha256": sha256(timing_report),
         "tracked_diff_sha256": hashlib.sha256(tracked_diff).hexdigest(),
@@ -335,7 +400,7 @@ def _collect_provenance(rtl_root: Path, build_root: Path) -> tuple[dict[str, obj
         "untracked_sources": untracked_entries,
         "untracked_sources_sha256": untracked_digest,
     }
-    return provenance, build_log, timing_report, route_report
+    return provenance, build_log, timing_report, route_report, synthesis_logs
 
 
 def _xclbin_info(candidate: Path) -> str:
@@ -369,12 +434,15 @@ def main() -> int:
     candidate = args.candidate.resolve(strict=True)
     rtl_root = args.rtl_root.resolve(strict=True)
     build_root = args.build_root.resolve(strict=True)
-    provenance, _, timing_report, route_report = _collect_provenance(rtl_root, build_root)
+    provenance, _, timing_report, route_report, synthesis_logs = _collect_provenance(
+        rtl_root, build_root
+    )
     record = qualify_from_text(
         candidate=candidate,
         info_text=_xclbin_info(candidate),
         timing_text=timing_report.read_text(encoding="utf-8", errors="replace"),
         route_text=route_report.read_text(encoding="utf-8", errors="replace"),
+        synthesis_logs=synthesis_logs,
         expected_sha256=CANDIDATE_SHA256,
         expected_uuid=CANDIDATE_UUID,
         provenance=provenance,

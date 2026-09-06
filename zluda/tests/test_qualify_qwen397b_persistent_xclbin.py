@@ -41,6 +41,12 @@ VALID_ROUTE = """
 # of nets with overlaps = 0
 """
 
+VALID_SYNTHESIS = """
+INFO: [Synth 8-3876] $readmem data file '/build/IQ1S_GRID.memh' is read successfully
+Synthesis finished with 0 errors, 0 critical warnings and 12 warnings.
+synth_design completed successfully
+"""
+
 
 def load_tool():
     spec = importlib.util.spec_from_file_location("qwen_xclbin_qualifier", TOOL)
@@ -63,7 +69,17 @@ def provenance():
         "build_log_sha256": "33" * 32,
         "timing_report_sha256": "44" * 32,
         "route_report_sha256": "55" * 32,
+        "synthesis_logs_sha256": "66" * 32,
         "build_exit_code": 0,
+    }
+
+
+def synthesis_logs():
+    return {
+        "iq1s_layer_big_1": VALID_SYNTHESIS,
+        "iq1s_layer_big_2": VALID_SYNTHESIS,
+        "iq1s_layer_big_3": VALID_SYNTHESIS,
+        "iq1s_layer_small_1": VALID_SYNTHESIS,
     }
 
 
@@ -80,6 +96,7 @@ def test_accepts_exact_four_cu_timing_and_provenance(tmp_path):
         info_text=VALID_INFO,
         timing_text=VALID_TIMING,
         route_text=VALID_ROUTE,
+        synthesis_logs=synthesis_logs(),
         expected_sha256=digest,
         expected_uuid=CANDIDATE_UUID,
         provenance=provenance(),
@@ -107,7 +124,58 @@ def test_accepts_exact_four_cu_timing_and_provenance(tmp_path):
         "whs_ns": 0.01,
         "ths_ns": 0.0,
     }
+    assert set(record["synthesis"]) == set(synthesis_logs())
+    assert all(item["grid_read_success"] for item in record["synthesis"].values())
     assert record["source_provenance_sha256"] != "0" * 64
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "synthesis log set"),
+        ("no_grid_read", "grid read-success"),
+        ("readmem_missing", "Synth 8-4445"),
+        ("undriven_grid", "undriven grid ROM"),
+        ("critical_warning", "clean completion"),
+    ],
+)
+def test_rejects_incomplete_or_bad_grid_rom_synthesis_evidence(tmp_path, mutation, message):
+    tool = load_tool()
+    candidate = tmp_path / "candidate.xclbin"
+    digest = write_candidate(candidate)
+    logs = synthesis_logs()
+    if mutation == "missing":
+        del logs["iq1s_layer_big_3"]
+    elif mutation == "no_grid_read":
+        logs["iq1s_layer_big_3"] = logs["iq1s_layer_big_3"].replace(
+            "INFO: [Synth 8-3876] $readmem data file '/build/IQ1S_GRID.memh' is read successfully\n",
+            "",
+        )
+    elif mutation == "readmem_missing":
+        logs["iq1s_layer_big_3"] += (
+            "CRITICAL WARNING: [Synth 8-4445] could not open $readmem data file "
+            "'IQ1S_GRID.memh'\n"
+        )
+    elif mutation == "undriven_grid":
+        logs["iq1s_layer_big_3"] += (
+            "WARNING: [Synth 8-3848] Net grid_rom in module iq1s_block_decoder "
+            "does not have driver.\n"
+        )
+    elif mutation == "critical_warning":
+        logs["iq1s_layer_big_3"] = logs["iq1s_layer_big_3"].replace(
+            "0 critical warnings", "1 critical warnings"
+        )
+    with pytest.raises(tool.QualificationError, match=message):
+        tool.qualify_from_text(
+            candidate=candidate,
+            info_text=VALID_INFO,
+            timing_text=VALID_TIMING,
+            route_text=VALID_ROUTE,
+            synthesis_logs=logs,
+            expected_sha256=digest,
+            expected_uuid=CANDIDATE_UUID,
+            provenance=provenance(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -134,6 +202,7 @@ def test_rejects_one_static_contract_mutation(tmp_path, field, value, message):
         "info_text": VALID_INFO,
         "timing_text": VALID_TIMING,
         "route_text": VALID_ROUTE,
+        "synthesis_logs": synthesis_logs(),
         "expected_sha256": digest,
         "expected_uuid": CANDIDATE_UUID,
         "provenance": provenance(),
@@ -165,6 +234,7 @@ def test_rejects_incomplete_source_provenance(tmp_path, mutation, message):
             info_text=VALID_INFO,
             timing_text=VALID_TIMING,
             route_text=VALID_ROUTE,
+            synthesis_logs=synthesis_logs(),
             expected_sha256=digest,
             expected_uuid=CANDIDATE_UUID,
             provenance=source,
