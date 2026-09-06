@@ -2,24 +2,22 @@ use super::iq1s_layer_abi::{
     iq1s_command_crc32, Iq1sCommand, Iq1sCompletion, IQ1S_ABI_VERSION, IQ1S_COMMAND_BYTES,
     IQ1S_COMPLETION_BYTES, IQ1S_COMPLETION_MAGIC, IQ1S_COMPLETION_STATUS_OK, IQ1S_FAULT_CODE_NONE,
     IQ1S_REGISTER_MAGIC, IQ1S_REG_ABI_MAGIC_OFFSET, IQ1S_REG_ABI_VERSION_OFFSET,
+    IQ1S_REG_ACTIVATION_BASE_HI_OFFSET, IQ1S_REG_ACTIVATION_BASE_LO_OFFSET,
+    IQ1S_REG_ACTIVATION_BYTES_OFFSET, IQ1S_REG_ARENA_MANIFEST_BASE_HI_OFFSET,
+    IQ1S_REG_ARENA_MANIFEST_BASE_LO_OFFSET, IQ1S_REG_ARENA_MANIFEST_BYTES_OFFSET,
     IQ1S_REG_COMMAND_BASE_HI_OFFSET, IQ1S_REG_COMMAND_BASE_LO_OFFSET,
     IQ1S_REG_COMMAND_CAPACITY_OFFSET, IQ1S_REG_COMMAND_CONSUMER_OFFSET,
     IQ1S_REG_COMMAND_PRODUCER_OFFSET, IQ1S_REG_COMPLETION_BASE_HI_OFFSET,
     IQ1S_REG_COMPLETION_BASE_LO_OFFSET, IQ1S_REG_COMPLETION_CAPACITY_OFFSET,
     IQ1S_REG_COMPLETION_CONSUMER_OFFSET, IQ1S_REG_COMPLETION_PRODUCER_OFFSET,
-    IQ1S_REG_CONTROL_OFFSET, IQ1S_REG_DOORBELL_OFFSET, IQ1S_REG_FAULT_CODE_OFFSET,
-    IQ1S_REG_CU_ID_OFFSET,
-    IQ1S_REG_ACTIVATION_BASE_HI_OFFSET, IQ1S_REG_ACTIVATION_BASE_LO_OFFSET,
-    IQ1S_REG_ACTIVATION_BYTES_OFFSET, IQ1S_REG_ARENA_MANIFEST_BASE_HI_OFFSET,
-    IQ1S_REG_ARENA_MANIFEST_BASE_LO_OFFSET, IQ1S_REG_ARENA_MANIFEST_BYTES_OFFSET,
-    IQ1S_REG_MODEL_TAG_HI_OFFSET, IQ1S_REG_MODEL_TAG_LO_OFFSET,
+    IQ1S_REG_CONTROL_OFFSET, IQ1S_REG_CU_ID_OFFSET, IQ1S_REG_DOORBELL_OFFSET,
+    IQ1S_REG_FAULT_CODE_OFFSET, IQ1S_REG_MODEL_TAG_HI_OFFSET, IQ1S_REG_MODEL_TAG_LO_OFFSET,
     IQ1S_REG_PROGRAM_BASE_HI_OFFSET, IQ1S_REG_PROGRAM_BASE_LO_OFFSET,
-    IQ1S_REG_PROGRAM_BYTES_OFFSET, IQ1S_REG_RESULT_BASE_HI_OFFSET,
+    IQ1S_REG_PROGRAM_BYTES_OFFSET, IQ1S_REG_QUIESCENT_OFFSET, IQ1S_REG_RESULT_BASE_HI_OFFSET,
     IQ1S_REG_RESULT_BASE_LO_OFFSET, IQ1S_REG_RESULT_BYTES_OFFSET,
+    IQ1S_REG_SESSION_GENERATION_HI_OFFSET, IQ1S_REG_SESSION_GENERATION_LO_OFFSET,
     IQ1S_REG_TOKEN_MAP_BASE_HI_OFFSET, IQ1S_REG_TOKEN_MAP_BASE_LO_OFFSET,
-    IQ1S_REG_TOKEN_MAP_BYTES_OFFSET,
-    IQ1S_REG_QUIESCENT_OFFSET, IQ1S_REG_SESSION_GENERATION_HI_OFFSET,
-    IQ1S_REG_SESSION_GENERATION_LO_OFFSET, IQ1S_ROLE_DOWN, IQ1S_ROLE_GATE, IQ1S_ROLE_UP,
+    IQ1S_REG_TOKEN_MAP_BYTES_OFFSET, IQ1S_ROLE_DOWN, IQ1S_ROLE_GATE, IQ1S_ROLE_UP,
 };
 use super::iq1s_layer_trace::{
     validate_compiled_layer_phase, CompiledLayerPhase, ExpandedIq1sCounts,
@@ -476,18 +474,28 @@ fn resident_model_tag(chunks: &[ArenaChunkSpec]) -> u64 {
             hash.update(shard.sha256);
         }
     }
-    u64::from_le_bytes(hash.finalize()[..8].try_into().expect("eight-byte model tag"))
+    u64::from_le_bytes(
+        hash.finalize()[..8]
+            .try_into()
+            .expect("eight-byte model tag"),
+    )
 }
 
 fn arena_manifest(model_tag: u64, arena: &[ArenaChunk]) -> Result<Vec<u8>, PersistentError> {
     let record_count = arena
         .iter()
         .try_fold(0usize, |count, chunk| count.checked_add(chunk.shards.len()))
-        .ok_or_else(|| PersistentError::Config("arena manifest record count overflow".to_string()))?;
+        .ok_or_else(|| {
+            PersistentError::Config("arena manifest record count overflow".to_string())
+        })?;
     let used = 64usize
-        .checked_add(record_count.checked_mul(ARENA_MANIFEST_RECORD_BYTES).ok_or_else(|| {
-            PersistentError::Config("arena manifest length overflow".to_string())
-        })?)
+        .checked_add(
+            record_count
+                .checked_mul(ARENA_MANIFEST_RECORD_BYTES)
+                .ok_or_else(|| {
+                    PersistentError::Config("arena manifest length overflow".to_string())
+                })?,
+        )
         .ok_or_else(|| PersistentError::Config("arena manifest length overflow".to_string()))?;
     if used > ARENA_MANIFEST_BYTES {
         return Err(PersistentError::Config(
@@ -497,12 +505,17 @@ fn arena_manifest(model_tag: u64, arena: &[ArenaChunk]) -> Result<Vec<u8>, Persi
     let mut bytes = vec![0u8; ARENA_MANIFEST_BYTES];
     bytes[0..4].copy_from_slice(&ARENA_MANIFEST_MAGIC.to_le_bytes());
     bytes[4..8].copy_from_slice(&IQ1S_ABI_VERSION.to_le_bytes());
-    let record_count = u32::try_from(record_count)
-        .map_err(|_| PersistentError::Config("arena manifest record count exceeds u32".to_string()))?;
+    let record_count = u32::try_from(record_count).map_err(|_| {
+        PersistentError::Config("arena manifest record count exceeds u32".to_string())
+    })?;
     bytes[8..12].copy_from_slice(&record_count.to_le_bytes());
     bytes[12..16].copy_from_slice(&(ARENA_MANIFEST_RECORD_BYTES as u32).to_le_bytes());
     bytes[16..24].copy_from_slice(&model_tag.to_le_bytes());
-    for (index, shard) in arena.iter().flat_map(|chunk| chunk.shards.iter()).enumerate() {
+    for (index, shard) in arena
+        .iter()
+        .flat_map(|chunk| chunk.shards.iter())
+        .enumerate()
+    {
         let offset = 64 + index * ARENA_MANIFEST_RECORD_BYTES;
         bytes[offset..offset + 8].copy_from_slice(&shard.address.to_le_bytes());
         bytes[offset + 8..offset + 16].copy_from_slice(&(shard.bytes as u64).to_le_bytes());
@@ -743,8 +756,7 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                         PersistentError::Config("arena shard byte range overflow".to_string())
                     })?;
                     if end > bytes.len()
-                        || <[u8; 32]>::from(Sha256::digest(&bytes[relative..end]))
-                            != shard.sha256
+                        || <[u8; 32]>::from(Sha256::digest(&bytes[relative..end])) != shard.sha256
                     {
                         return Err(PersistentError::Config(format!(
                             "arena shard bank {} layer {} role {} expert {} failed length/hash verification",
@@ -781,12 +793,7 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
             )?;
             checked_code(
                 "sync arena manifest",
-                ops.bo_sync(
-                    arena_manifest_bo,
-                    XRT_BO_SYNC_TO_DEVICE,
-                    manifest.len(),
-                    0,
-                ),
+                ops.bo_sync(arena_manifest_bo, XRT_BO_SYNC_TO_DEVICE, manifest.len(), 0),
             )?;
             let command_address = ops.bo_address(command_bo);
             let completion_address = ops.bo_address(completion_bo);
@@ -915,8 +922,14 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
             (IQ1S_REG_COMPLETION_CONSUMER_OFFSET, 0),
             (IQ1S_REG_PROGRAM_BASE_LO_OFFSET, program_address.0),
             (IQ1S_REG_PROGRAM_BASE_HI_OFFSET, program_address.1),
-            (IQ1S_REG_ARENA_MANIFEST_BASE_LO_OFFSET, arena_manifest_address.0),
-            (IQ1S_REG_ARENA_MANIFEST_BASE_HI_OFFSET, arena_manifest_address.1),
+            (
+                IQ1S_REG_ARENA_MANIFEST_BASE_LO_OFFSET,
+                arena_manifest_address.0,
+            ),
+            (
+                IQ1S_REG_ARENA_MANIFEST_BASE_HI_OFFSET,
+                arena_manifest_address.1,
+            ),
             (IQ1S_REG_ACTIVATION_BASE_LO_OFFSET, activation_address.0),
             (IQ1S_REG_ACTIVATION_BASE_HI_OFFSET, activation_address.1),
             (IQ1S_REG_RESULT_BASE_LO_OFFSET, result_address.0),
@@ -929,7 +942,10 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
             (IQ1S_REG_RESULT_BYTES_OFFSET, OUTPUT_BYTES as u32),
             (IQ1S_REG_TOKEN_MAP_BYTES_OFFSET, TOKEN_MAP_BYTES as u32),
             (IQ1S_REG_PROGRAM_BYTES_OFFSET, PROGRAM_BYTES as u32),
-            (IQ1S_REG_ARENA_MANIFEST_BYTES_OFFSET, ARENA_MANIFEST_BYTES as u32),
+            (
+                IQ1S_REG_ARENA_MANIFEST_BYTES_OFFSET,
+                ARENA_MANIFEST_BYTES as u32,
+            ),
             (IQ1S_REG_CU_ID_OFFSET, cu as u32),
             (IQ1S_REG_CONTROL_OFFSET, CONTROL_START),
         ] {
@@ -1585,11 +1601,17 @@ mod tests {
     use crate::r#impl::iq1s_layer_trace::{
         compile_layer_phase, ActivationRange, LayerPhase, LayerPhasePlan, SemanticIq1sCommand,
     };
+    use crate::r#impl::iq1s_tmatmul::{
+        raw_component_dots, reconstruct_from_raw, validated_grid, Iq1sBlock, Q8_1Block,
+    };
     use crate::r#impl::iq1s_weight_arena::ArenaShard;
     use crate::r#impl::iq1s_weight_registry::{Iq1sExpertRole, Iq1sTensorIdentity};
+    use crate::r#impl::xrt_tmatmul::RealXrt;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::ffi::CStr;
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -2241,23 +2263,29 @@ mod tests {
                     if *bo == output_bo)));
             let last_input_sync = events
                 .iter()
-                .rposition(|event| matches!(event,
+                .rposition(|event| {
+                    matches!(event,
                     Event::BoSync { bo, direction: XRT_BO_SYNC_TO_DEVICE, .. }
-                        if *bo == activation_bo || *bo == token_map_bo))
+                        if *bo == activation_bo || *bo == token_map_bo)
+                })
                 .unwrap();
             let producer_publish = events
                 .iter()
-                .position(|event| matches!(event,
+                .position(|event| {
+                    matches!(event,
                     Event::RegisterWrite { cu: actual, offset, value: 1 }
                         if *actual == cu as u32
-                            && *offset == IQ1S_REG_COMMAND_PRODUCER_OFFSET as u32))
+                            && *offset == IQ1S_REG_COMMAND_PRODUCER_OFFSET as u32)
+                })
                 .unwrap();
             let doorbell = events
                 .iter()
-                .position(|event| matches!(event,
+                .position(|event| {
+                    matches!(event,
                     Event::RegisterWrite { cu: actual, offset, value: 1 }
                         if *actual == cu as u32
-                            && *offset == IQ1S_REG_DOORBELL_OFFSET as u32))
+                            && *offset == IQ1S_REG_DOORBELL_OFFSET as u32)
+                })
                 .unwrap();
             assert!(last_input_sync < producer_publish);
             assert!(producer_publish < doorbell);
@@ -2441,5 +2469,324 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn persistent_smoke_fixture() -> (Vec<u8>, Vec<u8>, f32) {
+        const D_VALUES: [f32; 4] = [0.5, -0.25, 1.5, 0.0625];
+        const D_HALF: [u16; 4] = [0x3800, 0xb400, 0x3e00, 0x2c00];
+        const S_VALUES: [f32; 4] = [-2.0, 0.0, 0.75, 4.0];
+        const S_HALF: [u16; 4] = [0xc000, 0x0000, 0x3a00, 0x4400];
+
+        let grid = validated_grid(None).expect("recover the verified IQ1_S grid");
+        let mut row = Vec::with_capacity(800);
+        let mut activations = vec![0u8; 32 * 144];
+        let mut expected = 0.0f32;
+        for vector_index in 0..16usize {
+            let mut packed = [0u8; 50];
+            let iq1s_d_half = if vector_index % 2 == 0 {
+                0x3555u16
+            } else {
+                0xb400u16
+            };
+            packed[..2].copy_from_slice(&iq1s_d_half.to_le_bytes());
+            let mut q8_groups = Vec::with_capacity(8);
+            for group_index in 0..8usize {
+                let odd_scale = 1 + 2 * ((vector_index + group_index) % 8) as u8;
+                let negative = (vector_index + group_index) % 2 != 0;
+                let indices = [
+                    (vector_index * 137 + group_index * 29) & 0x7ff,
+                    0x7ff - ((vector_index * 73 + group_index * 11) & 0x7ff),
+                    ((vector_index << 8) | (group_index * 31)) & 0x7ff,
+                    (((7 - group_index) << 8) | ((255 - vector_index * 13) & 0xff)) & 0x7ff,
+                ];
+                let mut qh =
+                    (u16::from((odd_scale - 1) / 2) << 12) | if negative { 0x8000 } else { 0 };
+                for (position, index) in indices.iter().enumerate() {
+                    packed[2 + group_index * 4 + position] = *index as u8;
+                    qh |= (((index >> 8) & 7) as u16) << (3 * position);
+                }
+                let qh_offset = 34 + group_index * 2;
+                packed[qh_offset..qh_offset + 2].copy_from_slice(&qh.to_le_bytes());
+
+                let mut qs = [0i8; 32];
+                for (position, quant) in qs.iter_mut().enumerate() {
+                    *quant = match vector_index {
+                        0 => 0,
+                        1 if position % 2 == 0 => i8::MIN,
+                        1 => i8::MAX,
+                        _ => {
+                            (((position * 37 + group_index * 19 + vector_index * 11) % 255) as i16
+                                - 127) as i8
+                        }
+                    };
+                }
+                let d_index = (vector_index + group_index) % D_VALUES.len();
+                let s_index = (vector_index * 3 + group_index) % S_VALUES.len();
+                let q8 = Q8_1Block {
+                    d: D_VALUES[d_index],
+                    s: S_VALUES[s_index],
+                    qs,
+                };
+                let global_group = vector_index * 8 + group_index;
+                let record_offset = (global_group / 4) * 144;
+                let subblock = global_group % 4;
+                activations[record_offset + subblock * 4..record_offset + subblock * 4 + 2]
+                    .copy_from_slice(&D_HALF[d_index].to_le_bytes());
+                activations[record_offset + subblock * 4 + 2..record_offset + subblock * 4 + 4]
+                    .copy_from_slice(&S_HALF[s_index].to_le_bytes());
+                for (destination, value) in activations
+                    [record_offset + 16 + subblock * 32..record_offset + 16 + (subblock + 1) * 32]
+                    .iter_mut()
+                    .zip(qs)
+                {
+                    *destination = value as u8;
+                }
+                q8_groups.push(q8);
+            }
+            let parsed = Iq1sBlock::parse(&packed, &grid).expect("parse smoke IQ1_S block");
+            for (group, q8) in parsed.groups.iter().zip(q8_groups.iter()) {
+                let (grid_dot, delta_dot) = raw_component_dots(group, q8);
+                let contribution =
+                    reconstruct_from_raw(group, parsed.d, q8, grid_dot << 8, delta_dot << 8)
+                        .expect("reconstruct smoke IQ1_S contribution");
+                expected = (expected + contribution) as f32;
+            }
+            row.extend_from_slice(&packed);
+        }
+        assert_eq!(row.len(), 800);
+        assert_eq!(activations.len(), 4608);
+        assert!(expected.is_finite() && expected != 0.0);
+        (row, activations, expected)
+    }
+
+    fn persistent_smoke_chunks(bytes: &[u8], sha256: [u8; 32]) -> Vec<ArenaChunkSpec> {
+        (0..ARENA_BANK_COUNT)
+            .map(|bank| ArenaChunkSpec {
+                bank: bank as u8,
+                logical_offset: 0,
+                bytes: bytes.len(),
+                sha256,
+                shards: vec![ArenaShardSpec {
+                    bank: bank as u8,
+                    logical_offset: 0,
+                    bytes: bytes.len(),
+                    layer_id: 7,
+                    role: IQ1S_ROLE_GATE as u16,
+                    expert_id: 17,
+                    row_start: bank as u32 * 256,
+                    row_count: 256,
+                    sha256,
+                }],
+            })
+            .collect()
+    }
+
+    fn persistent_smoke_phase(transaction_id: u64, shard_sha256: [u8; 32]) -> CompiledLayerPhase {
+        let tensor = Arc::new(Iq1sTensorIdentity {
+            canonical_path: PathBuf::from("/qwen397b-smoke/blk.7.ffn_gate_exps.weight"),
+            file_offset: 0,
+            nbytes: 819_200,
+            name: "blk.7.ffn_gate_exps.weight".to_string(),
+            layer: 7,
+            ne: [4096, 1024, 512, 1],
+            nb: [50, 800, 819_200, 419_430_400],
+            role: Iq1sExpertRole::Gate,
+            model_sha256: [0x51; 32],
+            content_sha256: shard_sha256,
+            device: 1,
+            inode: 2,
+            modified_ns: 3,
+        });
+        let commands = (0..ARENA_BANK_COUNT)
+            .map(|bank| SemanticIq1sCommand {
+                layer_id: 7,
+                phase: LayerPhase::PhaseA,
+                role: Iq1sExpertRole::Gate,
+                expert_id: 17,
+                lane_mask: 1,
+                token_ids: vec![0],
+                input_offset: 0x2000,
+                output_offset: 0x8000,
+                token_map_offset: 0x3000,
+                row_shard: ArenaShard {
+                    tensor: tensor.clone(),
+                    expert: 17,
+                    bank: bank as u8,
+                    row_start: bank as u32 * 256,
+                    row_count: 256,
+                    superblock: 0,
+                    offset: 0,
+                    bytes: 204_800,
+                    sha256: shard_sha256,
+                },
+            })
+            .collect();
+        compile_layer_phase(
+            &LayerPhasePlan {
+                transaction_id,
+                phase: LayerPhase::PhaseA,
+                commands,
+                activations: vec![ActivationRange {
+                    cuda_ptr: 0x10000,
+                    slab_offset: 0x2000,
+                    bytes: 4608,
+                    stream: 1,
+                }],
+            },
+            "compiler",
+            QWEN_MODEL_CONTEXT_LIMIT,
+        )
+        .expect("compile persistent smoke phase")
+    }
+
+    fn format_xuid(uuid: Xuid) -> String {
+        let hex = uuid
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
+    }
+
+    #[test]
+    #[ignore = "opens and programs the real AU250 only under the explicit persistent smoke guard"]
+    fn au250_iq1s_persistent_four_cu_smoke() {
+        if std::env::var("HETGPU_XRT_AU250_IQ1S_PERSISTENT_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        let xclbin = PathBuf::from(
+            std::env::var_os("HETGPU_XRT_XCLBIN")
+                .expect("HETGPU_XRT_XCLBIN must name the qualified persistent image"),
+        );
+        let expected_uuid = std::env::var("HETGPU_XRT_EXPECTED_UUID")
+            .expect("HETGPU_XRT_EXPECTED_UUID is required");
+        let summary_path = PathBuf::from(
+            std::env::var_os("HETGPU_XRT_PERSISTENT_SUMMARY")
+                .expect("HETGPU_XRT_PERSISTENT_SUMMARY is required"),
+        );
+        let timeout_ms = std::env::var("HETGPU_XRT_TIMEOUT_MS")
+            .unwrap_or_else(|_| "10000".to_string())
+            .parse::<u32>()
+            .expect("HETGPU_XRT_TIMEOUT_MS must be u32");
+
+        let (row, activations, expected) = persistent_smoke_fixture();
+        let arena_bytes = row.repeat(256);
+        assert_eq!(arena_bytes.len(), 204_800);
+        let arena_sha256: [u8; 32] = Sha256::digest(&arena_bytes).into();
+        let chunks = persistent_smoke_chunks(&arena_bytes, arena_sha256);
+        let ops = RealXrt::load(true).expect("load XRT with native-IP API");
+        let mut pool = PersistentIq1sPool::open(
+            ops,
+            PersistentIq1sConfig::checked(xclbin, 0, Some(4), timeout_ms)
+                .expect("validate persistent smoke config"),
+            1,
+            &chunks,
+            |_| Ok(arena_bytes.clone()),
+        )
+        .expect("open four-CU persistent IQ1_S pool");
+        let actual_uuid = format_xuid(pool.xclbin_uuid);
+        assert_eq!(actual_uuid, expected_uuid);
+
+        let buffers = PhaseBuffers {
+            activations: vec![HostRange {
+                offset: 0x2000,
+                bytes: activations,
+            }],
+            token_maps: vec![HostRange {
+                offset: 0x3000,
+                bytes: 0u32.to_le_bytes().to_vec(),
+            }],
+        };
+        let mut ring_generations: [Vec<u32>; ARENA_BANK_COUNT] =
+            std::array::from_fn(|_| Vec::new());
+        let mut completion_counts = [0u64; ARENA_BANK_COUNT];
+        let mut result_rows_checked = 0u64;
+        pool.measurement_begin()
+            .expect("begin persistent DMA window");
+        for (generation, transaction_id) in [101u64, 102].into_iter().enumerate() {
+            let completed = pool
+                .submit_phase(
+                    &persistent_smoke_phase(transaction_id, arena_sha256),
+                    &buffers,
+                )
+                .expect("submit persistent smoke descriptor generation");
+            assert_eq!(completed.dma.weight_ranges, 0);
+            assert_eq!(completed.dma.weight_bytes, 0);
+            for cu in 0..ARENA_BANK_COUNT {
+                assert_eq!(completed.completions[cu].len(), 1);
+                let completion = completed.completions[cu][0];
+                assert_eq!(completion.command_index, generation as u32);
+                assert_eq!(completion.fault_code, IQ1S_FAULT_CODE_NONE);
+                assert!(completion.result_fence != 0 && completion.cycles != 0);
+                ring_generations[cu].push(completion.command_index);
+                completion_counts[cu] += 1;
+                assert_eq!(completed.results[cu].len(), 1);
+                let result = &completed.results[cu][0];
+                assert_eq!(result.offset, 0x8000);
+                assert_eq!(result.bytes.len(), 256 * 4);
+                for actual in result.bytes.chunks_exact(4) {
+                    let actual = f32::from_le_bytes(actual.try_into().expect("four-byte f32"));
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                    result_rows_checked += 1;
+                }
+            }
+        }
+        let measured = pool.measurement_end().expect("end persistent DMA window");
+        assert_eq!(measured.weight_ranges, 0);
+        assert_eq!(measured.weight_bytes, 0);
+        assert_eq!(measured.command_ranges, 8);
+        assert_eq!(measured.activation_ranges, 8);
+        assert_eq!(measured.result_ranges, 8);
+        assert_eq!(measured.program_ranges, 4);
+        let mut sticky_fault_codes = [0u32; ARENA_BANK_COUNT];
+        let mut quiescent = [0u32; ARENA_BANK_COUNT];
+        for cu in 0..ARENA_BANK_COUNT {
+            sticky_fault_codes[cu] = pool
+                .reg_read(cu, IQ1S_REG_FAULT_CODE_OFFSET)
+                .expect("read sticky fault code");
+            quiescent[cu] = pool
+                .reg_read(cu, IQ1S_REG_QUIESCENT_OFFSET)
+                .expect("read quiescent state");
+        }
+        assert_eq!(sticky_fault_codes, [0; ARENA_BANK_COUNT]);
+        assert_eq!(quiescent, [1; ARENA_BANK_COUNT]);
+        pool.shutdown()
+            .expect("gracefully shut down persistent CUs");
+
+        let summary = serde_json::json!({
+            "schema_version": 1,
+            "status": "pass",
+            "xclbin_uuid": actual_uuid,
+            "persistent_starts_per_cu": [1, 1, 1, 1],
+            "ring_generations_per_cu": ring_generations,
+            "per_cu_completions": completion_counts,
+            "sticky_fault_codes": sticky_fault_codes,
+            "quiescent_before_shutdown": quiescent,
+            "result_rows_checked": result_rows_checked,
+            "expected_f32_bits": expected.to_bits(),
+            "measured_dma": {
+                "command_ranges": measured.command_ranges,
+                "activation_ranges": measured.activation_ranges,
+                "result_ranges": measured.result_ranges,
+                "program_ranges": measured.program_ranges,
+                "weight_ranges": measured.weight_ranges,
+                "weight_bytes": measured.weight_bytes,
+            },
+        });
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&summary_path)
+            .expect("create persistent smoke summary without overwriting evidence");
+        serde_json::to_writer_pretty(&mut output, &summary)
+            .expect("write persistent smoke summary");
+        writeln!(output).expect("terminate persistent smoke summary");
+        output.sync_all().expect("sync persistent smoke summary");
     }
 }
