@@ -88,14 +88,111 @@ def write_bundle(root, phases=None, mode_summary=None):
     )
 
 
-def validate(root):
+def validate(root, gate="ledger"):
     return subprocess.run(
-        [sys.executable, str(VALIDATOR), "--gate", "ledger", str(root)],
+        [sys.executable, str(VALIDATOR), "--gate", gate, str(root)],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
     )
+
+
+def g3_summary():
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "xclbin_uuid": "b1bafc64-09fd-32b0-a5b4-a881e554ae84",
+        "persistent_starts_per_cu": [1, 1, 1, 1],
+        "ring_generations_per_cu": [[0, 1], [0, 1], [0, 1], [0, 1]],
+        "per_cu_completions": [2, 2, 2, 2],
+        "sticky_fault_codes": [0, 0, 0, 0],
+        "quiescent_before_shutdown": [1, 1, 1, 1],
+        "result_rows_checked": 2048,
+        "expected_f32_bits": 1167027804,
+        "measured_dma": {
+            "command_ranges": 8,
+            "activation_ranges": 8,
+            "result_ranges": 8,
+            "program_ranges": 4,
+            "weight_ranges": 0,
+            "weight_bytes": 0,
+        },
+    }
+
+
+def write_g3_bundle(root, hardware_summary=None):
+    root.mkdir()
+    qualification = {
+        "status": "pass",
+        "sha256": "aa" * 32,
+        "uuid": "b1bafc64-09fd-32b0-a5b4-a881e554ae84",
+        "installed_path": "/au250_xrt/xclbins/qwen397b_iq1s_layer_persistent_aaaaaaaa.xclbin",
+        "synthesis": {
+            name: {"grid_read_success": True, "log_sha256": "bb" * 32}
+            for name in (
+                "iq1s_layer_big_1",
+                "iq1s_layer_big_2",
+                "iq1s_layer_big_3",
+                "iq1s_layer_small_1",
+            )
+        },
+    }
+    for name, value in (
+        ("qualification.json", qualification),
+        ("summary.json", hardware_summary if hardware_summary is not None else g3_summary()),
+    ):
+        (root / name).write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    for name in ("health-before.txt", "health-after.txt"):
+        (root / name).write_text("Level 0 : 0x0 (GOOD)\n", encoding="utf-8")
+    (root / "xclbin-info.txt").write_text(
+        "UUID (xclbin):          b1bafc64-09fd-32b0-a5b4-a881e554ae84\n",
+        encoding="utf-8",
+    )
+    (root / "cargo.log").write_text("test result: ok. 1 passed; 0 failed\n", encoding="utf-8")
+
+
+def test_g3_accepts_exact_fail_closed_hardware_bundle(tmp_path):
+    root = tmp_path / "g3"
+    write_g3_bundle(root)
+    result = validate(root, "g3")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "gate": "g3",
+        "per_cu_completions": [2, 2, 2, 2],
+        "result_rows_checked": 2048,
+        "status": "pass",
+        "xclbin_uuid": "b1bafc64-09fd-32b0-a5b4-a881e554ae84",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda root, data: data.__setitem__("status", "fail"),
+        lambda root, data: data.__setitem__("persistent_starts_per_cu", [1, 1, 1, 0]),
+        lambda root, data: data.__setitem__("ring_generations_per_cu", [[0, 1]] * 3),
+        lambda root, data: data.__setitem__("per_cu_completions", [2, 2, 2, 1]),
+        lambda root, data: data.__setitem__("sticky_fault_codes", [0, 0, 0, 1]),
+        lambda root, data: data.__setitem__("quiescent_before_shutdown", [1, 1, 1, 0]),
+        lambda root, data: data.__setitem__("result_rows_checked", 2047),
+        lambda root, data: data["measured_dma"].__setitem__("weight_bytes", 1),
+        lambda root, data: data["measured_dma"].__setitem__("program_ranges", 3),
+        lambda root, data: (root / "health-after.txt").write_text(
+            "Level 0 : 0x1 (TRIPPED)\n", encoding="utf-8"
+        ),
+    ),
+)
+def test_g3_rejects_each_hardware_proof_mutation(tmp_path, mutation):
+    root = tmp_path / "g3-bad"
+    data = g3_summary()
+    write_g3_bundle(root, data)
+    mutation(root, data)
+    (root / "summary.json").write_text(
+        json.dumps(data, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    result = validate(root, "g3")
+    assert result.returncode != 0
 
 
 def test_compact_persistent_ledger_accepts_exact_one_token_bundle(tmp_path):

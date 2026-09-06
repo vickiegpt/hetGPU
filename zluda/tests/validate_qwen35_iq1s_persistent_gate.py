@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 SHA256 = re.compile(r"[0-9a-f]{64}")
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 TIMING_FIELDS = (
     "capture",
     "route_dma",
@@ -55,6 +56,27 @@ SUMMARY_FIELDS = {
     "fallbacks",
     "token_ids",
     "cuda_token_ids",
+}
+G3_SUMMARY_FIELDS = {
+    "schema_version",
+    "status",
+    "xclbin_uuid",
+    "persistent_starts_per_cu",
+    "ring_generations_per_cu",
+    "per_cu_completions",
+    "sticky_fault_codes",
+    "quiescent_before_shutdown",
+    "result_rows_checked",
+    "expected_f32_bits",
+    "measured_dma",
+}
+G3_DMA_FIELDS = {
+    "command_ranges",
+    "activation_ranges",
+    "result_ranges",
+    "program_ranges",
+    "weight_ranges",
+    "weight_bytes",
 }
 
 
@@ -126,6 +148,16 @@ def read_ledger(path):
         except (UnicodeError, json.JSONDecodeError) as error:
             fail(f"cannot parse phase ledger line {index}: {error}")
     return records
+
+
+def read_text(path, label):
+    try:
+        value = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        fail(f"cannot read {label}: {error}")
+    if not value.endswith("\n"):
+        fail(f"{label} is truncated or lacks its final newline")
+    return value
 
 
 def validate_phase(record, index, mode):
@@ -254,6 +286,87 @@ def validate_ledger(root):
     }
 
 
+def validate_g3(root):
+    qualification = read_json(root / "qualification.json", "qualification.json")
+    required_qualification = {"status", "sha256", "uuid", "installed_path", "synthesis"}
+    if not isinstance(qualification, dict) or not required_qualification.issubset(qualification):
+        fail("qualification.json lacks mandatory fields")
+    if qualification["status"] != "pass":
+        fail("xclbin qualification did not pass")
+    sha256(qualification["sha256"], "qualification.sha256")
+    image_uuid = qualification["uuid"]
+    if not isinstance(image_uuid, str) or UUID.fullmatch(image_uuid) is None:
+        fail("qualification.uuid is invalid")
+    installed = qualification["installed_path"]
+    expected_name = f"qwen397b_iq1s_layer_persistent_{qualification['sha256'][:8]}.xclbin"
+    if not isinstance(installed, str) or Path(installed).name != expected_name:
+        fail("qualified install name does not contain the image SHA prefix")
+    synthesis = qualification["synthesis"]
+    expected_instances = {
+        "iq1s_layer_big_1",
+        "iq1s_layer_big_2",
+        "iq1s_layer_big_3",
+        "iq1s_layer_small_1",
+    }
+    if not isinstance(synthesis, dict) or set(synthesis) != expected_instances:
+        fail("qualification synthesis set differs from four CUs")
+    for instance, evidence in synthesis.items():
+        exact_fields(evidence, {"grid_read_success", "log_sha256"}, f"synthesis.{instance}")
+        if evidence["grid_read_success"] is not True:
+            fail(f"synthesis.{instance} did not read the IQ1_S grid")
+        sha256(evidence["log_sha256"], f"synthesis.{instance}.log_sha256")
+
+    summary = read_json(root / "summary.json", "summary.json")
+    exact_fields(summary, G3_SUMMARY_FIELDS, "G3 summary")
+    if summary["schema_version"] != 1 or summary["status"] != "pass":
+        fail("G3 summary did not pass")
+    if summary["xclbin_uuid"] != image_uuid:
+        fail("G3 summary UUID differs from qualified xclbin")
+    expected_vectors = {
+        "persistent_starts_per_cu": [1, 1, 1, 1],
+        "ring_generations_per_cu": [[0, 1], [0, 1], [0, 1], [0, 1]],
+        "per_cu_completions": [2, 2, 2, 2],
+        "sticky_fault_codes": [0, 0, 0, 0],
+        "quiescent_before_shutdown": [1, 1, 1, 1],
+    }
+    for field, expected in expected_vectors.items():
+        if summary[field] != expected:
+            fail(f"G3 summary {field} differs from the strict contract")
+    if integer(summary["result_rows_checked"], "G3 result_rows_checked") != 2048:
+        fail("G3 must check exactly 2048 result rows")
+    integer(summary["expected_f32_bits"], "G3 expected_f32_bits", 1)
+    dma = summary["measured_dma"]
+    exact_fields(dma, G3_DMA_FIELDS, "G3 measured_dma")
+    expected_dma = {
+        "command_ranges": 8,
+        "activation_ranges": 8,
+        "result_ranges": 8,
+        "program_ranges": 4,
+        "weight_ranges": 0,
+        "weight_bytes": 0,
+    }
+    if dma != expected_dma:
+        fail("G3 measured DMA differs from the strict resident-weight contract")
+
+    for filename in ("health-before.txt", "health-after.txt"):
+        health = read_text(root / filename, filename)
+        if "Level 0 : 0x0 (GOOD)" not in health or re.search(r"\bfatal\b", health, re.I):
+            fail(f"{filename} is not healthy")
+    xclbin_info = read_text(root / "xclbin-info.txt", "xclbin-info.txt")
+    if f"UUID (xclbin):          {image_uuid}" not in xclbin_info:
+        fail("xclbin-info UUID differs from qualified xclbin")
+    cargo_log = read_text(root / "cargo.log", "cargo.log")
+    if "test result: ok." not in cargo_log:
+        fail("cargo hardware smoke did not pass")
+    return {
+        "gate": "g3",
+        "per_cu_completions": summary["per_cu_completions"],
+        "result_rows_checked": summary["result_rows_checked"],
+        "status": "pass",
+        "xclbin_uuid": image_uuid,
+    }
+
+
 def parser():
     result = argparse.ArgumentParser()
     result.add_argument("--gate", choices=("ledger", "g3", "g4", "g5"), required=True)
@@ -264,9 +377,13 @@ def parser():
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        if args.gate != "ledger":
+        root = Path(args.root)
+        if args.gate == "ledger":
+            result = validate_ledger(root)
+        elif args.gate == "g3":
+            result = validate_g3(root)
+        else:
             fail(f"gate {args.gate} is not implemented by this build")
-        result = validate_ledger(Path(args.root))
     except (ProofInvalid, OSError, TypeError, ValueError) as error:
         print(f"QWEN_IQ1S_PERSISTENT_PROOF_INVALID: {error}", file=sys.stderr)
         return 1
