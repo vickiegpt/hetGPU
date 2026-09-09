@@ -179,8 +179,16 @@ fn bench_zvbdot_selection() {
     let iterations = 100_000;
 
     let types = [
-        (SifiveElementType::Int8, SifiveElementType::Int32, "int8→i32"),
-        (SifiveElementType::Uint8, SifiveElementType::Int32, "uint8→i32"),
+        (
+            SifiveElementType::Int8,
+            SifiveElementType::Int32,
+            "int8→i32",
+        ),
+        (
+            SifiveElementType::Uint8,
+            SifiveElementType::Int32,
+            "uint8→i32",
+        ),
         (
             SifiveElementType::Bfloat16,
             SifiveElementType::Float32,
@@ -254,9 +262,13 @@ fn bench_module_generation() {
 
     // Print module sizes
     let vcix_module = emit_sifive_kernel_module("bench", 512);
-    let zvbdot_module =
-        emit_sifive_zvbdot_kernel_module("bench", 512, SifiveElementType::Int8, SifiveElementType::Int32)
-            .unwrap_or_default();
+    let zvbdot_module = emit_sifive_zvbdot_kernel_module(
+        "bench",
+        512,
+        SifiveElementType::Int8,
+        SifiveElementType::Int32,
+    )
+    .unwrap_or_default();
     println!(
         "    Module sizes: VCIX: {} bytes, Zvbdot: {} bytes",
         vcix_module.len(),

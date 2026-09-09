@@ -11,8 +11,7 @@ pub(crate) const CAP_DAX_RANGES: u64 = 1 << 0;
 pub(crate) const CAP_DIRECT_DESCRIPTOR: u64 = 1 << 6;
 pub(crate) const REQUIRED_HARDWARE_CAPABILITIES: u64 = 0x7a;
 pub(crate) const CAP_DAX_FD_BIND_REQUIRED: u64 = 1 << 7;
-pub(crate) const REQUIRED_PRE_BIND: u64 =
-    REQUIRED_HARDWARE_CAPABILITIES | CAP_DAX_FD_BIND_REQUIRED;
+pub(crate) const REQUIRED_PRE_BIND: u64 = REQUIRED_HARDWARE_CAPABILITIES | CAP_DAX_FD_BIND_REQUIRED;
 pub(crate) const REQUIRED_POST_BIND: u64 = REQUIRED_PRE_BIND | CAP_DAX_RANGES;
 pub(crate) const LANE_ANY: u32 = u32::MAX;
 /// Matches the loaded driver's `TMATMUL_V3_MAX_LANES` wave limit.
@@ -1651,8 +1650,8 @@ mod tests {
 
     #[test]
     fn devdax_binding_is_pre_bind_bind_post_bind_in_that_order() {
-        let session = V3Session::with_bound_io(FakeIoctl::pre_bind(), 17)
-            .expect("bind one devdax fd");
+        let session =
+            V3Session::with_bound_io(FakeIoctl::pre_bind(), 17).expect("bind one devdax fd");
         assert_eq!(session.caps().capabilities, REQUIRED_POST_BIND);
         assert_eq!(session.caps().dax_bytes, EXPECTED_DAX_BYTES);
         assert_eq!(session.io().calls, ["query", "bind:17", "query"]);
@@ -1687,12 +1686,19 @@ mod tests {
         cases.push(("size", wrong_size));
 
         let mut missing_post_dax = FakeIoctl::pre_bind();
-        missing_post_dax.post_bind_caps.as_mut().unwrap().capabilities &= !CAP_DAX_RANGES;
+        missing_post_dax
+            .post_bind_caps
+            .as_mut()
+            .unwrap()
+            .capabilities &= !CAP_DAX_RANGES;
         cases.push(("post-bind capabilities", missing_post_dax));
 
         let mut post_regression = FakeIoctl::pre_bind();
-        post_regression.post_bind_caps.as_mut().unwrap().capabilities &=
-            !CAP_DIRECT_DESCRIPTOR;
+        post_regression
+            .post_bind_caps
+            .as_mut()
+            .unwrap()
+            .capabilities &= !CAP_DIRECT_DESCRIPTOR;
         cases.push(("post-bind capabilities", post_regression));
 
         for (label, io) in cases {

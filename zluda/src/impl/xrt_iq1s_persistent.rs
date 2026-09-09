@@ -11,8 +11,10 @@ use super::iq1s_layer_abi::{
     IQ1S_REG_COMPLETION_BASE_LO_OFFSET, IQ1S_REG_COMPLETION_CAPACITY_OFFSET,
     IQ1S_REG_COMPLETION_CONSUMER_OFFSET, IQ1S_REG_COMPLETION_PRODUCER_OFFSET,
     IQ1S_REG_CONTROL_OFFSET, IQ1S_REG_CU_ID_OFFSET, IQ1S_REG_DOORBELL_OFFSET,
-    IQ1S_REG_FAULT_CODE_OFFSET, IQ1S_REG_MODEL_TAG_HI_OFFSET, IQ1S_REG_MODEL_TAG_LO_OFFSET,
-    IQ1S_REG_PROGRAM_BASE_HI_OFFSET, IQ1S_REG_PROGRAM_BASE_LO_OFFSET,
+    IQ1S_REG_FAULT_CODE_OFFSET, IQ1S_REG_FAULT_DETAIL_HI_OFFSET,
+    IQ1S_REG_FAULT_DETAIL_LO_OFFSET, IQ1S_REG_MODEL_TAG_HI_OFFSET,
+    IQ1S_REG_MODEL_TAG_LO_OFFSET, IQ1S_REG_PROGRAM_BASE_HI_OFFSET,
+    IQ1S_REG_PROGRAM_BASE_LO_OFFSET,
     IQ1S_REG_PROGRAM_BYTES_OFFSET, IQ1S_REG_QUIESCENT_OFFSET, IQ1S_REG_RESULT_BASE_HI_OFFSET,
     IQ1S_REG_RESULT_BASE_LO_OFFSET, IQ1S_REG_RESULT_BYTES_OFFSET,
     IQ1S_REG_SESSION_GENERATION_HI_OFFSET, IQ1S_REG_SESSION_GENERATION_LO_OFFSET,
@@ -23,8 +25,12 @@ use super::iq1s_layer_trace::{
     validate_compiled_layer_phase, CompiledLayerPhase, ExpandedIq1sCounts,
 };
 use super::iq1s_trace::QWEN_MODEL_CONTEXT_LIMIT;
-use super::iq1s_weight_arena::{ARENA_ALIGNMENT, ARENA_BANK_COUNT, ARENA_SUPERBLOCK_BYTES};
-use super::xrt_tmatmul::{Handle, XrtOps, Xuid, XRT_BO_SYNC_FROM_DEVICE, XRT_BO_SYNC_TO_DEVICE};
+#[cfg(test)]
+use super::iq1s_weight_arena::ARENA_SUPERBLOCK_BYTES;
+use super::iq1s_weight_arena::{ARENA_ALIGNMENT, ARENA_BANK_COUNT, ARENA_STAGING_CHUNK_BYTES};
+use super::xrt_tmatmul::{
+    Handle, XrtOps, Xuid, XRT_BO_FLAGS_DEVICE_ONLY, XRT_BO_SYNC_FROM_DEVICE, XRT_BO_SYNC_TO_DEVICE,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::CString;
@@ -34,14 +40,28 @@ use std::time::{Duration, Instant};
 
 const CONTROL_START: u32 = 1;
 const CONTROL_SHUTDOWN: u32 = 2;
+const CONTROL_FAULT_RESET: u32 = 4;
 const COMMAND_RING_DEFAULT_CAPACITY: u32 = 512;
 const PROGRAM_BYTES: usize = 4 * 1024 * 1024;
 const ARENA_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 const ARENA_MANIFEST_MAGIC: u32 = 0x4d41_5149;
 const ARENA_MANIFEST_RECORD_BYTES: usize = 64;
+#[cfg(not(test))]
 const ACTIVATION_BYTES: usize = 256 * 1024 * 1024;
+#[cfg(test)]
+const ACTIVATION_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(not(test))]
 const OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+#[cfg(test)]
+const OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(not(test))]
 const TOKEN_MAP_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(test)]
+const TOKEN_MAP_BYTES: usize = 2 * 1024 * 1024;
+const TICKET_SLOT_COUNT: usize = 2;
+const ACTIVATION_SLOT_BYTES: usize = ACTIVATION_BYTES / TICKET_SLOT_COUNT;
+const OUTPUT_SLOT_BYTES: usize = OUTPUT_BYTES / TICKET_SLOT_COUNT;
+const TOKEN_MAP_SLOT_BYTES: usize = TOKEN_MAP_BYTES / TICKET_SLOT_COUNT;
 const MAX_BACKOFF_US: u64 = 1_000;
 const MEMORY_GROUPS: [u32; ARENA_BANK_COUNT] = [0, 3, 2, 1];
 const IP_NAMES: [&str; ARENA_BANK_COUNT] = [
@@ -127,6 +147,7 @@ pub(crate) enum PersistentError {
         cu: usize,
         capacity: u32,
     },
+    TicketSlotsFull,
     Timeout {
         operation: &'static str,
         timeout_ms: u32,
@@ -155,6 +176,9 @@ impl fmt::Display for PersistentError {
                     formatter,
                     "IQ1_S CU {cu} command ring capacity {capacity} is full"
                 )
+            }
+            Self::TicketSlotsFull => {
+                write!(formatter, "both persistent IQ1_S ticket slots are busy")
             }
             Self::Timeout {
                 operation,
@@ -242,6 +266,68 @@ pub(crate) struct CompletedLayerPhase {
     pub(crate) timings: PersistentPhaseTimings,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    Free,
+    Prepared,
+    Published,
+    Complete,
+    Poisoned,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SubmissionTicket {
+    slot: u8,
+    slot_generation: u64,
+    transaction_id: u64,
+    command_end: [u32; ARENA_BANK_COUNT],
+    expected_completion: [u32; ARENA_BANK_COUNT],
+    deadline: Instant,
+}
+
+impl SubmissionTicket {
+    pub(crate) fn slot(&self) -> u8 {
+        self.slot
+    }
+
+    pub(crate) fn slot_generation(&self) -> u64 {
+        self.slot_generation
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TicketPoll {
+    Pending,
+    Complete,
+}
+
+#[derive(Debug)]
+struct PreparedTicket {
+    phase: CompiledLayerPhase,
+    expected: [Vec<Iq1sCommand>; ARENA_BANK_COUNT],
+    result_ranges: [Vec<(usize, usize, usize)>; ARENA_BANK_COUNT],
+    dma: PersistentDmaCounters,
+    timings: PersistentPhaseTimings,
+    phase_wall_start: Instant,
+}
+
+#[derive(Debug)]
+struct TicketSlot {
+    generation: u64,
+    state: SlotState,
+    prepared: Option<PreparedTicket>,
+}
+
+impl Default for TicketSlot {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            state: SlotState::Free,
+            prepared: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ArenaChunk {
     logical_offset: u64,
@@ -274,6 +360,7 @@ struct PersistentCu {
     activation_bo: Handle,
     output_bo: Handle,
     token_map_bo: Handle,
+    arena_staging_bo: Handle,
     command_address: u64,
     completion_address: u64,
     program_address: u64,
@@ -286,13 +373,15 @@ struct PersistentCu {
     completion_shadow: Vec<u8>,
     program_shadow: Vec<u8>,
     command_producer: u32,
+    command_published: u32,
     command_consumer: u32,
     completion_consumer: u32,
+    completion_reserved: u32,
     cached_program_id: Option<u64>,
 }
 
 impl PersistentCu {
-    fn runtime_bos(&self) -> [Handle; 7] {
+    fn runtime_bos(&self) -> [Handle; 8] {
         [
             self.command_bo,
             self.completion_bo,
@@ -301,6 +390,7 @@ impl PersistentCu {
             self.activation_bo,
             self.output_bo,
             self.token_map_bo,
+            self.arena_staging_bo,
         ]
     }
 }
@@ -318,6 +408,8 @@ pub(crate) struct PersistentIq1sPool<O: XrtOps> {
     measured: bool,
     measurement_baseline: PersistentDmaCounters,
     dma: PersistentDmaCounters,
+    ticket_slots: [TicketSlot; TICKET_SLOT_COUNT],
+    next_poll_cu: usize,
     closed: bool,
 }
 
@@ -429,6 +521,32 @@ fn validate_host_ranges(
     merge_adjacent_ranges(checked, name)
 }
 
+fn coalesce_host_ranges(
+    ranges: &[HostRange],
+    capacity: usize,
+    name: &str,
+) -> Result<Vec<HostRange>, PersistentError> {
+    let merged = validate_host_ranges(ranges, capacity, name)?;
+    let mut coalesced = Vec::with_capacity(merged.len());
+    for (offset, bytes) in merged {
+        let mut packed = vec![0u8; bytes];
+        for range in ranges {
+            let source_offset = usize::try_from(range.offset).map_err(|_| {
+                PersistentError::InvalidPhase(format!("{name} offset does not fit usize"))
+            })?;
+            if source_offset >= offset && source_offset < offset + bytes {
+                let relative = source_offset - offset;
+                packed[relative..relative + range.bytes.len()].copy_from_slice(&range.bytes);
+            }
+        }
+        coalesced.push(HostRange {
+            offset: offset as u64,
+            bytes: packed,
+        });
+    }
+    Ok(coalesced)
+}
+
 fn range_is_covered(ranges: &[(usize, usize)], offset: usize, bytes: usize) -> bool {
     offset.checked_add(bytes).is_some_and(|end| {
         ranges.iter().any(|(range_offset, range_bytes)| {
@@ -536,6 +654,7 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
         generation: u64,
         chunks: &[ArenaChunkSpec],
         mut read_chunk: impl FnMut(&ArenaChunkSpec) -> Result<Vec<u8>, String>,
+        mut chunk_resident: impl FnMut(&ArenaChunkSpec) -> Result<(), String>,
     ) -> Result<Self, PersistentError> {
         if generation == 0 {
             return Err(PersistentError::Config(
@@ -555,7 +674,7 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
             let bank = usize::from(chunk.bank);
             if bank >= ARENA_BANK_COUNT
                 || chunk.bytes == 0
-                || chunk.bytes as u64 > ARENA_SUPERBLOCK_BYTES
+                || chunk.bytes as u64 > ARENA_STAGING_CHUNK_BYTES
                 || chunk.logical_offset % ARENA_ALIGNMENT != 0
                 || chunk.sha256 == [0; 32]
                 || chunk.shards.is_empty()
@@ -701,6 +820,134 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
             }
         }
 
+        // The xclbin can remain programmed after the owning process exits, so
+        // the read-only ring counters are not necessarily zero when a new host
+        // runtime opens the CUs.  Stop every CU and rebind the writable side of
+        // each ring to the hardware's monotonic counters before installing new
+        // BO addresses.  Starting from zero against a persisted non-zero
+        // consumer makes the unsigned occupancy wrap and immediately raises
+        // IQ1S_FAULT_CODE_RING_OVERFLOW.
+        let mut command_baselines = [0u32; ARENA_BANK_COUNT];
+        let mut completion_baselines = [0u32; ARENA_BANK_COUNT];
+        for cu in 0..ARENA_BANK_COUNT {
+            checked_code(
+                "stop persistent CU before ring rebind",
+                ops.xcl_reg_write(
+                    native_device,
+                    ip_indices[cu],
+                    IQ1S_REG_CONTROL_OFFSET as u32,
+                    CONTROL_SHUTDOWN,
+                ),
+            )?;
+        }
+        let rebind_deadline =
+            Instant::now() + Duration::from_millis(u64::from(config.timeout_ms));
+        for cu in 0..ARENA_BANK_COUNT {
+            loop {
+                let mut command_consumer = 0u32;
+                let mut completion_producer = 0u32;
+                checked_code(
+                    "read persisted command consumer",
+                    ops.xcl_reg_read(
+                        native_device,
+                        ip_indices[cu],
+                        IQ1S_REG_COMMAND_CONSUMER_OFFSET as u32,
+                        &mut command_consumer,
+                    ),
+                )?;
+                checked_code(
+                    "read persisted completion producer",
+                    ops.xcl_reg_read(
+                        native_device,
+                        ip_indices[cu],
+                        IQ1S_REG_COMPLETION_PRODUCER_OFFSET as u32,
+                        &mut completion_producer,
+                    ),
+                )?;
+                checked_code(
+                    "rebind command producer",
+                    ops.xcl_reg_write(
+                        native_device,
+                        ip_indices[cu],
+                        IQ1S_REG_COMMAND_PRODUCER_OFFSET as u32,
+                        command_consumer,
+                    ),
+                )?;
+                checked_code(
+                    "rebind completion consumer",
+                    ops.xcl_reg_write(
+                        native_device,
+                        ip_indices[cu],
+                        IQ1S_REG_COMPLETION_CONSUMER_OFFSET as u32,
+                        completion_producer,
+                    ),
+                )?;
+                let mut quiescent = 0u32;
+                checked_code(
+                    "read quiescent during ring rebind",
+                    ops.xcl_reg_read(
+                        native_device,
+                        ip_indices[cu],
+                        IQ1S_REG_QUIESCENT_OFFSET as u32,
+                        &mut quiescent,
+                    ),
+                )?;
+                if quiescent == 1 {
+                    command_baselines[cu] = command_consumer;
+                    completion_baselines[cu] = completion_producer;
+                    break;
+                }
+                if Instant::now() >= rebind_deadline {
+                    return Err(PersistentError::Shutdown(format!(
+                        "CU {cu} did not become quiescent during ring rebind"
+                    )));
+                }
+                std::thread::yield_now();
+            }
+
+            let mut fault_code = 0u32;
+            checked_code(
+                "read fault before ring rebind reset",
+                ops.xcl_reg_read(
+                    native_device,
+                    ip_indices[cu],
+                    IQ1S_REG_FAULT_CODE_OFFSET as u32,
+                    &mut fault_code,
+                ),
+            )?;
+            if fault_code != IQ1S_FAULT_CODE_NONE {
+                checked_code(
+                    "reset fault after ring rebind",
+                    ops.xcl_reg_write(
+                        native_device,
+                        ip_indices[cu],
+                        IQ1S_REG_CONTROL_OFFSET as u32,
+                        CONTROL_FAULT_RESET,
+                    ),
+                )?;
+                loop {
+                    checked_code(
+                        "verify fault reset after ring rebind",
+                        ops.xcl_reg_read(
+                            native_device,
+                            ip_indices[cu],
+                            IQ1S_REG_FAULT_CODE_OFFSET as u32,
+                            &mut fault_code,
+                        ),
+                    )?;
+                    if fault_code == IQ1S_FAULT_CODE_NONE {
+                        break;
+                    }
+                    if Instant::now() >= rebind_deadline {
+                        return Err(PersistentError::Config(format!(
+                            "CU {cu} fault {fault_code} did not clear after ring rebind"
+                        )));
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
+
         let ring_bytes = usize::try_from(config.command_capacity)
             .ok()
             .and_then(|capacity| capacity.checked_mul(IQ1S_COMMAND_BYTES))
@@ -709,19 +956,27 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
         let mut dma = PersistentDmaCounters::default();
         for cu in 0..ARENA_BANK_COUNT {
             let group = MEMORY_GROUPS[cu];
-            let allocate = |bytes: usize| -> Result<Handle, PersistentError> {
-                checked_handle("bo_alloc", ops.bo_alloc(device, bytes, 0, group))
+            let allocate = |bytes: usize, flags: u64| -> Result<Handle, PersistentError> {
+                checked_handle("bo_alloc", ops.bo_alloc(device, bytes, flags, group))
             };
-            let command_bo = allocate(ring_bytes)?;
-            let completion_bo = allocate(ring_bytes)?;
-            let program_bo = allocate(PROGRAM_BYTES)?;
-            let arena_manifest_bo = allocate(ARENA_MANIFEST_BYTES)?;
-            let activation_bo = allocate(ACTIVATION_BYTES)?;
-            let output_bo = allocate(OUTPUT_BYTES)?;
-            let token_map_bo = allocate(TOKEN_MAP_BYTES)?;
+            let command_bo = allocate(ring_bytes, 0)?;
+            let completion_bo = allocate(ring_bytes, 0)?;
+            let program_bo = allocate(PROGRAM_BYTES, 0)?;
+            let arena_manifest_bo = allocate(ARENA_MANIFEST_BYTES, 0)?;
+            let activation_bo = allocate(ACTIVATION_BYTES, 0)?;
+            let output_bo = allocate(OUTPUT_BYTES, 0)?;
+            let token_map_bo = allocate(TOKEN_MAP_BYTES, 0)?;
+            let arena_staging_bytes = by_bank[cu]
+                .iter()
+                .map(|chunk| chunk.bytes)
+                .max()
+                .ok_or_else(|| {
+                    PersistentError::Config(format!("arena bank {cu} has no transfer chunks"))
+                })?;
+            let arena_staging_bo = allocate(arena_staging_bytes, 0)?;
             let mut arena = Vec::new();
             for spec in &by_bank[cu] {
-                let bo = allocate(spec.bytes)?;
+                let bo = allocate(spec.bytes, XRT_BO_FLAGS_DEVICE_ONLY)?;
                 let bytes = read_chunk(spec).map_err(PersistentError::Config)?;
                 if bytes.len() != spec.bytes
                     || <[u8; 32]>::from(Sha256::digest(&bytes)) != spec.sha256
@@ -731,10 +986,17 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                         spec.bank, spec.logical_offset
                     )));
                 }
-                checked_code("write arena chunk", ops.bo_write(bo, &bytes))?;
                 checked_code(
-                    "sync arena chunk",
-                    ops.bo_sync(bo, XRT_BO_SYNC_TO_DEVICE, bytes.len(), 0),
+                    "write arena staging chunk",
+                    ops.bo_write(arena_staging_bo, &bytes),
+                )?;
+                checked_code(
+                    "sync arena staging chunk",
+                    ops.bo_sync(arena_staging_bo, XRT_BO_SYNC_TO_DEVICE, bytes.len(), 0),
+                )?;
+                checked_code(
+                    "copy arena chunk to device-only BO",
+                    ops.bo_copy(bo, arena_staging_bo, bytes.len(), 0, 0),
                 )?;
                 dma.weight_ranges += 1;
                 dma.weight_bytes = dma.weight_bytes.saturating_add(bytes.len() as u64);
@@ -785,6 +1047,7 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                     sha256: spec.sha256,
                     shards: resident_shards,
                 });
+                chunk_resident(spec).map_err(PersistentError::Config)?;
             }
             let manifest = arena_manifest(model_tag, &arena)?;
             checked_code(
@@ -826,6 +1089,7 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                 activation_bo,
                 output_bo,
                 token_map_bo,
+                arena_staging_bo,
                 command_address,
                 completion_address,
                 program_address,
@@ -837,9 +1101,11 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                 command_shadow: vec![0; ring_bytes],
                 completion_shadow: vec![0; ring_bytes],
                 program_shadow: vec![0; PROGRAM_BYTES],
-                command_producer: 0,
-                command_consumer: 0,
-                completion_consumer: 0,
+                command_producer: command_baselines[cu],
+                command_published: command_baselines[cu],
+                command_consumer: command_baselines[cu],
+                completion_consumer: completion_baselines[cu],
+                completion_reserved: completion_baselines[cu],
                 cached_program_id: None,
             });
         }
@@ -859,6 +1125,8 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
             measured: false,
             measurement_baseline: PersistentDmaCounters::default(),
             dma,
+            ticket_slots: std::array::from_fn(|_| TicketSlot::default()),
+            next_poll_cu: 0,
             closed: false,
         };
         for cu in 0..ARENA_BANK_COUNT {
@@ -912,14 +1180,20 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                 IQ1S_REG_COMMAND_CAPACITY_OFFSET,
                 self.config.command_capacity,
             ),
-            (IQ1S_REG_COMMAND_PRODUCER_OFFSET, 0),
+            (
+                IQ1S_REG_COMMAND_PRODUCER_OFFSET,
+                self.cus[cu].command_producer,
+            ),
             (IQ1S_REG_COMPLETION_BASE_LO_OFFSET, completion_address.0),
             (IQ1S_REG_COMPLETION_BASE_HI_OFFSET, completion_address.1),
             (
                 IQ1S_REG_COMPLETION_CAPACITY_OFFSET,
                 self.config.command_capacity,
             ),
-            (IQ1S_REG_COMPLETION_CONSUMER_OFFSET, 0),
+            (
+                IQ1S_REG_COMPLETION_CONSUMER_OFFSET,
+                self.cus[cu].completion_consumer,
+            ),
             (IQ1S_REG_PROGRAM_BASE_LO_OFFSET, program_address.0),
             (IQ1S_REG_PROGRAM_BASE_HI_OFFSET, program_address.1),
             (
@@ -952,6 +1226,28 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
             self.reg_write(cu, offset, value)?;
         }
         Ok(())
+    }
+
+    fn hardware_fault_snapshot(
+        &self,
+        cu: usize,
+        fault_code: u32,
+    ) -> Result<PersistentFault, PersistentError> {
+        let detail_lo = self.reg_read(cu, IQ1S_REG_FAULT_DETAIL_LO_OFFSET)?;
+        let detail_hi = self.reg_read(cu, IQ1S_REG_FAULT_DETAIL_HI_OFFSET)?;
+        let command_producer = self.reg_read(cu, IQ1S_REG_COMMAND_PRODUCER_OFFSET)?;
+        let command_consumer = self.reg_read(cu, IQ1S_REG_COMMAND_CONSUMER_OFFSET)?;
+        let command_capacity = self.reg_read(cu, IQ1S_REG_COMMAND_CAPACITY_OFFSET)?;
+        let completion_producer = self.reg_read(cu, IQ1S_REG_COMPLETION_PRODUCER_OFFSET)?;
+        let completion_consumer = self.reg_read(cu, IQ1S_REG_COMPLETION_CONSUMER_OFFSET)?;
+        let completion_capacity = self.reg_read(cu, IQ1S_REG_COMPLETION_CAPACITY_OFFSET)?;
+        Ok(PersistentFault {
+            cu: Some(cu),
+            operation: "hardware fault register",
+            detail: format!(
+                "fault_code={fault_code} fault_detail=0x{detail_hi:08x}{detail_lo:08x} command={command_producer}/{command_consumer}/{command_capacity} completion={completion_producer}/{completion_consumer}/{completion_capacity}"
+            ),
+        })
     }
 
     pub(crate) fn measurement_begin(&mut self) -> Result<(), PersistentError> {
@@ -990,6 +1286,11 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
     fn poison<T>(&mut self, fault: PersistentFault) -> Result<T, PersistentError> {
         if self.poisoned.is_none() {
             self.poisoned = Some(fault.clone());
+        }
+        for slot in &mut self.ticket_slots {
+            if slot.state != SlotState::Free {
+                slot.state = SlotState::Poisoned;
+            }
         }
         Err(PersistentError::Fault(
             self.poisoned.clone().unwrap_or(fault),
@@ -1071,25 +1372,682 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
         phase: &CompiledLayerPhase,
         buffers: &PhaseBuffers,
     ) -> Result<CompletedLayerPhase, PersistentError> {
-        let result = self.submit_phase_inner(phase, buffers);
+        let result = (|| {
+            let ticket = self.prepare_ticket_inner(phase, buffers)?;
+            self.publish_ticket_inner(&ticket)?;
+            let mut backoff = 1u64;
+            while self.poll_ticket_inner(&ticket)? == TicketPoll::Pending {
+                std::thread::sleep(Duration::from_micros(backoff));
+                backoff = (backoff * 2).min(MAX_BACKOFF_US);
+            }
+            self.collect_ticket_inner(&ticket)
+        })();
+        self.record_ticket_error(result)
+    }
+
+    fn record_ticket_error<T>(
+        &mut self,
+        result: Result<T, PersistentError>,
+    ) -> Result<T, PersistentError> {
         if let Err(error) = &result {
             if self.poisoned.is_none()
                 && !matches!(
                     error,
-                    PersistentError::Poisoned(_) | PersistentError::Shutdown(_)
+                    PersistentError::TicketSlotsFull
+                        | PersistentError::Poisoned(_)
+                        | PersistentError::Shutdown(_)
                 )
             {
-                self.poisoned = Some(PersistentFault {
+                let fault = PersistentFault {
                     cu: None,
-                    operation: "phase submission",
+                    operation: "ticket lifecycle",
                     detail: error.to_string(),
-                });
+                };
+                self.poisoned = Some(fault);
+                for slot in &mut self.ticket_slots {
+                    if slot.state != SlotState::Free {
+                        slot.state = SlotState::Poisoned;
+                    }
+                }
             }
         }
         result
     }
 
-    fn submit_phase_inner(
+    pub(crate) fn has_free_ticket_slot(&self) -> bool {
+        self.poisoned.is_none()
+            && !self.closed
+            && self
+                .ticket_slots
+                .iter()
+                .any(|slot| slot.state == SlotState::Free)
+    }
+
+    pub(crate) fn prepare_ticket(
+        &mut self,
+        phase: &CompiledLayerPhase,
+        buffers: &PhaseBuffers,
+    ) -> Result<SubmissionTicket, PersistentError> {
+        let result = self.prepare_ticket_inner(phase, buffers);
+        self.record_ticket_error(result)
+    }
+
+    fn prepare_ticket_inner(
+        &mut self,
+        phase: &CompiledLayerPhase,
+        buffers: &PhaseBuffers,
+    ) -> Result<SubmissionTicket, PersistentError> {
+        if let Some(fault) = &self.poisoned {
+            return Err(PersistentError::Poisoned(fault.clone()));
+        }
+        if self.closed {
+            return Err(PersistentError::Shutdown("pool is closed".to_string()));
+        }
+        let slot_index = self
+            .ticket_slots
+            .iter()
+            .position(|slot| slot.state == SlotState::Free)
+            .ok_or(PersistentError::TicketSlotsFull)?;
+        validate_compiled_layer_phase(phase, QWEN_MODEL_CONTEXT_LIMIT)
+            .map_err(PersistentError::InvalidPhase)?;
+        let activations =
+            coalesce_host_ranges(&buffers.activations, ACTIVATION_SLOT_BYTES, "activation")?;
+        let token_maps =
+            coalesce_host_ranges(&buffers.token_maps, TOKEN_MAP_SLOT_BYTES, "token-map")?;
+        let activation_ranges = activations
+            .iter()
+            .map(|range| (range.offset as usize, range.bytes.len()))
+            .collect::<Vec<_>>();
+        let token_map_ranges = token_maps
+            .iter()
+            .map(|range| (range.offset as usize, range.bytes.len()))
+            .collect::<Vec<_>>();
+        let activation_manifest = merge_adjacent_ranges(
+            phase
+                .activations
+                .iter()
+                .map(|range| {
+                    let offset = usize::try_from(range.slab_offset).map_err(|_| {
+                        PersistentError::InvalidPhase(
+                            "activation manifest offset does not fit usize".to_string(),
+                        )
+                    })?;
+                    let bytes = usize::try_from(range.bytes).map_err(|_| {
+                        PersistentError::InvalidPhase(
+                            "activation manifest bytes do not fit usize".to_string(),
+                        )
+                    })?;
+                    Ok((offset, bytes))
+                })
+                .collect::<Result<Vec<_>, PersistentError>>()?,
+            "activation manifest",
+        )?;
+        let supplied_activations = activations
+            .iter()
+            .map(|range| (range.offset as usize, range.bytes.len()))
+            .collect::<Vec<_>>();
+        if supplied_activations != activation_manifest {
+            return Err(PersistentError::InvalidPhase(
+                "activation manifest differs from compiled phase".to_string(),
+            ));
+        }
+
+        let activation_slot_base = slot_index * ACTIVATION_SLOT_BYTES;
+        let output_slot_base = slot_index * OUTPUT_SLOT_BYTES;
+        let token_map_slot_base = slot_index * TOKEN_MAP_SLOT_BYTES;
+        let mut timings = PersistentPhaseTimings::default();
+        let mut ticket_dma = PersistentDmaCounters::default();
+        let mut result_ranges: [Vec<(usize, usize, usize)>; ARENA_BANK_COUNT] =
+            std::array::from_fn(|_| Vec::new());
+        let mut expected: [Vec<Iq1sCommand>; ARENA_BANK_COUNT] =
+            std::array::from_fn(|_| Vec::new());
+        let mut command_end = [0u32; ARENA_BANK_COUNT];
+        let mut expected_completion = [0u32; ARENA_BANK_COUNT];
+        let phase_wall_start = Instant::now();
+
+        for cu in 0..ARENA_BANK_COUNT {
+            let mut outputs = Vec::with_capacity(phase.commands[cu].len());
+            for command in &phase.commands[cu] {
+                let input_offset = usize::try_from(command.input_offset).map_err(|_| {
+                    PersistentError::InvalidPhase(
+                        "descriptor activation offset does not fit usize".to_string(),
+                    )
+                })?;
+                let output_offset = usize::try_from(command.output_offset).map_err(|_| {
+                    PersistentError::InvalidPhase(
+                        "descriptor output offset does not fit usize".to_string(),
+                    )
+                })?;
+                let token_offset = usize::try_from(command.token_map_offset).map_err(|_| {
+                    PersistentError::InvalidPhase(
+                        "descriptor token-map offset does not fit usize".to_string(),
+                    )
+                })?;
+                let input_bytes = command.input_bytes as usize;
+                let output_bytes = command.output_bytes as usize;
+                let token_bytes =
+                    usize::from(command.lane_count)
+                        .checked_mul(4)
+                        .ok_or_else(|| {
+                            PersistentError::InvalidPhase(
+                                "descriptor token-map byte count overflow".to_string(),
+                            )
+                        })?;
+                if input_offset
+                    .checked_add(input_bytes)
+                    .is_none_or(|end| end > ACTIVATION_SLOT_BYTES)
+                    || output_offset
+                        .checked_add(output_bytes)
+                        .is_none_or(|end| end > OUTPUT_SLOT_BYTES)
+                    || token_offset
+                        .checked_add(token_bytes)
+                        .is_none_or(|end| end > TOKEN_MAP_SLOT_BYTES)
+                    || !range_is_covered(&activation_ranges, input_offset, input_bytes)
+                    || !range_is_covered(&token_map_ranges, token_offset, token_bytes)
+                {
+                    return Err(PersistentError::InvalidPhase(format!(
+                        "CU {cu} descriptor is outside its ticket activation, output, or token-map slot"
+                    )));
+                }
+                outputs.push((output_offset, output_bytes));
+            }
+            result_ranges[cu] = merge_adjacent_ranges(outputs, "result")?
+                .into_iter()
+                .map(|(logical, bytes)| (logical, output_slot_base + logical, bytes))
+                .collect();
+
+            let hardware_consumer = self.reg_read(cu, IQ1S_REG_COMMAND_CONSUMER_OFFSET)?;
+            self.cus[cu].command_consumer = hardware_consumer;
+            let count = u32::try_from(phase.commands[cu].len()).map_err(|_| {
+                PersistentError::InvalidPhase("command count does not fit u32".to_string())
+            })?;
+            let used = self.cus[cu]
+                .command_producer
+                .wrapping_sub(self.cus[cu].command_consumer);
+            if used > self.config.command_capacity
+                || count > self.config.command_capacity.saturating_sub(used)
+            {
+                return Err(PersistentError::RingFull {
+                    cu,
+                    capacity: self.config.command_capacity,
+                });
+            }
+            let producer = self.cus[cu].command_producer;
+            for (index, source) in phase.commands[cu].iter().enumerate() {
+                let mut command = *source;
+                command.session_generation = self.generation;
+                let input_columns = match u32::from(command.role) {
+                    IQ1S_ROLE_GATE | IQ1S_ROLE_UP => 4096u64,
+                    IQ1S_ROLE_DOWN => 1024u64,
+                    _ => {
+                        return Err(PersistentError::InvalidPhase(
+                            "descriptor has an unsupported role".to_string(),
+                        ));
+                    }
+                };
+                let weight_bytes = u64::from(command.row_count)
+                    .checked_mul(input_columns / 256)
+                    .and_then(|blocks| blocks.checked_mul(50))
+                    .ok_or_else(|| {
+                        PersistentError::InvalidPhase(
+                            "descriptor weight byte count overflow".to_string(),
+                        )
+                    })?;
+                command.arena_offset =
+                    Self::resolve_arena(&self.cus[cu], source.arena_offset, weight_bytes)?;
+                command.input_offset = self.cus[cu]
+                    .activation_address
+                    .checked_add((activation_slot_base as u64) + source.input_offset)
+                    .ok_or_else(|| {
+                        PersistentError::InvalidPhase("input relocation overflow".to_string())
+                    })?;
+                command.output_offset = self.cus[cu]
+                    .output_address
+                    .checked_add((output_slot_base as u64) + source.output_offset)
+                    .ok_or_else(|| {
+                        PersistentError::InvalidPhase("output relocation overflow".to_string())
+                    })?;
+                command.token_map_offset = self.cus[cu]
+                    .token_map_address
+                    .checked_add((token_map_slot_base as u64) + source.token_map_offset)
+                    .ok_or_else(|| {
+                        PersistentError::InvalidPhase("token-map relocation overflow".to_string())
+                    })?;
+                command.crc32 = 0;
+                command.crc32 = command_crc(&command);
+                let ring_slot =
+                    producer.wrapping_add(index as u32) & (self.config.command_capacity - 1);
+                let offset = ring_slot as usize * IQ1S_COMMAND_BYTES;
+                self.cus[cu].command_shadow[offset..offset + IQ1S_COMMAND_BYTES]
+                    .copy_from_slice(struct_bytes(&command));
+                expected[cu].push(command);
+            }
+
+            let ring_publish_start = Instant::now();
+            for (offset, bytes) in Self::descriptor_ranges(
+                producer,
+                phase.commands[cu].len(),
+                self.config.command_capacity,
+            ) {
+                let end = offset.checked_add(bytes).ok_or_else(|| {
+                    PersistentError::InvalidPhase("command ring range overflow".to_string())
+                })?;
+                checked_code(
+                    "write command ring",
+                    self.ops.bo_write_range(
+                        self.cus[cu].command_bo,
+                        &self.cus[cu].command_shadow[offset..end],
+                        offset,
+                    ),
+                )?;
+                checked_code(
+                    "sync command ring",
+                    self.ops.bo_sync(
+                        self.cus[cu].command_bo,
+                        XRT_BO_SYNC_TO_DEVICE,
+                        bytes,
+                        offset,
+                    ),
+                )?;
+                self.dma.command_ranges += 1;
+                ticket_dma.command_ranges += 1;
+            }
+            timings.ring_publish_us = timings
+                .ring_publish_us
+                .saturating_add(elapsed_us(ring_publish_start));
+
+            let activation_sync_start = Instant::now();
+            for range in &activations {
+                let logical = range.offset as usize;
+                let physical = activation_slot_base + logical;
+                checked_code(
+                    "write activation range",
+                    self.ops
+                        .bo_write_range(self.cus[cu].activation_bo, &range.bytes, physical),
+                )?;
+                checked_code(
+                    "sync activation range",
+                    self.ops.bo_sync(
+                        self.cus[cu].activation_bo,
+                        XRT_BO_SYNC_TO_DEVICE,
+                        range.bytes.len(),
+                        physical,
+                    ),
+                )?;
+                self.dma.activation_ranges += 1;
+                ticket_dma.activation_ranges += 1;
+            }
+            for range in &token_maps {
+                let logical = range.offset as usize;
+                let physical = token_map_slot_base + logical;
+                checked_code(
+                    "write token-map range",
+                    self.ops
+                        .bo_write_range(self.cus[cu].token_map_bo, &range.bytes, physical),
+                )?;
+                checked_code(
+                    "sync token-map range",
+                    self.ops.bo_sync(
+                        self.cus[cu].token_map_bo,
+                        XRT_BO_SYNC_TO_DEVICE,
+                        range.bytes.len(),
+                        physical,
+                    ),
+                )?;
+            }
+            timings.activation_sync_us = timings
+                .activation_sync_us
+                .saturating_add(elapsed_us(activation_sync_start));
+            let next_producer = producer.wrapping_add(count);
+            self.cus[cu].command_producer = next_producer;
+            command_end[cu] = next_producer;
+            let next_completion = self.cus[cu].completion_reserved.wrapping_add(count);
+            self.cus[cu].completion_reserved = next_completion;
+            expected_completion[cu] = next_completion;
+        }
+
+        let slot_generation = self.ticket_slots[slot_index].generation.wrapping_add(1);
+        if slot_generation == 0 {
+            return Err(PersistentError::InvalidPhase(
+                "ticket slot generation overflow".to_string(),
+            ));
+        }
+        let ticket = SubmissionTicket {
+            slot: slot_index as u8,
+            slot_generation,
+            transaction_id: phase.transaction_id,
+            command_end,
+            expected_completion,
+            deadline: Instant::now() + Duration::from_millis(u64::from(self.config.timeout_ms)),
+        };
+        self.ticket_slots[slot_index] = TicketSlot {
+            generation: slot_generation,
+            state: SlotState::Prepared,
+            prepared: Some(PreparedTicket {
+                phase: phase.clone(),
+                expected,
+                result_ranges,
+                dma: ticket_dma,
+                timings,
+                phase_wall_start,
+            }),
+        };
+        Ok(ticket)
+    }
+
+    fn ticket_index(
+        &self,
+        ticket: &SubmissionTicket,
+        allowed: &[SlotState],
+    ) -> Result<usize, PersistentError> {
+        let index = usize::from(ticket.slot);
+        let Some(slot) = self.ticket_slots.get(index) else {
+            return Err(PersistentError::InvalidPhase(
+                "ticket slot is invalid".to_string(),
+            ));
+        };
+        if slot.generation != ticket.slot_generation
+            || slot
+                .prepared
+                .as_ref()
+                .is_none_or(|prepared| prepared.phase.transaction_id != ticket.transaction_id)
+        {
+            return Err(PersistentError::InvalidPhase(
+                "ticket slot generation or transaction is stale".to_string(),
+            ));
+        }
+        if !allowed.contains(&slot.state) {
+            return Err(PersistentError::InvalidPhase(format!(
+                "ticket slot is in state {:?}",
+                slot.state
+            )));
+        }
+        Ok(index)
+    }
+
+    pub(crate) fn publish_ticket(
+        &mut self,
+        ticket: &SubmissionTicket,
+    ) -> Result<(), PersistentError> {
+        let result = self.publish_ticket_inner(ticket);
+        self.record_ticket_error(result)
+    }
+
+    fn publish_ticket_inner(&mut self, ticket: &SubmissionTicket) -> Result<(), PersistentError> {
+        if let Some(fault) = &self.poisoned {
+            return Err(PersistentError::Poisoned(fault.clone()));
+        }
+        let index = self.ticket_index(ticket, &[SlotState::Prepared])?;
+        let phase = self.ticket_slots[index]
+            .prepared
+            .as_ref()
+            .expect("validated ticket has prepared data")
+            .phase
+            .clone();
+        for cu in 0..ARENA_BANK_COUNT {
+            let count = phase.commands[cu].len() as u32;
+            let start = ticket.command_end[cu].wrapping_sub(count);
+            if self.cus[cu].command_published != start {
+                return Err(PersistentError::InvalidPhase(
+                    "tickets must be published in reservation order".to_string(),
+                ));
+            }
+            self.write_program_if_needed(cu, &phase)?;
+        }
+        let publish_start = Instant::now();
+        for cu in 0..ARENA_BANK_COUNT {
+            self.reg_write(
+                cu,
+                IQ1S_REG_COMMAND_PRODUCER_OFFSET,
+                ticket.command_end[cu],
+            )?;
+            self.reg_write(cu, IQ1S_REG_DOORBELL_OFFSET, 1)?;
+            self.cus[cu].command_published = ticket.command_end[cu];
+        }
+        let elapsed = elapsed_us(publish_start);
+        if let Some(prepared) = self.ticket_slots[index].prepared.as_mut() {
+            prepared.timings.doorbell_us = prepared.timings.doorbell_us.saturating_add(elapsed);
+            for cu in 0..ARENA_BANK_COUNT {
+                if self.cus[cu].cached_program_id == Some(phase.commands[cu][0].program_id) {
+                    // Global counters remain authoritative; this ticket owns no weight DMA.
+                }
+            }
+        }
+        self.ticket_slots[index].state = SlotState::Published;
+        Ok(())
+    }
+
+    pub(crate) fn poll_ticket(
+        &mut self,
+        ticket: &SubmissionTicket,
+    ) -> Result<TicketPoll, PersistentError> {
+        let result = self.poll_ticket_inner(ticket);
+        self.record_ticket_error(result)
+    }
+
+    fn poll_ticket_inner(
+        &mut self,
+        ticket: &SubmissionTicket,
+    ) -> Result<TicketPoll, PersistentError> {
+        if let Some(fault) = &self.poisoned {
+            return Err(PersistentError::Poisoned(fault.clone()));
+        }
+        let index = self.ticket_index(ticket, &[SlotState::Published, SlotState::Complete])?;
+        if self.ticket_slots[index].state == SlotState::Complete {
+            return Ok(TicketPoll::Complete);
+        }
+        let poll_start = Instant::now();
+        let start_cu = self.next_poll_cu;
+        let mut all_complete = true;
+        for step in 0..ARENA_BANK_COUNT {
+            let cu = (start_cu + step) % ARENA_BANK_COUNT;
+            let fault_code = self.reg_read(cu, IQ1S_REG_FAULT_CODE_OFFSET)?;
+            if fault_code != IQ1S_FAULT_CODE_NONE {
+                let fault = self.hardware_fault_snapshot(cu, fault_code)?;
+                return self.poison(fault);
+            }
+            let producer = self.reg_read(cu, IQ1S_REG_COMPLETION_PRODUCER_OFFSET)?;
+            if producer.wrapping_sub(ticket.expected_completion[cu]) >= (1u32 << 31) {
+                all_complete = false;
+            }
+        }
+        self.next_poll_cu = (start_cu + 1) % ARENA_BANK_COUNT;
+        if let Some(prepared) = self.ticket_slots[index].prepared.as_mut() {
+            prepared.timings.device_wait_us = prepared
+                .timings
+                .device_wait_us
+                .saturating_add(elapsed_us(poll_start));
+        }
+        if all_complete {
+            self.ticket_slots[index].state = SlotState::Complete;
+            return Ok(TicketPoll::Complete);
+        }
+        if Instant::now() >= ticket.deadline {
+            return self.poison(PersistentFault {
+                cu: None,
+                operation: "completion poll",
+                detail: format!("timeout after {} ms", self.config.timeout_ms),
+            });
+        }
+        Ok(TicketPoll::Pending)
+    }
+
+    pub(crate) fn collect_ticket(
+        &mut self,
+        ticket: &SubmissionTicket,
+    ) -> Result<CompletedLayerPhase, PersistentError> {
+        let result = self.collect_ticket_inner(ticket);
+        self.record_ticket_error(result)
+    }
+
+    fn collect_ticket_inner(
+        &mut self,
+        ticket: &SubmissionTicket,
+    ) -> Result<CompletedLayerPhase, PersistentError> {
+        if let Some(fault) = &self.poisoned {
+            return Err(PersistentError::Poisoned(fault.clone()));
+        }
+        let index = self.ticket_index(ticket, &[SlotState::Complete])?;
+        let mut prepared = self.ticket_slots[index]
+            .prepared
+            .take()
+            .expect("validated ticket has prepared data");
+        let mut completed: [Vec<Iq1sCompletion>; ARENA_BANK_COUNT] =
+            std::array::from_fn(|_| Vec::new());
+        let mut results: [Vec<HostRange>; ARENA_BANK_COUNT] = std::array::from_fn(|_| Vec::new());
+
+        for cu in 0..ARENA_BANK_COUNT {
+            let count = prepared.expected[cu].len();
+            let start_counter = ticket.expected_completion[cu].wrapping_sub(count as u32);
+            if self.cus[cu].completion_consumer != start_counter {
+                self.ticket_slots[index].prepared = Some(prepared);
+                return Err(PersistentError::InvalidPhase(
+                    "completed tickets must be collected in reservation order".to_string(),
+                ));
+            }
+            let completion_sync_start = Instant::now();
+            for (offset, bytes) in
+                Self::descriptor_ranges(start_counter, count, self.config.command_capacity)
+            {
+                checked_code(
+                    "sync completion ring",
+                    self.ops.bo_sync(
+                        self.cus[cu].completion_bo,
+                        XRT_BO_SYNC_FROM_DEVICE,
+                        bytes,
+                        offset,
+                    ),
+                )?;
+                let end = offset.checked_add(bytes).ok_or_else(|| {
+                    PersistentError::InvalidPhase("completion ring range overflow".to_string())
+                })?;
+                checked_code(
+                    "read completion ring",
+                    self.ops.bo_read_range(
+                        self.cus[cu].completion_bo,
+                        &mut self.cus[cu].completion_shadow[offset..end],
+                        offset,
+                    ),
+                )?;
+            }
+            prepared.timings.completion_sync_us = prepared
+                .timings
+                .completion_sync_us
+                .saturating_add(elapsed_us(completion_sync_start));
+            for (command_index, command) in prepared.expected[cu].iter().enumerate() {
+                let counter = start_counter.wrapping_add(command_index as u32);
+                let command_counter = ticket.command_end[cu]
+                    .wrapping_sub(count as u32)
+                    .wrapping_add(command_index as u32);
+                let ring_slot = counter & (self.config.command_capacity - 1);
+                let offset = ring_slot as usize * IQ1S_COMPLETION_BYTES;
+                let completion = struct_from_bytes::<Iq1sCompletion>(
+                    &self.cus[cu].completion_shadow[offset..offset + IQ1S_COMPLETION_BYTES],
+                )?;
+                let mismatch = completion.magic != IQ1S_COMPLETION_MAGIC
+                    || completion.abi_version != IQ1S_ABI_VERSION as u16
+                    || completion.completion_bytes != IQ1S_COMPLETION_BYTES as u16
+                    || completion.status != IQ1S_COMPLETION_STATUS_OK
+                    || completion.fault_code != IQ1S_FAULT_CODE_NONE
+                    || completion.session_generation != self.generation
+                    || completion.transaction_id != command.transaction_id
+                    || completion.program_id != command.program_id
+                    || completion.trace_id != command.trace_id
+                    || completion.layer_id != command.layer_id
+                    || completion.phase != command.phase
+                    || usize::from(completion.cu_id) != cu
+                    || completion.expert_id != command.expert_id
+                    || completion.lane_mask != command.lane_mask
+                    || completion.rows_completed != command.row_count as u16
+                    || completion.descriptor_crc32 != command.crc32
+                    || completion.command_index != command_counter
+                    || completion.result_fence == 0;
+                if mismatch {
+                    self.ticket_slots[index].prepared = Some(prepared);
+                    return self.poison(PersistentFault {
+                        cu: Some(cu),
+                        operation: "completion validation",
+                        detail: format!("completion {counter} does not match its descriptor"),
+                    });
+                }
+                completed[cu].push(completion);
+            }
+            self.cus[cu].completion_consumer = ticket.expected_completion[cu];
+            self.cus[cu].command_consumer = ticket.command_end[cu];
+            self.reg_write(
+                cu,
+                IQ1S_REG_COMPLETION_CONSUMER_OFFSET,
+                ticket.expected_completion[cu],
+            )?;
+            let result_copy_start = Instant::now();
+            for (logical_offset, physical_offset, bytes) in &prepared.result_ranges[cu] {
+                checked_code(
+                    "sync result range",
+                    self.ops.bo_sync(
+                        self.cus[cu].output_bo,
+                        XRT_BO_SYNC_FROM_DEVICE,
+                        *bytes,
+                        *physical_offset,
+                    ),
+                )?;
+                let mut result = vec![0u8; *bytes];
+                checked_code(
+                    "read result range",
+                    self.ops
+                        .bo_read_range(self.cus[cu].output_bo, &mut result, *physical_offset),
+                )?;
+                results[cu].push(HostRange {
+                    offset: *logical_offset as u64,
+                    bytes: result,
+                });
+                self.dma.result_ranges += 1;
+                prepared.dma.result_ranges += 1;
+            }
+            prepared.timings.result_copy_us = prepared
+                .timings
+                .result_copy_us
+                .saturating_add(elapsed_us(result_copy_start));
+        }
+        if self.measured
+            && (self.dma.weight_ranges != self.measurement_baseline.weight_ranges
+                || self.dma.weight_bytes != self.measurement_baseline.weight_bytes)
+        {
+            self.ticket_slots[index].prepared = Some(prepared);
+            return self.poison(PersistentFault {
+                cu: None,
+                operation: "weight residency",
+                detail: "weight DMA occurred during submit".to_string(),
+            });
+        }
+        let expanded = prepared.phase.programs.iter().fold(
+            ExpandedIq1sCounts::default(),
+            |mut total, program| {
+                total.blocks = total.blocks.saturating_add(program.expanded.blocks);
+                total.grid_passes = total
+                    .grid_passes
+                    .saturating_add(program.expanded.grid_passes);
+                total.delta_passes = total
+                    .delta_passes
+                    .saturating_add(program.expanded.delta_passes);
+                total
+            },
+        );
+        prepared.timings.phase_wall_us = elapsed_us(prepared.phase_wall_start);
+        let completed_phase = CompletedLayerPhase {
+            transaction_id: prepared.phase.transaction_id,
+            semantic_sha256: prepared.phase.semantic_sha256,
+            completions: completed,
+            results,
+            expanded,
+            dma: prepared.dma,
+            timings: prepared.timings,
+        };
+        self.ticket_slots[index].state = SlotState::Free;
+        Ok(completed_phase)
+    }
+
+    #[allow(dead_code)]
+    fn legacy_submit_phase_inner(
         &mut self,
         phase: &CompiledLayerPhase,
         buffers: &PhaseBuffers,
@@ -1386,11 +2344,8 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
             let observed_producer = loop {
                 let fault_code = self.reg_read(cu, IQ1S_REG_FAULT_CODE_OFFSET)?;
                 if fault_code != IQ1S_FAULT_CODE_NONE {
-                    return self.poison(PersistentFault {
-                        cu: Some(cu),
-                        operation: "hardware fault register",
-                        detail: format!("fault_code={fault_code}"),
-                    });
+                    let fault = self.hardware_fault_snapshot(cu, fault_code)?;
+                    return self.poison(fault);
                 }
                 let producer = self.reg_read(cu, IQ1S_REG_COMPLETION_PRODUCER_OFFSET)?;
                 if producer.wrapping_sub(expected_end) < (1u32 << 31) {
@@ -1450,6 +2405,10 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                 .saturating_add(elapsed_us(completion_sync_start));
             for (index, command) in expected[cu].iter().enumerate() {
                 let counter = self.cus[cu].completion_consumer.wrapping_add(index as u32);
+                let command_counter = self.cus[cu]
+                    .command_producer
+                    .wrapping_sub(expected[cu].len() as u32)
+                    .wrapping_add(index as u32);
                 let slot = counter & (self.config.command_capacity - 1);
                 let offset = slot as usize * IQ1S_COMPLETION_BYTES;
                 let completion = struct_from_bytes::<Iq1sCompletion>(
@@ -1471,7 +2430,7 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                     || completion.lane_mask != command.lane_mask
                     || completion.rows_completed != command.row_count as u16
                     || completion.descriptor_crc32 != command.crc32
-                    || completion.command_index != counter
+                    || completion.command_index != command_counter
                     || completion.result_fence == 0;
                 if mismatch {
                     return self.poison(PersistentFault {
@@ -1608,7 +2567,7 @@ mod tests {
     use crate::r#impl::iq1s_weight_registry::{Iq1sExpertRole, Iq1sTensorIdentity};
     use crate::r#impl::xrt_tmatmul::RealXrt;
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::ffi::CStr;
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -1618,6 +2577,79 @@ mod tests {
     const DEVICE: usize = 1;
     const NATIVE_DEVICE: usize = 2;
     const FIRST_BO: usize = 100;
+    const MAX_SMOKE_MISMATCH_SAMPLES: usize = 16;
+
+    #[derive(Debug, serde::Serialize)]
+    struct SmokeResultMismatch {
+        cu: usize,
+        generation: usize,
+        row: usize,
+        expected_bits: u32,
+        actual_bits: u32,
+    }
+
+    #[derive(Debug)]
+    struct SmokeResultComparison {
+        rows_checked: u64,
+        mismatch_count: u64,
+        actual_bits_histogram: BTreeMap<u32, u64>,
+        first_mismatches: Vec<SmokeResultMismatch>,
+    }
+
+    fn compare_smoke_result_bytes(
+        cu: usize,
+        generation: usize,
+        expected_bits: u32,
+        bytes: &[u8],
+    ) -> SmokeResultComparison {
+        assert_eq!(bytes.len() % 4, 0, "smoke result must contain whole f32 rows");
+        let mut comparison = SmokeResultComparison {
+            rows_checked: 0,
+            mismatch_count: 0,
+            actual_bits_histogram: BTreeMap::new(),
+            first_mismatches: Vec::new(),
+        };
+        for (row, actual) in bytes.chunks_exact(4).enumerate() {
+            let actual_bits = u32::from_le_bytes(actual.try_into().expect("four-byte f32"));
+            comparison.rows_checked += 1;
+            *comparison
+                .actual_bits_histogram
+                .entry(actual_bits)
+                .or_default() += 1;
+            if actual_bits != expected_bits {
+                comparison.mismatch_count += 1;
+                if comparison.first_mismatches.len() < MAX_SMOKE_MISMATCH_SAMPLES {
+                    comparison.first_mismatches.push(SmokeResultMismatch {
+                        cu,
+                        generation,
+                        row,
+                        expected_bits,
+                        actual_bits,
+                    });
+                }
+            }
+        }
+        comparison
+    }
+
+    fn classify_smoke_signature(
+        rows_checked: u64,
+        mismatch_count: u64,
+        actual_bits_histogram: &BTreeMap<u32, u64>,
+        zero_grid_expected_bits: u32,
+    ) -> &'static str {
+        if mismatch_count == 0 {
+            "matches_reference"
+        } else if rows_checked != 0
+            && mismatch_count == rows_checked
+            && actual_bits_histogram.len() == 1
+            && actual_bits_histogram.get(&zero_grid_expected_bits) == Some(&rows_checked)
+        {
+            "matches_zero_grid_oracle"
+        } else {
+            "unclassified_numerical_mismatch"
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Event {
@@ -1628,7 +2660,15 @@ mod tests {
         BoAlloc {
             bo: usize,
             bytes: usize,
+            flags: u64,
             group: u32,
+        },
+        BoCopy {
+            destination: usize,
+            source: usize,
+            bytes: usize,
+            destination_offset: usize,
+            source_offset: usize,
         },
         BoSync {
             bo: usize,
@@ -1729,12 +2769,66 @@ mod tests {
             self.state.borrow_mut().fail_read_bo = Some(bo as usize);
         }
 
+        fn set_hold_completions(&self, hold: bool) {
+            self.state.borrow_mut().hold_completions = hold;
+        }
+
+        fn release_completions(&self) {
+            let mut state = self.state.borrow_mut();
+            state.hold_completions = false;
+            for cu in 0..ARENA_BANK_COUNT as u32 {
+                Self::ring_doorbell(&mut state, cu);
+            }
+        }
+
+        fn set_fault(&self, cu: usize, fault_code: u32) {
+            let mut state = self.state.borrow_mut();
+            state
+                .registers
+                .insert((cu as u32, IQ1S_REG_FAULT_CODE_OFFSET as u32), fault_code);
+            state.registers.insert(
+                (cu as u32, IQ1S_REG_FAULT_DETAIL_LO_OFFSET as u32),
+                0x5566_7788,
+            );
+            state.registers.insert(
+                (cu as u32, IQ1S_REG_FAULT_DETAIL_HI_OFFSET as u32),
+                0x1122_3344,
+            );
+        }
+
+        fn set_persisted_ring_state(
+            &self,
+            cu: usize,
+            command_consumer: u32,
+            completion_producer: u32,
+            fault_code: u32,
+        ) {
+            let mut state = self.state.borrow_mut();
+            state.registers.insert(
+                (cu as u32, IQ1S_REG_COMMAND_CONSUMER_OFFSET as u32),
+                command_consumer,
+            );
+            state.registers.insert(
+                (cu as u32, IQ1S_REG_COMPLETION_PRODUCER_OFFSET as u32),
+                completion_producer,
+            );
+            state.registers.insert(
+                (cu as u32, IQ1S_REG_FAULT_CODE_OFFSET as u32),
+                fault_code,
+            );
+            state
+                .doorbell_consumer
+                .insert(cu as u32, command_consumer);
+        }
+
         fn ring_doorbell(state: &mut FakeState, cu: u32) {
             if state.hold_completions {
                 return;
             }
             let command_producer = state.registers[&(cu, IQ1S_REG_COMMAND_PRODUCER_OFFSET as u32)];
             let start = *state.doorbell_consumer.get(&cu).unwrap_or(&0);
+            let completion_start =
+                state.registers[&(cu, IQ1S_REG_COMPLETION_PRODUCER_OFFSET as u32)];
             let capacity = state.registers[&(cu, IQ1S_REG_COMMAND_CAPACITY_OFFSET as u32)];
             let command_address =
                 u64::from(state.registers[&(cu, IQ1S_REG_COMMAND_BASE_LO_OFFSET as u32)])
@@ -1768,11 +2862,11 @@ mod tests {
                 .unwrap()
                 .0;
             let commands = state.memories[&command_bo].clone();
-            for counter in start..command_producer {
-                let slot = counter & (capacity - 1);
-                let offset = slot as usize * IQ1S_COMMAND_BYTES;
+            for (completion_index, counter) in (start..command_producer).enumerate() {
+                let command_slot = counter & (capacity - 1);
+                let command_offset = command_slot as usize * IQ1S_COMMAND_BYTES;
                 let command = struct_from_bytes::<Iq1sCommand>(
-                    &commands[offset..offset + IQ1S_COMMAND_BYTES],
+                    &commands[command_offset..command_offset + IQ1S_COMMAND_BYTES],
                 )
                 .unwrap();
                 let output_offset =
@@ -1805,7 +2899,9 @@ mod tests {
                     iq1s_blocks: 1,
                     grid_passes: 8,
                     delta_passes: 8,
-                    result_fence: counter as u64 + 1,
+                    result_fence: completion_start
+                        .wrapping_add(completion_index as u32) as u64
+                        + 1,
                     fault_detail: 0,
                 };
                 if let Some(mutation) = state.completion_mutation.take() {
@@ -1818,8 +2914,12 @@ mod tests {
                         CompletionMutation::Crc => completion.descriptor_crc32 ^= 1,
                     }
                 }
+                let completion_counter =
+                    completion_start.wrapping_add(completion_index as u32);
+                let completion_slot = completion_counter & (capacity - 1);
+                let completion_offset = completion_slot as usize * IQ1S_COMPLETION_BYTES;
                 state.memories.get_mut(&completion_bo).unwrap()
-                    [offset..offset + IQ1S_COMPLETION_BYTES]
+                    [completion_offset..completion_offset + IQ1S_COMPLETION_BYTES]
                     .copy_from_slice(struct_bytes(&completion));
             }
             state.doorbell_consumer.insert(cu, command_producer);
@@ -1829,7 +2929,7 @@ mod tests {
             );
             state.registers.insert(
                 (cu, IQ1S_REG_COMPLETION_PRODUCER_OFFSET as u32),
-                command_producer,
+                completion_start.wrapping_add(command_producer.wrapping_sub(start)),
             );
         }
     }
@@ -1913,12 +3013,17 @@ mod tests {
                 value,
             });
             state.registers.insert((index, offset), value);
+            if offset == IQ1S_REG_CONTROL_OFFSET as u32 && value == 4 {
+                state
+                    .registers
+                    .insert((index, IQ1S_REG_FAULT_CODE_OFFSET as u32), 0);
+            }
             if offset == IQ1S_REG_DOORBELL_OFFSET as u32 {
                 Self::ring_doorbell(&mut state, index);
             }
             0
         }
-        fn bo_alloc(&self, _: Handle, size: usize, _: u64, group: u32) -> Handle {
+        fn bo_alloc(&self, _: Handle, size: usize, flags: u64, group: u32) -> Handle {
             let mut state = self.state.borrow_mut();
             let bo = state.next_bo;
             state.next_bo += 1;
@@ -1929,6 +3034,7 @@ mod tests {
             state.events.push(Event::BoAlloc {
                 bo,
                 bytes: size,
+                flags,
                 group,
             });
             bo as Handle
@@ -1974,6 +3080,46 @@ mod tests {
                 bo: bo as usize,
                 offset,
                 bytes: bytes.len(),
+            });
+            0
+        }
+        fn bo_copy(
+            &self,
+            destination: Handle,
+            source: Handle,
+            size: usize,
+            destination_offset: usize,
+            source_offset: usize,
+        ) -> i32 {
+            let mut state = self.state.borrow_mut();
+            let source_bytes = {
+                let Some(source_memory) = state.memories.get(&(source as usize)) else {
+                    return -1;
+                };
+                let Some(source_end) = source_offset.checked_add(size) else {
+                    return -1;
+                };
+                if source_end > source_memory.len() {
+                    return -1;
+                }
+                source_memory[source_offset..source_end].to_vec()
+            };
+            let Some(destination_memory) = state.memories.get_mut(&(destination as usize)) else {
+                return -1;
+            };
+            let Some(destination_end) = destination_offset.checked_add(size) else {
+                return -1;
+            };
+            if destination_end > destination_memory.len() {
+                return -1;
+            }
+            destination_memory[destination_offset..destination_end].copy_from_slice(&source_bytes);
+            state.events.push(Event::BoCopy {
+                destination: destination as usize,
+                source: source as usize,
+                bytes: size,
+                destination_offset,
+                source_offset,
             });
             0
         }
@@ -2049,6 +3195,7 @@ mod tests {
                     slab_offset: 0x2000,
                     bytes: if distinct { 32768 } else { 16384 },
                     stream: 1,
+                    source_identity_sha256: [0x51; 32],
                 }],
             },
             "compiler",
@@ -2087,7 +3234,7 @@ mod tests {
         }
     }
 
-    fn pool(capacity: u32) -> PersistentIq1sPool<FakeXrt> {
+    fn pool_with_ops(capacity: u32, ops: FakeXrt) -> PersistentIq1sPool<FakeXrt> {
         let bytes = vec![0x5a; 2 * 1024 * 1024];
         let hash: [u8; 32] = Sha256::digest(&bytes).into();
         let shard_hash: [u8; 32] = Sha256::digest(vec![0x5a; 204_800]).into();
@@ -2113,19 +3260,186 @@ mod tests {
             })
             .collect::<Vec<_>>();
         PersistentIq1sPool::open(
-            FakeXrt::new(),
+            ops,
             PersistentIq1sConfig::checked(
                 PathBuf::from("/tmp/qwen.xclbin"),
                 0,
                 Some(capacity),
-                100,
+                5_000,
             )
             .unwrap(),
             9,
             &chunks,
             |_| Ok(bytes.clone()),
+            |_| Ok(()),
         )
         .unwrap()
+    }
+
+    fn pool(capacity: u32) -> PersistentIq1sPool<FakeXrt> {
+        pool_with_ops(capacity, FakeXrt::new())
+    }
+
+    #[test]
+    fn xrt_iq1s_persistent_two_ticket_slots_overlap_and_reject_a_third() {
+        let mut pool = pool(8);
+        pool.ops.set_hold_completions(true);
+        let phase_a = fixture_phase(17, false);
+        let phase_b = fixture_phase(18, false);
+        let phase_c = fixture_phase(19, false);
+        let buffers = fixture_buffers(false);
+
+        let first = pool.prepare_ticket(&phase_a, &buffers).unwrap();
+        let second = pool.prepare_ticket(&phase_b, &buffers).unwrap();
+        assert_ne!(first.slot(), second.slot());
+        assert!(matches!(
+            pool.prepare_ticket(&phase_c, &buffers),
+            Err(PersistentError::TicketSlotsFull)
+        ));
+
+        pool.publish_ticket(&first).unwrap();
+        pool.publish_ticket(&second).unwrap();
+        assert_eq!(pool.poll_ticket(&first).unwrap(), TicketPoll::Pending);
+        pool.ops.release_completions();
+        assert_eq!(pool.poll_ticket(&second).unwrap(), TicketPoll::Complete);
+        assert_eq!(pool.poll_ticket(&first).unwrap(), TicketPoll::Complete);
+        assert_eq!(pool.collect_ticket(&first).unwrap().transaction_id, 17);
+        assert_eq!(pool.collect_ticket(&second).unwrap().transaction_id, 18);
+    }
+
+    #[test]
+    fn xrt_iq1s_persistent_ticket_slots_use_disjoint_physical_slabs() {
+        let mut pool = pool(8);
+        let phase_a = fixture_phase(20, false);
+        let phase_b = fixture_phase(21, false);
+        let buffers = fixture_buffers(false);
+        let activation_bo = pool.cus[0].activation_bo as usize;
+
+        let first = pool.prepare_ticket(&phase_a, &buffers).unwrap();
+        let second = pool.prepare_ticket(&phase_b, &buffers).unwrap();
+        assert_eq!(first.slot(), 0);
+        assert_eq!(second.slot(), 1);
+        let offsets = pool
+            .ops
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::BoWriteRange { bo, offset, .. } if bo == activation_bo => Some(offset),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(offsets.contains(&0x2000));
+        assert!(offsets.contains(&(ACTIVATION_SLOT_BYTES + 0x2000)));
+    }
+
+    #[test]
+    fn xrt_iq1s_persistent_poll_rotates_across_all_four_cus() {
+        let mut pool = pool(8);
+        pool.ops.set_hold_completions(true);
+        let ticket = pool
+            .prepare_ticket(&fixture_phase(22, false), &fixture_buffers(false))
+            .unwrap();
+        pool.publish_ticket(&ticket).unwrap();
+        let baseline = pool.ops.events().len();
+        assert_eq!(pool.poll_ticket(&ticket).unwrap(), TicketPoll::Pending);
+        assert_eq!(pool.poll_ticket(&ticket).unwrap(), TicketPoll::Pending);
+        let order = pool.ops.events()[baseline..]
+            .iter()
+            .filter_map(|event| match event {
+                Event::RegisterRead { cu, offset }
+                    if *offset == IQ1S_REG_COMPLETION_PRODUCER_OFFSET as u32 =>
+                {
+                    Some(*cu)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![0, 1, 2, 3, 1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn xrt_iq1s_persistent_stale_ticket_generation_poisons_live_slot() {
+        let mut pool = pool(8);
+        let first = pool
+            .prepare_ticket(&fixture_phase(23, false), &fixture_buffers(false))
+            .unwrap();
+        pool.publish_ticket(&first).unwrap();
+        assert_eq!(pool.poll_ticket(&first).unwrap(), TicketPoll::Complete);
+        pool.collect_ticket(&first).unwrap();
+        let second = pool
+            .prepare_ticket(&fixture_phase(24, false), &fixture_buffers(false))
+            .unwrap();
+        assert_eq!(first.slot(), second.slot());
+        assert!(matches!(
+            pool.poll_ticket(&first),
+            Err(PersistentError::InvalidPhase(_))
+        ));
+        assert!(matches!(
+            pool.publish_ticket(&second),
+            Err(PersistentError::Poisoned(_))
+        ));
+    }
+
+    #[test]
+    fn xrt_iq1s_persistent_fault_poisons_both_ticket_slots() {
+        let mut pool = pool(8);
+        pool.ops.set_hold_completions(true);
+        let first = pool
+            .prepare_ticket(&fixture_phase(25, false), &fixture_buffers(false))
+            .unwrap();
+        let second = pool
+            .prepare_ticket(&fixture_phase(26, false), &fixture_buffers(false))
+            .unwrap();
+        pool.publish_ticket(&first).unwrap();
+        pool.publish_ticket(&second).unwrap();
+        pool.ops.set_fault(2, 7);
+        let error = pool.poll_ticket(&first).unwrap_err().to_string();
+        assert!(error.contains("fault_code=7"), "{error}");
+        assert!(
+            error.contains("fault_detail=0x1122334455667788"),
+            "{error}"
+        );
+        assert!(error.contains("command="), "{error}");
+        assert!(error.contains("completion="), "{error}");
+        assert!(matches!(
+            pool.poll_ticket(&second),
+            Err(PersistentError::Poisoned(_))
+        ));
+    }
+
+    #[test]
+    fn xrt_iq1s_persistent_merges_adjacent_activation_dma_ranges() {
+        let mut pool = pool(8);
+        let phase = fixture_phase(27, false);
+        let mut buffers = fixture_buffers(false);
+        let bytes = buffers.activations.remove(0).bytes;
+        buffers.activations = vec![
+            HostRange {
+                offset: 0x2000,
+                bytes: bytes[..8192].to_vec(),
+            },
+            HostRange {
+                offset: 0x4000,
+                bytes: bytes[8192..].to_vec(),
+            },
+        ];
+        let activation_bos = pool
+            .cus
+            .iter()
+            .map(|cu| cu.activation_bo as usize)
+            .collect::<Vec<_>>();
+        pool.prepare_ticket(&phase, &buffers).unwrap();
+        let syncs = pool
+            .ops
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(event,
+                Event::BoSync { bo, direction: XRT_BO_SYNC_TO_DEVICE, offset: 0x2000, bytes: 16384 }
+                    if activation_bos.contains(bo))
+            })
+            .count();
+        assert_eq!(syncs, ARENA_BANK_COUNT);
     }
 
     #[test]
@@ -2229,6 +3543,108 @@ mod tests {
                 _ => None,
             })
             .all(|bytes| bytes <= ARENA_SUPERBLOCK_BYTES as usize));
+        pool.shutdown().unwrap();
+    }
+
+    #[test]
+    fn xrt_iq1s_persistent_rebinds_persisted_ring_counters_before_start() {
+        let ops = FakeXrt::new();
+        for cu in 0..ARENA_BANK_COUNT {
+            ops.set_persisted_ring_state(cu, 37 + cu as u32, 29 + cu as u32, 11);
+        }
+
+        let mut pool = pool_with_ops(8, ops);
+        let events = pool.ops.events();
+        for cu in 0..ARENA_BANK_COUNT {
+            let command_baseline = 37 + cu as u32;
+            let completion_baseline = 29 + cu as u32;
+            assert_eq!(pool.cus[cu].command_producer, command_baseline);
+            assert_eq!(pool.cus[cu].command_published, command_baseline);
+            assert_eq!(pool.cus[cu].command_consumer, command_baseline);
+            assert_eq!(pool.cus[cu].completion_consumer, completion_baseline);
+
+            let start = events
+                .iter()
+                .position(|event| matches!(event,
+                    Event::RegisterWrite { cu: actual, offset, value: CONTROL_START }
+                        if *actual == cu as u32 && *offset == IQ1S_REG_CONTROL_OFFSET as u32))
+                .unwrap();
+            assert!(events[..start].iter().any(|event| matches!(event,
+                Event::RegisterWrite { cu: actual, offset, value: CONTROL_SHUTDOWN }
+                    if *actual == cu as u32 && *offset == IQ1S_REG_CONTROL_OFFSET as u32)));
+            assert!(events[..start].iter().any(|event| matches!(event,
+                Event::RegisterWrite { cu: actual, offset, value }
+                    if *actual == cu as u32
+                        && *offset == IQ1S_REG_COMMAND_PRODUCER_OFFSET as u32
+                        && *value == command_baseline)));
+            assert!(events[..start].iter().any(|event| matches!(event,
+                Event::RegisterWrite { cu: actual, offset, value }
+                    if *actual == cu as u32
+                        && *offset == IQ1S_REG_COMPLETION_CONSUMER_OFFSET as u32
+                        && *value == completion_baseline)));
+            assert!(events[..start].iter().any(|event| matches!(event,
+                Event::RegisterWrite { cu: actual, offset, value: 4 }
+                    if *actual == cu as u32 && *offset == IQ1S_REG_CONTROL_OFFSET as u32)));
+            assert_eq!(
+                pool.reg_read(cu, IQ1S_REG_FAULT_CODE_OFFSET).unwrap(),
+                IQ1S_FAULT_CODE_NONE
+            );
+        }
+
+        let phase = fixture_phase(31, false);
+        let buffers = fixture_buffers(false);
+        let ticket = pool.prepare_ticket(&phase, &buffers).unwrap();
+        pool.publish_ticket(&ticket).unwrap();
+        assert_eq!(pool.poll_ticket(&ticket).unwrap(), TicketPoll::Complete);
+        pool.collect_ticket(&ticket).unwrap();
+        for cu in 0..ARENA_BANK_COUNT {
+            assert_eq!(pool.cus[cu].command_consumer, 38 + cu as u32);
+            assert_eq!(pool.cus[cu].completion_consumer, 30 + cu as u32);
+        }
+        pool.shutdown().unwrap();
+    }
+
+    #[test]
+    fn xrt_iq1s_persistent_weights_use_device_only_bos_and_bounded_staging() {
+        let mut pool = pool(4);
+        let resident = pool
+            .cus
+            .iter()
+            .flat_map(|cu| cu.arena.iter().map(|chunk| chunk.bo as usize))
+            .collect::<Vec<_>>();
+        let staging = pool
+            .cus
+            .iter()
+            .map(|cu| cu.arena_staging_bo as usize)
+            .collect::<Vec<_>>();
+        let events = pool.ops.events();
+
+        assert_eq!(resident.len(), 4);
+        assert_eq!(staging.len(), 4);
+        for bo in &resident {
+            assert!(events.iter().any(|event| matches!(event,
+                Event::BoAlloc { bo: actual, flags: XRT_BO_FLAGS_DEVICE_ONLY, .. }
+                    if actual == bo)));
+        }
+        for bo in &staging {
+            assert!(events.iter().any(|event| matches!(event,
+                Event::BoAlloc { bo: actual, flags: 0, bytes, .. }
+                    if actual == bo && *bytes == 2 * 1024 * 1024)));
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    Event::BoCopy {
+                        destination,
+                        source,
+                        bytes: 2_097_152,
+                        destination_offset: 0,
+                        source_offset: 0,
+                    } if resident.contains(destination) && staging.contains(source)))
+                .count(),
+            4
+        );
         pool.shutdown().unwrap();
     }
 
@@ -2471,7 +3887,7 @@ mod tests {
         );
     }
 
-    fn persistent_smoke_fixture() -> (Vec<u8>, Vec<u8>, f32) {
+    fn persistent_smoke_fixture_for_grid(zero_grid: bool) -> (Vec<u8>, Vec<u8>, f32) {
         const D_VALUES: [f32; 4] = [0.5, -0.25, 1.5, 0.0625];
         const D_HALF: [u16; 4] = [0x3800, 0xb400, 0x3e00, 0x2c00];
         const S_VALUES: [f32; 4] = [-2.0, 0.0, 0.75, 4.0];
@@ -2545,10 +3961,19 @@ mod tests {
             }
             let parsed = Iq1sBlock::parse(&packed, &grid).expect("parse smoke IQ1_S block");
             for (group, q8) in parsed.groups.iter().zip(q8_groups.iter()) {
-                let (grid_dot, delta_dot) = raw_component_dots(group, q8);
-                let contribution =
-                    reconstruct_from_raw(group, parsed.d, q8, grid_dot << 8, delta_dot << 8)
-                        .expect("reconstruct smoke IQ1_S contribution");
+                let mut oracle_group = *group;
+                if zero_grid {
+                    oracle_group.grid_values.fill(0);
+                }
+                let (grid_dot, delta_dot) = raw_component_dots(&oracle_group, q8);
+                let contribution = reconstruct_from_raw(
+                    &oracle_group,
+                    parsed.d,
+                    q8,
+                    grid_dot << 8,
+                    delta_dot << 8,
+                )
+                .expect("reconstruct smoke IQ1_S contribution");
                 expected = (expected + contribution) as f32;
             }
             row.extend_from_slice(&packed);
@@ -2557,6 +3982,179 @@ mod tests {
         assert_eq!(activations.len(), 4608);
         assert!(expected.is_finite() && expected != 0.0);
         (row, activations, expected)
+    }
+
+    fn persistent_smoke_fixture() -> (Vec<u8>, Vec<u8>, f32) {
+        persistent_smoke_fixture_for_grid(false)
+    }
+
+    fn persistent_smoke_zero_grid_expected() -> f32 {
+        persistent_smoke_fixture_for_grid(true).2
+    }
+
+    #[test]
+    fn smoke_result_comparison_records_the_first_numerical_boundary() {
+        let bytes = [1.0f32.to_le_bytes(), 2.0f32.to_le_bytes()].concat();
+        let comparison = compare_smoke_result_bytes(2, 1, 1.0f32.to_bits(), &bytes);
+
+        assert_eq!(comparison.rows_checked, 2);
+        assert_eq!(comparison.mismatch_count, 1);
+        assert_eq!(comparison.actual_bits_histogram.get(&1.0f32.to_bits()), Some(&1));
+        assert_eq!(comparison.actual_bits_histogram.get(&2.0f32.to_bits()), Some(&1));
+        assert_eq!(comparison.first_mismatches.len(), 1);
+        assert_eq!(comparison.first_mismatches[0].cu, 2);
+        assert_eq!(comparison.first_mismatches[0].generation, 1);
+        assert_eq!(comparison.first_mismatches[0].row, 1);
+        assert_eq!(comparison.first_mismatches[0].expected_bits, 1.0f32.to_bits());
+        assert_eq!(comparison.first_mismatches[0].actual_bits, 2.0f32.to_bits());
+    }
+
+    #[test]
+    fn smoke_zero_grid_oracle_matches_the_observed_hardware_signature() {
+        assert_eq!(persistent_smoke_zero_grid_expected().to_bits(), 0x454c_4e9f);
+    }
+
+    #[test]
+    fn smoke_signature_classifies_an_all_row_zero_grid_match() {
+        let histogram = BTreeMap::from([(0x454c_4e9f, 2048)]);
+        assert_eq!(
+            classify_smoke_signature(2048, 2048, &histogram, 0x454c_4e9f),
+            "matches_zero_grid_oracle"
+        );
+    }
+
+    struct CapturedQwenReplayFixture {
+        chunks: Vec<ArenaChunkSpec>,
+        phase: CompiledLayerPhase,
+        buffers: PhaseBuffers,
+    }
+
+    fn captured_qwen_replay_fixture(
+        matrix: &[u8],
+        activation: &[u8],
+        mode: &str,
+        transaction_id: u64,
+    ) -> Result<CapturedQwenReplayFixture, String> {
+        const MATRIX_BYTES: usize = 819_200;
+        const SHARD_BYTES: usize = MATRIX_BYTES / ARENA_BANK_COUNT;
+        const ACTIVATION_BYTES: usize = 4_608;
+        if matrix.len() != MATRIX_BYTES || activation.len() != ACTIVATION_BYTES {
+            return Err(format!(
+                "captured Qwen replay requires {MATRIX_BYTES} matrix bytes and {ACTIVATION_BYTES} activation bytes"
+            ));
+        }
+        let matrix_sha256: [u8; 32] = Sha256::digest(matrix).into();
+        let activation_sha256: [u8; 32] = Sha256::digest(activation).into();
+        let tensor = Arc::new(Iq1sTensorIdentity {
+            canonical_path: PathBuf::from("/qwen397b-replay/blk.0.ffn_gate_exps.weight"),
+            file_offset: 0,
+            nbytes: MATRIX_BYTES as u64,
+            name: "blk.0.ffn_gate_exps.weight".to_string(),
+            layer: 0,
+            ne: [4096, 1024, 512, 1],
+            nb: [50, 800, 819_200, 419_430_400],
+            role: Iq1sExpertRole::Gate,
+            model_sha256: [0x39; 32],
+            content_sha256: matrix_sha256,
+            device: 1,
+            inode: 2,
+            modified_ns: 3,
+        });
+        let mut chunks = Vec::with_capacity(ARENA_BANK_COUNT);
+        let mut commands = Vec::with_capacity(ARENA_BANK_COUNT);
+        for bank in 0..ARENA_BANK_COUNT {
+            let shard_bytes = &matrix[bank * SHARD_BYTES..(bank + 1) * SHARD_BYTES];
+            let shard_sha256: [u8; 32] = Sha256::digest(shard_bytes).into();
+            chunks.push(ArenaChunkSpec {
+                bank: bank as u8,
+                logical_offset: 0,
+                bytes: SHARD_BYTES,
+                sha256: shard_sha256,
+                shards: vec![ArenaShardSpec {
+                    bank: bank as u8,
+                    logical_offset: 0,
+                    bytes: SHARD_BYTES,
+                    layer_id: 0,
+                    role: IQ1S_ROLE_GATE as u16,
+                    expert_id: 7,
+                    row_start: bank as u32 * 256,
+                    row_count: 256,
+                    sha256: shard_sha256,
+                }],
+            });
+            commands.push(SemanticIq1sCommand {
+                layer_id: 0,
+                phase: LayerPhase::PhaseA,
+                role: Iq1sExpertRole::Gate,
+                expert_id: 7,
+                lane_mask: 1,
+                token_ids: vec![0],
+                input_offset: 0,
+                output_offset: 0,
+                token_map_offset: 0,
+                row_shard: ArenaShard {
+                    tensor: tensor.clone(),
+                    expert: 7,
+                    bank: bank as u8,
+                    row_start: bank as u32 * 256,
+                    row_count: 256,
+                    superblock: 0,
+                    offset: 0,
+                    bytes: SHARD_BYTES as u64,
+                    sha256: shard_sha256,
+                },
+            });
+        }
+        let phase = compile_layer_phase(
+            &LayerPhasePlan {
+                transaction_id,
+                phase: LayerPhase::PhaseA,
+                commands,
+                activations: vec![ActivationRange {
+                    cuda_ptr: 0x10000,
+                    slab_offset: 0,
+                    bytes: ACTIVATION_BYTES as u32,
+                    stream: 1,
+                    source_identity_sha256: activation_sha256,
+                }],
+            },
+            mode,
+            QWEN_MODEL_CONTEXT_LIMIT,
+        )?;
+        Ok(CapturedQwenReplayFixture {
+            chunks,
+            phase,
+            buffers: PhaseBuffers {
+                activations: vec![HostRange {
+                    offset: 0,
+                    bytes: activation.to_vec(),
+                }],
+                token_maps: vec![HostRange {
+                    offset: 0,
+                    bytes: 0u32.to_le_bytes().to_vec(),
+                }],
+            },
+        })
+    }
+
+    #[test]
+    fn captured_qwen_replay_fixture_maps_one_expert_across_four_banks() {
+        let matrix = vec![0x5a; 819_200];
+        let activation = vec![0xa5; 4_608];
+        let fixture = captured_qwen_replay_fixture(&matrix, &activation, "handwritten", 17)
+            .expect("build captured Qwen replay fixture");
+
+        assert_eq!(fixture.chunks.len(), ARENA_BANK_COUNT);
+        assert_eq!(fixture.phase.transaction_id, 17);
+        assert_eq!(fixture.phase.commands.iter().map(Vec::len).sum::<usize>(), 4);
+        assert_eq!(fixture.buffers.activations[0].bytes, activation);
+        for bank in 0..ARENA_BANK_COUNT {
+            assert_eq!(fixture.chunks[bank].bank, bank as u8);
+            assert_eq!(fixture.chunks[bank].bytes, 204_800);
+            assert_eq!(fixture.phase.commands[bank].len(), 1);
+            assert_eq!(fixture.phase.commands[bank][0].row_start, bank as u32 * 256);
+            assert_eq!(fixture.phase.commands[bank][0].lane_count, 1);
+        }
     }
 
     fn persistent_smoke_chunks(bytes: &[u8], sha256: [u8; 32]) -> Vec<ArenaChunkSpec> {
@@ -2631,6 +4229,7 @@ mod tests {
                     slab_offset: 0x2000,
                     bytes: 4608,
                     stream: 1,
+                    source_identity_sha256: [0x51; 32],
                 }],
             },
             "compiler",
@@ -2676,6 +4275,7 @@ mod tests {
             .expect("HETGPU_XRT_TIMEOUT_MS must be u32");
 
         let (row, activations, expected) = persistent_smoke_fixture();
+        let zero_grid_expected = persistent_smoke_zero_grid_expected();
         let arena_bytes = row.repeat(256);
         assert_eq!(arena_bytes.len(), 204_800);
         let arena_sha256: [u8; 32] = Sha256::digest(&arena_bytes).into();
@@ -2688,10 +4288,13 @@ mod tests {
             1,
             &chunks,
             |_| Ok(arena_bytes.clone()),
+            |_| Ok(()),
         )
         .expect("open four-CU persistent IQ1_S pool");
         let actual_uuid = format_xuid(pool.xclbin_uuid);
         assert_eq!(actual_uuid, expected_uuid);
+        let command_baselines =
+            std::array::from_fn::<u32, ARENA_BANK_COUNT, _>(|cu| pool.cus[cu].command_producer);
 
         let buffers = PhaseBuffers {
             activations: vec![HostRange {
@@ -2707,6 +4310,9 @@ mod tests {
             std::array::from_fn(|_| Vec::new());
         let mut completion_counts = [0u64; ARENA_BANK_COUNT];
         let mut result_rows_checked = 0u64;
+        let mut result_mismatch_count = 0u64;
+        let mut actual_bits_histogram = BTreeMap::<u32, u64>::new();
+        let mut first_mismatches = Vec::<SmokeResultMismatch>::new();
         pool.measurement_begin()
             .expect("begin persistent DMA window");
         for (generation, transaction_id) in [101u64, 102].into_iter().enumerate() {
@@ -2721,7 +4327,10 @@ mod tests {
             for cu in 0..ARENA_BANK_COUNT {
                 assert_eq!(completed.completions[cu].len(), 1);
                 let completion = completed.completions[cu][0];
-                assert_eq!(completion.command_index, generation as u32);
+                assert_eq!(
+                    completion.command_index,
+                    command_baselines[cu].wrapping_add(generation as u32)
+                );
                 assert_eq!(completion.fault_code, IQ1S_FAULT_CODE_NONE);
                 assert!(completion.result_fence != 0 && completion.cycles != 0);
                 ring_generations[cu].push(completion.command_index);
@@ -2730,10 +4339,21 @@ mod tests {
                 let result = &completed.results[cu][0];
                 assert_eq!(result.offset, 0x8000);
                 assert_eq!(result.bytes.len(), 256 * 4);
-                for actual in result.bytes.chunks_exact(4) {
-                    let actual = f32::from_le_bytes(actual.try_into().expect("four-byte f32"));
-                    assert_eq!(actual.to_bits(), expected.to_bits());
-                    result_rows_checked += 1;
+                let comparison = compare_smoke_result_bytes(
+                    cu,
+                    generation,
+                    expected.to_bits(),
+                    &result.bytes,
+                );
+                result_rows_checked += comparison.rows_checked;
+                result_mismatch_count += comparison.mismatch_count;
+                for (actual_bits, count) in comparison.actual_bits_histogram {
+                    *actual_bits_histogram.entry(actual_bits).or_default() += count;
+                }
+                for mismatch in comparison.first_mismatches {
+                    if first_mismatches.len() < MAX_SMOKE_MISMATCH_SAMPLES {
+                        first_mismatches.push(mismatch);
+                    }
                 }
             }
         }
@@ -2759,17 +4379,30 @@ mod tests {
         pool.shutdown()
             .expect("gracefully shut down persistent CUs");
 
+        let numerical_signature = classify_smoke_signature(
+            result_rows_checked,
+            result_mismatch_count,
+            &actual_bits_histogram,
+            zero_grid_expected.to_bits(),
+        );
+
         let summary = serde_json::json!({
             "schema_version": 1,
-            "status": "pass",
+            "status": if result_mismatch_count == 0 { "pass" } else { "numerical_mismatch" },
             "xclbin_uuid": actual_uuid,
             "persistent_starts_per_cu": [1, 1, 1, 1],
+            "command_baselines_per_cu": command_baselines,
             "ring_generations_per_cu": ring_generations,
             "per_cu_completions": completion_counts,
             "sticky_fault_codes": sticky_fault_codes,
             "quiescent_before_shutdown": quiescent,
             "result_rows_checked": result_rows_checked,
+            "result_mismatch_count": result_mismatch_count,
+            "actual_f32_bits_histogram": actual_bits_histogram,
+            "first_mismatches": first_mismatches,
             "expected_f32_bits": expected.to_bits(),
+            "zero_grid_expected_f32_bits": zero_grid_expected.to_bits(),
+            "numerical_signature": numerical_signature,
             "measured_dma": {
                 "command_ranges": measured.command_ranges,
                 "activation_ranges": measured.activation_ranges,
@@ -2788,5 +4421,11 @@ mod tests {
             .expect("write persistent smoke summary");
         writeln!(output).expect("terminate persistent smoke summary");
         output.sync_all().expect("sync persistent smoke summary");
+        assert_eq!(
+            result_mismatch_count,
+            0,
+            "persistent hardware smoke numerical mismatch; evidence: {}",
+            summary_path.display()
+        );
     }
 }

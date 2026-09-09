@@ -1725,7 +1725,9 @@ impl<'a> MethodEmitContext<'a> {
         let dest_type = get_pointer_type(self.context, to_space)?;
         let mut src = self.resolver.value(arguments.src)?;
         #[cfg(feature = "sifive")]
-        if sifive_uses_64bit_address_values(from_space) || sifive_uses_64bit_address_values(to_space) {
+        if sifive_uses_64bit_address_values(from_space)
+            || sifive_uses_64bit_address_values(to_space)
+        {
             src = self.sifive_int_to_i64(src);
         }
         let temp_ptr =
@@ -3722,7 +3724,9 @@ impl<'a> MethodEmitContext<'a> {
 
 /// Map PTX ScalarType to SIFIVE element type (used by emit_mma_sifive_vcix)
 #[cfg(feature = "sifive")]
-fn sifive_elem_from_scalar(scalar: ast::ScalarType) -> crate::pass::emit_sifive_vcix::SifiveElementType {
+fn sifive_elem_from_scalar(
+    scalar: ast::ScalarType,
+) -> crate::pass::emit_sifive_vcix::SifiveElementType {
     use crate::pass::emit_sifive_vcix::SifiveElementType;
     match scalar {
         ast::ScalarType::U8 => SifiveElementType::Uint8,

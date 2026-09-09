@@ -29,7 +29,8 @@ if [[ "${1:-}" == "--inside" ]]; then
     model_sha256=0a32c2702fbb61934960cfeef34524b81ec6d9267158f246d45fc86f5aaa7568
     llama_revision=925e1179947ea0c0ebfb0032df18af3a729822be
     fpga_bdf=0000:64:00.1
-    cu_config='{"version":1,"cus":[{"ip_name":"iq1s_layer_big:iq1s_layer_big_1","memory_group":0,"lanes":9},{"ip_name":"iq1s_layer_big:iq1s_layer_big_2","memory_group":3,"lanes":9},{"ip_name":"iq1s_layer_big:iq1s_layer_big_3","memory_group":2,"lanes":9},{"ip_name":"iq1s_layer_small:iq1s_layer_small_1","memory_group":1,"lanes":6}]}'
+    profile=one-token
+    cu_config='{"version":1,"cus":[{"ip_name":"ternip_big:ternip_big_1","memory_group":0,"lanes":9},{"ip_name":"ternip_big:ternip_big_2","memory_group":3,"lanes":9},{"ip_name":"ternip_big:ternip_big_3","memory_group":2,"lanes":9},{"ip_name":"ternip_small:ternip_small_1","memory_group":1,"lanes":6}]}'
 
     for required in \
         "${model}" "${manifest}" "${llama_server}" "${libnvcuda}" "${cuda13_launch_shim}" "${oracle}" \
@@ -106,7 +107,7 @@ PY
 
     xclbin_info="$(xclbinutil --info --input "${xclbin}" 2>&1)"
     printf '%s\n' "${xclbin_info}" > "${proof_dir}/xclbin-info.txt"
-    for cu in iq1s_layer_big_1 iq1s_layer_big_2 iq1s_layer_big_3 iq1s_layer_small_1; do
+    for cu in ternip_big_1 ternip_big_2 ternip_big_3 ternip_small_1; do
         grep -Fq "Instance:        ${cu}" <<<"${xclbin_info}" || {
             echo "xclbin is missing expected compute unit ${cu}" >&2
             exit 1
@@ -186,7 +187,7 @@ PY
         unset HETGPU_BITNET_ROUTE_MANIFEST HETGPU_BITNET_ROUTE_LOG HETGPU_XRT_EXECUTION_LOG
         unset HETGPU_BITNET_GPU_KERNELS HETGPU_BITNET_CXL_KERNELS HETGPU_TQ1_EVIDENCE_LOG
         python3 "${evaluator}" \
-            --mode cuda --evidence-kind iq1s \
+            --mode cuda --profile "${profile}" --evidence-kind iq1s \
             --server "${llama_server}" --server-preload "${cuda13_launch_shim}:${libnvcuda}" \
             --model "${model}" --prompt-seed "${prompt_seed}" \
             --model-verification "${proof_dir}/model-verification.json" \
@@ -213,6 +214,7 @@ PY
         export HETGPU_CUDART_PRELAUNCH_NAMED_KERNEL=1
         export HETGPU_QWEN_IQ1S_DISABLE_CUDA_FUSION=1
         export HETGPU_QWEN_IQ1S_STRICT=1
+        export HETGPU_QWEN_IQ1S_PERSISTENT=1
         export HETGPU_QWEN_MODEL_CONTEXT_LIMIT=262144
         export HETGPU_IQ1S_TRACE_MODE="${trace_mode}"
         export HETGPU_LIBGGML="${verified_libggml}"
@@ -227,7 +229,7 @@ PY
         export HETGPU_XRT_COMPARE_MAX_LAUNCHES=1
         unset HETGPU_TQ1_EVIDENCE_LOG
         python3 "${evaluator}" \
-            --mode "${trace_mode}" --evidence-kind iq1s \
+            --mode "${trace_mode}" --profile "${profile}" --evidence-kind iq1s \
             --server "${llama_server}" --server-preload "${cuda13_launch_shim}:${libnvcuda}" \
             --model "${model}" --prompt-seed "${prompt_seed}" \
             --model-verification "${proof_dir}/model-verification.json" \

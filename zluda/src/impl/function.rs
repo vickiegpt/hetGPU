@@ -8397,6 +8397,414 @@ struct NvidiaCxlMmqShape {
     not(feature = "intel"),
     not(feature = "tenstorrent")
 ))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NvidiaCuda13MoeMmqLaunch {
+    matrix_base: usize,
+    activation_base: usize,
+    ids_dst: usize,
+    expert_bounds: usize,
+    output_base: usize,
+    ncols_x: u64,
+    nrows_x: u64,
+    active_routes: usize,
+    matrix_row_stride_blocks: u64,
+    activation_pitch: usize,
+    output_stride: u64,
+    expert_count: usize,
+    matrix_expert_stride_blocks: u64,
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+#[derive(Clone, Debug)]
+struct NvidiaCuda13MoeMmqPlan {
+    expert: usize,
+    compact_index: usize,
+    destination_index: usize,
+    matrix_ptr: usize,
+    activation_ptr: usize,
+    output_ptr: usize,
+    signature: super::iq1s_tmatmul::GgmlType19Signature,
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NvidiaCuda13SharedInputIdentity {
+    activation_base: usize,
+    ids_dst: usize,
+    expert_bounds: usize,
+    ncols_x: u64,
+    nrows_x: u64,
+    active_routes: usize,
+    activation_pitch: usize,
+    expert_count: usize,
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NvidiaCuda13SharedInputs {
+    ids: Vec<u8>,
+    bounds: Vec<u8>,
+    activations: Vec<u8>,
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+fn nvidia_cuda13_shared_inputs_with(
+    cache: &mut std::collections::HashMap<
+        usize,
+        (
+            super::iq1s_layer::LayerKey,
+            NvidiaCuda13SharedInputIdentity,
+            NvidiaCuda13SharedInputs,
+        ),
+    >,
+    layer_key: super::iq1s_layer::LayerKey,
+    identity: NvidiaCuda13SharedInputIdentity,
+    copy: impl FnOnce() -> Result<NvidiaCuda13SharedInputs, String>,
+) -> Result<NvidiaCuda13SharedInputs, String> {
+    if let Some((cached_key, cached_identity, cached)) = cache.get(&layer_key.stream) {
+        if *cached_key == layer_key {
+            if *cached_identity != identity {
+                return Err(
+                    "CUDA 13 IQ1_S gate/up shared input identity changed within a transaction"
+                        .to_string(),
+                );
+            }
+            let result = cached.clone();
+            cache.remove(&layer_key.stream);
+            return Ok(result);
+        }
+        cache.remove(&layer_key.stream);
+    }
+    let copied = copy()?;
+    cache.insert(layer_key.stream, (layer_key, identity, copied.clone()));
+    Ok(copied)
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+fn nvidia_is_cuda13_moe_iq1s_mmq(kernel_name: &str) -> bool {
+    kernel_name.contains("_Z9mul_mat_qI")
+        && kernel_name.contains("ggml_type19")
+        && kernel_name.contains("EvPKcPKi")
+        && kernel_name.contains("PKf5uint3iiiii")
+        && !kernel_name.contains("stream_k_fixup")
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+fn nvidia_positive_u64(field: &str, value: i32) -> Result<u64, String> {
+    let value = u64::try_from(value).map_err(|_| format!("{field} has negative value {value}"))?;
+    if value == 0 {
+        return Err(format!("{field} must be positive"));
+    }
+    Ok(value)
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+unsafe fn nvidia_read_cuda13_moe_iq1s_mmq_launch(
+    kernel_name: &str,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+) -> Result<NvidiaCuda13MoeMmqLaunch, String> {
+    if !nvidia_is_cuda13_moe_iq1s_mmq(kernel_name) {
+        return Err(format!(
+            "kernel '{kernel_name}' is not the pinned CUDA 13 IQ1_S MoE-MMQ ABI"
+        ));
+    }
+    let blocks_per_ne00 = nvidia_cxl_read_uint3_param(kernel_params, 7, kernel_name)?;
+    let nchannels_y = nvidia_cxl_read_uint3_param(kernel_params, 14, kernel_name)?;
+    let blocks = u64::from(blocks_per_ne00.z);
+    if blocks == 0 {
+        return Err("CUDA 13 IQ1_S MoE-MMQ K block count must be positive".to_string());
+    }
+    let ncols_x = blocks
+        .checked_mul(super::iq1s_tmatmul::IQ1S_BLOCK_VALUES as u64)
+        .ok_or("CUDA 13 IQ1_S MoE-MMQ K dimension overflow")?;
+    let active_routes = usize::try_from(nvidia_positive_u64(
+        "ncols_dst",
+        nvidia_cxl_read_i32_param(kernel_params, 9, kernel_name)?,
+    )?)
+    .map_err(|_| "ncols_dst does not fit usize")?;
+    let activation_pitch = usize::try_from(nvidia_positive_u64(
+        "ncols_y",
+        nvidia_cxl_read_i32_param(kernel_params, 11, kernel_name)?,
+    )?)
+    .map_err(|_| "ncols_y does not fit usize")?;
+    let expert_count = usize::try_from(nchannels_y.z)
+        .map_err(|_| "CUDA 13 IQ1_S MoE-MMQ expert count does not fit usize")?;
+    if expert_count == 0 {
+        return Err("CUDA 13 IQ1_S MoE-MMQ expert count must be positive".to_string());
+    }
+    Ok(NvidiaCuda13MoeMmqLaunch {
+        matrix_base: nvidia_cxl_read_pointer_param(kernel_params, 0, kernel_name)?,
+        activation_base: nvidia_cxl_read_pointer_param(kernel_params, 1, kernel_name)?,
+        ids_dst: nvidia_cxl_read_pointer_param(kernel_params, 2, kernel_name)?,
+        expert_bounds: nvidia_cxl_read_pointer_param(kernel_params, 3, kernel_name)?,
+        output_base: nvidia_cxl_read_pointer_param(kernel_params, 4, kernel_name)?,
+        ncols_x,
+        nrows_x: nvidia_positive_u64(
+            "nrows_x",
+            nvidia_cxl_read_i32_param(kernel_params, 8, kernel_name)?,
+        )?,
+        active_routes,
+        matrix_row_stride_blocks: nvidia_positive_u64(
+            "stride_row_x",
+            nvidia_cxl_read_i32_param(kernel_params, 10, kernel_name)?,
+        )?,
+        activation_pitch,
+        output_stride: nvidia_positive_u64(
+            "stride_col_dst",
+            nvidia_cxl_read_i32_param(kernel_params, 12, kernel_name)?,
+        )?,
+        expert_count,
+        matrix_expert_stride_blocks: nvidia_positive_u64(
+            "stride_channel_x",
+            nvidia_cxl_read_i32_param(kernel_params, 15, kernel_name)?,
+        )?,
+    })
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+fn nvidia_plan_cuda13_moe_iq1s_mmq(
+    kernel_name: &str,
+    layout: NvidiaCuda13MoeMmqLaunch,
+    ids_dst: &[i32],
+    expert_bounds: &[i32],
+) -> Result<Vec<NvidiaCuda13MoeMmqPlan>, String> {
+    use super::iq1s_tmatmul::{IQ1S_BLOCK_BYTES, IQ1S_BLOCK_VALUES, Q8_1_MMQ_BYTES};
+
+    if layout.active_routes == 0
+        || layout.ncols_x == 0
+        || layout.nrows_x == 0
+        || layout.expert_count == 0
+    {
+        return Err("CUDA 13 IQ1_S MoE-MMQ layout contains a zero extent".to_string());
+    }
+    if layout.activation_pitch < layout.active_routes {
+        return Err(
+            "CUDA 13 IQ1_S MoE-MMQ activation pitch is smaller than its routes".to_string(),
+        );
+    }
+    if layout.output_stride < layout.nrows_x {
+        return Err("CUDA 13 IQ1_S MoE-MMQ output stride is smaller than its rows".to_string());
+    }
+    let packed_row_blocks = layout.ncols_x / IQ1S_BLOCK_VALUES as u64;
+    if !layout.ncols_x.is_multiple_of(IQ1S_BLOCK_VALUES as u64)
+        || layout.matrix_row_stride_blocks < packed_row_blocks
+    {
+        return Err("CUDA 13 IQ1_S MoE-MMQ matrix row stride is invalid".to_string());
+    }
+    if ids_dst.len() != layout.active_routes {
+        return Err(format!(
+            "CUDA 13 IQ1_S MoE-MMQ has {} destination IDs, expected {}",
+            ids_dst.len(),
+            layout.active_routes
+        ));
+    }
+    let expected_bounds = layout
+        .expert_count
+        .checked_add(1)
+        .ok_or("CUDA 13 IQ1_S MoE-MMQ bounds count overflow")?;
+    if expert_bounds.len() != expected_bounds {
+        return Err(format!(
+            "CUDA 13 IQ1_S MoE-MMQ has {} expert bounds, expected {expected_bounds}",
+            expert_bounds.len()
+        ));
+    }
+    if expert_bounds.first() != Some(&0)
+        || usize::try_from(*expert_bounds.last().expect("nonempty bounds")).ok()
+            != Some(layout.active_routes)
+    {
+        return Err("CUDA 13 IQ1_S MoE-MMQ expert bounds do not span every route".to_string());
+    }
+
+    let matrix_expert_stride_bytes = usize::try_from(layout.matrix_expert_stride_blocks)
+        .map_err(|_| "matrix expert stride does not fit usize")?
+        .checked_mul(IQ1S_BLOCK_BYTES)
+        .ok_or("matrix expert byte stride overflow")?;
+    let output_stride_bytes = usize::try_from(layout.output_stride)
+        .map_err(|_| "output stride does not fit usize")?
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or("output byte stride overflow")?;
+    let mut by_destination = vec![None; layout.active_routes];
+    for expert in 0..layout.expert_count {
+        let begin = usize::try_from(expert_bounds[expert])
+            .map_err(|_| format!("expert {expert} lower bound is negative"))?;
+        let end = usize::try_from(expert_bounds[expert + 1])
+            .map_err(|_| format!("expert {expert} upper bound is negative"))?;
+        if begin > end || end > layout.active_routes {
+            return Err(format!(
+                "expert {expert} bounds are not monotonic or in range"
+            ));
+        }
+        for compact_index in begin..end {
+            let destination_index = usize::try_from(ids_dst[compact_index])
+                .map_err(|_| format!("compact route {compact_index} has a negative destination"))?;
+            if destination_index >= layout.active_routes {
+                return Err(format!(
+                    "compact route {compact_index} destination {destination_index} is out of range"
+                ));
+            }
+            let matrix_ptr = layout
+                .matrix_base
+                .checked_add(
+                    expert
+                        .checked_mul(matrix_expert_stride_bytes)
+                        .ok_or("matrix expert offset overflow")?,
+                )
+                .ok_or("matrix expert pointer overflow")?;
+            let activation_ptr = layout
+                .activation_base
+                .checked_add(
+                    compact_index
+                        .checked_mul(Q8_1_MMQ_BYTES)
+                        .ok_or("activation route offset overflow")?,
+                )
+                .ok_or("activation route pointer overflow")?;
+            let output_ptr = layout
+                .output_base
+                .checked_add(
+                    destination_index
+                        .checked_mul(output_stride_bytes)
+                        .ok_or("output route offset overflow")?,
+                )
+                .ok_or("output route pointer overflow")?;
+            let signature = super::iq1s_tmatmul::GgmlType19Signature {
+                kernel: kernel_name.to_string(),
+                ne00: layout.ncols_x,
+                ne01: layout.nrows_x,
+                stride01: layout.matrix_row_stride_blocks,
+                ne10: layout.ncols_x,
+                ne11: 1,
+                stride11: 1,
+                ne0: layout.nrows_x,
+            }
+            .validate()?;
+            let plan = NvidiaCuda13MoeMmqPlan {
+                expert,
+                compact_index,
+                destination_index,
+                matrix_ptr,
+                activation_ptr,
+                output_ptr,
+                signature,
+            };
+            if by_destination[destination_index].replace(plan).is_some() {
+                return Err(format!(
+                    "CUDA 13 IQ1_S MoE-MMQ has duplicate destination {destination_index}"
+                ));
+            }
+        }
+    }
+    by_destination
+        .into_iter()
+        .enumerate()
+        .map(|(destination, plan)| {
+            plan.ok_or_else(|| {
+                format!("CUDA 13 IQ1_S MoE-MMQ is missing destination {destination}")
+            })
+        })
+        .collect()
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+fn nvidia_gather_cuda13_moe_mmq_activation(
+    layout: NvidiaCuda13MoeMmqLaunch,
+    compact_index: usize,
+    packed: &[u8],
+) -> Result<Vec<u8>, String> {
+    use super::iq1s_tmatmul::Q8_1_MMQ_BYTES;
+
+    if compact_index >= layout.active_routes || compact_index >= layout.activation_pitch {
+        return Err(format!(
+            "CUDA 13 IQ1_S MoE-MMQ compact route {compact_index} is out of range"
+        ));
+    }
+    let record_count = usize::try_from(layout.ncols_x / 128)
+        .map_err(|_| "CUDA 13 IQ1_S MoE-MMQ Q8 record count does not fit usize")?;
+    let expected = record_count
+        .checked_mul(layout.activation_pitch)
+        .and_then(|records| records.checked_mul(Q8_1_MMQ_BYTES))
+        .ok_or("CUDA 13 IQ1_S MoE-MMQ activation extent overflow")?;
+    if packed.len() != expected {
+        return Err(format!(
+            "CUDA 13 IQ1_S MoE-MMQ activation storage is {} bytes, expected {expected}",
+            packed.len()
+        ));
+    }
+    let mut dense = Vec::with_capacity(
+        record_count
+            .checked_mul(Q8_1_MMQ_BYTES)
+            .ok_or("CUDA 13 IQ1_S MoE-MMQ dense activation extent overflow")?,
+    );
+    for record in 0..record_count {
+        let source_record = record
+            .checked_mul(layout.activation_pitch)
+            .and_then(|base| base.checked_add(compact_index))
+            .ok_or("CUDA 13 IQ1_S MoE-MMQ activation record offset overflow")?;
+        let begin = source_record
+            .checked_mul(Q8_1_MMQ_BYTES)
+            .ok_or("CUDA 13 IQ1_S MoE-MMQ activation byte offset overflow")?;
+        let end = begin
+            .checked_add(Q8_1_MMQ_BYTES)
+            .ok_or("CUDA 13 IQ1_S MoE-MMQ activation byte end overflow")?;
+        dense.extend_from_slice(
+            packed
+                .get(begin..end)
+                .ok_or("CUDA 13 IQ1_S MoE-MMQ activation record is out of range")?,
+        );
+    }
+    Ok(dense)
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
 fn nvidia_cxl_mmvq_contract_error(shape: NvidiaCxlMmvqShape) -> Option<String> {
     const DIM: i32 = 2048;
     if shape.ncols_x != DIM
@@ -8653,9 +9061,7 @@ fn nvidia_is_modern_iq1s_mmvq(kernel_name: &str) -> bool {
 ))]
 fn nvidia_is_modern_iq1s_moe_mmvq(kernel_name: &str) -> bool {
     let name = kernel_name.to_ascii_lowercase();
-    name.contains("mul_mat_vec_q_moe")
-        && name.contains("ggml_type19")
-        && name.contains("eli2e")
+    name.contains("mul_mat_vec_q_moe") && name.contains("ggml_type19") && name.contains("eli2e")
 }
 
 #[cfg(all(
@@ -8863,10 +9269,14 @@ fn nvidia_plan_modern_iq1s_moe_mmvq(
         || layout.ncols_dst < 2
         || layout.ncols_dst > 16
     {
-        return Err("modern IQ1_S MoE MMVQ dimensions or active-token count are invalid".to_string());
+        return Err(
+            "modern IQ1_S MoE MMVQ dimensions or active-token count are invalid".to_string(),
+        );
     }
     if grid.1 == 0 || grid.2 != 1 {
-        return Err("modern IQ1_S MoE MMVQ grid.y must be positive and grid.z must equal one".to_string());
+        return Err(
+            "modern IQ1_S MoE MMVQ grid.y must be positive and grid.z must equal one".to_string(),
+        );
     }
     let expected_grid_x = layout.nrows_x.div_ceil(2);
     if grid.0 != expected_grid_x {
@@ -8876,9 +9286,7 @@ fn nvidia_plan_modern_iq1s_moe_mmvq(
         ));
     }
     let expected_row_stride = layout.ncols_x / IQ1S_BLOCK_VALUES as u32;
-    if !layout
-        .ncols_x
-        .is_multiple_of(IQ1S_BLOCK_VALUES as u32)
+    if !layout.ncols_x.is_multiple_of(IQ1S_BLOCK_VALUES as u32)
         || layout.stride_row_x != expected_row_stride
     {
         return Err("modern IQ1_S MoE MMVQ has a noncontiguous IQ1_S row stride".to_string());
@@ -8890,7 +9298,9 @@ fn nvidia_plan_modern_iq1s_moe_mmvq(
     if layout.stride_channel_x != expected_expert_stride
         || layout.stride_channel_dst != layout.nrows_x
     {
-        return Err("modern IQ1_S MoE MMVQ matrix/output channel strides do not match nrows_x".to_string());
+        return Err(
+            "modern IQ1_S MoE MMVQ matrix/output channel strides do not match nrows_x".to_string(),
+        );
     }
     let expected_q8_channel_stride = layout.ncols_x / 32;
     let expected_q8_column_stride = layout
@@ -9609,13 +10019,8 @@ fn nvidia_resolve_registered_iq1s_launch(
     nrows: u64,
     row_stride_bytes: u64,
 ) -> Result<NvidiaIq1sCaptureIdentity, String> {
-    let resolved = registry.resolve_launch(
-        matrix_ptr,
-        matrix_bytes,
-        ncols,
-        nrows,
-        row_stride_bytes,
-    )?;
+    let resolved =
+        registry.resolve_launch(matrix_ptr, matrix_bytes, ncols, nrows, row_stride_bytes)?;
     Ok(NvidiaIq1sCaptureIdentity {
         tensor_name: resolved.identity.name,
         expert: resolved.expert,
@@ -9754,6 +10159,140 @@ unsafe fn nvidia_capture_iq1s_xrt_mmq(
     not(feature = "intel"),
     not(feature = "tenstorrent")
 ))]
+unsafe fn nvidia_capture_cuda13_moe_iq1s_xrt_mmq_activations(
+    kernel_name: &str,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    stream: usize,
+) -> Result<Vec<super::iq1s_tmatmul::CapturedActivationLaunch>, String> {
+    use super::iq1s_tmatmul::Q8_1_MMQ_BYTES;
+
+    let layout = nvidia_read_cuda13_moe_iq1s_mmq_launch(kernel_name, kernel_params)?;
+    let layer_key = super::iq1s_layer::open_layer_key(stream)?
+        .ok_or("CUDA 13 IQ1_S MoE-MMQ has no open layer transaction")?;
+    let ids_size = layout
+        .active_routes
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or("CUDA 13 IQ1_S MoE-MMQ destination ID extent overflow")?;
+    let bounds_count = layout
+        .expert_count
+        .checked_add(1)
+        .ok_or("CUDA 13 IQ1_S MoE-MMQ bounds count overflow")?;
+    let bounds_size = bounds_count
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or("CUDA 13 IQ1_S MoE-MMQ bounds extent overflow")?;
+    let q8_record_count = usize::try_from(layout.ncols_x / 128)
+        .map_err(|_| "CUDA 13 IQ1_S MoE-MMQ Q8 record count does not fit usize")?;
+    let activation_size = q8_record_count
+        .checked_mul(layout.activation_pitch)
+        .and_then(|records| records.checked_mul(Q8_1_MMQ_BYTES))
+        .ok_or("CUDA 13 IQ1_S MoE-MMQ activation extent overflow")?;
+    let identity = NvidiaCuda13SharedInputIdentity {
+        activation_base: layout.activation_base,
+        ids_dst: layout.ids_dst,
+        expert_bounds: layout.expert_bounds,
+        ncols_x: layout.ncols_x,
+        nrows_x: layout.nrows_x,
+        active_routes: layout.active_routes,
+        activation_pitch: layout.activation_pitch,
+        expert_count: layout.expert_count,
+    };
+    static SHARED_INPUTS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                usize,
+                (
+                    super::iq1s_layer::LayerKey,
+                    NvidiaCuda13SharedInputIdentity,
+                    NvidiaCuda13SharedInputs,
+                ),
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    let mut cache = SHARED_INPUTS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .map_err(|_| "CUDA 13 IQ1_S shared input cache lock poisoned".to_string())?;
+    let shared = nvidia_cuda13_shared_inputs_with(&mut cache, layer_key, identity, || {
+        let copied = super::iq1s_layer::copy_cuda_to_host_batch(
+            stream,
+            &[
+                (layout.ids_dst, ids_size),
+                (layout.expert_bounds, bounds_size),
+                (layout.activation_base, activation_size),
+            ],
+        )?;
+        let [ids, bounds, activations]: [Vec<u8>; 3] = copied
+            .try_into()
+            .map_err(|_| "CUDA 13 IQ1_S shared input copy returned the wrong count")?;
+        Ok(NvidiaCuda13SharedInputs {
+            ids,
+            bounds,
+            activations,
+        })
+    })?;
+    drop(cache);
+    let ids_bytes = shared.ids;
+    let ids_dst = ids_bytes
+        .chunks_exact(std::mem::size_of::<i32>())
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("four-byte destination ID")))
+        .collect::<Vec<_>>();
+    let bounds_bytes = shared.bounds;
+    let expert_bounds = bounds_bytes
+        .chunks_exact(std::mem::size_of::<i32>())
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("four-byte expert bound")))
+        .collect::<Vec<_>>();
+    let plans = nvidia_plan_cuda13_moe_iq1s_mmq(kernel_name, layout, &ids_dst, &expert_bounds)?;
+    let packed_activations = shared.activations;
+
+    let mut captured = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let matrix_bytes = plan.signature.matrix_storage_bytes()?;
+        let row_stride_bytes = plan
+            .signature
+            .stride01
+            .checked_mul(super::iq1s_tmatmul::IQ1S_BLOCK_BYTES as u64)
+            .ok_or("CUDA 13 IQ1_S MoE-MMQ row stride overflow")?;
+        let identity = nvidia_qwen_iq1s_capture_identity(
+            plan.matrix_ptr,
+            matrix_bytes,
+            plan.signature.ne00,
+            plan.signature.ne01,
+            row_stride_bytes,
+        )?
+        .ok_or("CUDA 13 IQ1_S MoE-MMQ matrix has no registered Qwen identity")?;
+        if identity.expert != plan.expert as u64 {
+            return Err(format!(
+                "CUDA 13 IQ1_S MoE-MMQ planned expert {} resolved as expert {}",
+                plan.expert, identity.expert
+            ));
+        }
+        let dense_activations = nvidia_gather_cuda13_moe_mmq_activation(
+            layout,
+            plan.compact_index,
+            &packed_activations,
+        )?;
+        let launch = super::iq1s_tmatmul::LogicalLaunch {
+            matrix_ptr: plan.matrix_ptr,
+            activation_ptr: plan.activation_ptr,
+            output_ptr: plan.output_ptr,
+            allocation_generation: identity.allocation_generation,
+            content_hash: identity.content_hash,
+            signature: plan.signature,
+        };
+        captured.push(super::iq1s_tmatmul::capture_activation_from_host(
+            launch,
+            &dense_activations,
+        )?);
+    }
+    Ok(captured)
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
 unsafe fn nvidia_capture_iq1s_xrt_mmvq(
     kernel_name: &str,
     kernel_params: *mut *mut ::core::ffi::c_void,
@@ -9767,9 +10306,7 @@ unsafe fn nvidia_capture_iq1s_xrt_mmvq(
     let row_stride_bytes = signature
         .ncols_x
         .checked_div(super::iq1s_tmatmul::IQ1S_BLOCK_VALUES as u64)
-        .and_then(|blocks| {
-            blocks.checked_mul(super::iq1s_tmatmul::IQ1S_BLOCK_BYTES as u64)
-        })
+        .and_then(|blocks| blocks.checked_mul(super::iq1s_tmatmul::IQ1S_BLOCK_BYTES as u64))
         .ok_or("IQ1_S MMVQ row stride overflow")?;
     let identity = nvidia_qwen_iq1s_capture_identity(
         matrix_ptr,
@@ -9868,9 +10405,7 @@ unsafe fn nvidia_capture_modern_iq1s_xrt_mmvq(
                 .signature
                 .ncols_x
                 .checked_div(super::iq1s_tmatmul::IQ1S_BLOCK_VALUES as u64)
-                .and_then(|blocks| {
-                    blocks.checked_mul(super::iq1s_tmatmul::IQ1S_BLOCK_BYTES as u64)
-                })
+                .and_then(|blocks| blocks.checked_mul(super::iq1s_tmatmul::IQ1S_BLOCK_BYTES as u64))
                 .ok_or("modern IQ1_S MMVQ row stride overflow")?;
             let identity = nvidia_qwen_iq1s_capture_identity(
                 plan.matrix_ptr,
@@ -9970,9 +10505,7 @@ unsafe fn nvidia_plan_modern_iq1s_xrt_moe_mmvq_launch(
                 .signature
                 .ncols_x
                 .checked_div(super::iq1s_tmatmul::IQ1S_BLOCK_VALUES as u64)
-                .and_then(|blocks| {
-                    blocks.checked_mul(super::iq1s_tmatmul::IQ1S_BLOCK_BYTES as u64)
-                })
+                .and_then(|blocks| blocks.checked_mul(super::iq1s_tmatmul::IQ1S_BLOCK_BYTES as u64))
                 .ok_or("modern IQ1_S MoE MMVQ row stride overflow")?;
             let identity = nvidia_qwen_iq1s_capture_identity(
                 plan.matrix_ptr,
@@ -10162,7 +10695,7 @@ where
             u8::from(transaction_open)
         );
         return Err(NvidiaIq1sDispatchError::Capture(
-            "strict persistent IQ1_S eligible_direct_route=1 requires an open layer lifecycle"
+            "strict persistent IQ1_S eligible_direct_route=1 requires an open layer lifecycle; no layer transaction is active"
                 .to_string(),
         ));
     }
@@ -10218,8 +10751,11 @@ pub(crate) unsafe fn nvidia_try_launch_named_xrt_tmatmul(
         }
         super::bitnet_disagg::BitnetRoute::CxlTmatmul => {}
     }
-    let modern_moe = matches!(kernel_kind, NvidiaIq1sXrtKernel::Mmvq)
+    let cuda13_moe_mmq = matches!(kernel_kind, NvidiaIq1sXrtKernel::Mmq)
+        && nvidia_is_cuda13_moe_iq1s_mmq(kernel_name);
+    let modern_moe_mmvq = matches!(kernel_kind, NvidiaIq1sXrtKernel::Mmvq)
         && nvidia_is_modern_iq1s_moe_mmvq(kernel_name);
+    let modern_moe = cuda13_moe_mmq || modern_moe_mmvq;
     let modern_multi = matches!(kernel_kind, NvidiaIq1sXrtKernel::Mmvq)
         && (modern_moe || nvidia_is_modern_iq1s_mmvq(kernel_name));
     if !modern_multi {
@@ -10241,14 +10777,24 @@ pub(crate) unsafe fn nvidia_try_launch_named_xrt_tmatmul(
         stream.0 as usize,
         &NvidiaIq1sGlobalLayerCaptureSink,
         || {
-            if !modern_moe {
-                return Err("activation-only capture requires a modern IQ1_S MoE launch".into());
+            if cuda13_moe_mmq {
+                return nvidia_capture_cuda13_moe_iq1s_xrt_mmq_activations(
+                    kernel_name,
+                    kernel_params,
+                    stream.0 as usize,
+                );
+            }
+            if !modern_moe_mmvq {
+                return Err("activation-only capture requires a supported IQ1_S MoE launch".into());
             }
             nvidia_capture_modern_iq1s_xrt_moe_activations(kernel_name, kernel_params, grid)
         },
         || match kernel_kind {
+            NvidiaIq1sXrtKernel::Mmq if cuda13_moe_mmq => {
+                Err("CUDA 13 IQ1_S MoE-MMQ requires an open layer lifecycle".to_string())
+            }
             NvidiaIq1sXrtKernel::Mmq => nvidia_capture_iq1s_xrt_mmq(kernel_name, kernel_params),
-            NvidiaIq1sXrtKernel::Mmvq if modern_moe => {
+            NvidiaIq1sXrtKernel::Mmvq if modern_moe_mmvq => {
                 nvidia_capture_modern_iq1s_xrt_moe_mmvq(kernel_name, kernel_params, grid)
             }
             NvidiaIq1sXrtKernel::Mmvq if modern_multi => {
@@ -10748,6 +11294,9 @@ pub(crate) fn launch_kernel_ex(
     not(feature = "tenstorrent")
 ))]
 mod nvidia_bitnet_route_tests {
+    use super::{
+        nvidia_cuda13_shared_inputs_with, NvidiaCuda13SharedInputIdentity, NvidiaCuda13SharedInputs,
+    };
     use core::ffi::c_void;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11214,15 +11763,9 @@ mod nvidia_bitnet_route_tests {
         assert_eq!(identity.tensor_name, source.identity.name);
         assert_eq!(identity.expert, 1);
 
-        let error = super::nvidia_resolve_registered_iq1s_launch(
-            &registry,
-            0x80_000,
-            100,
-            256,
-            2,
-            50,
-        )
-        .unwrap_err();
+        let error =
+            super::nvidia_resolve_registered_iq1s_launch(&registry, 0x80_000, 100, 256, 2, 50)
+                .unwrap_err();
         assert!(error.contains("registered device binding"), "{error}");
     }
 
@@ -11389,6 +11932,165 @@ mod nvidia_bitnet_route_tests {
         let error = super::nvidia_iq1s_signature(KERNEL, negative_dimension).unwrap_err();
         assert!(error.contains("ne10"), "unexpected error: {error}");
         assert!(error.contains("negative"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn nvidia_cuda13_moe_mmq_reads_the_live_qwen_kernel_abi() {
+        let kernel = "_Z9mul_mat_qIL9ggml_type19ELi16ELb0EEvPKcPKiS4_S4_PfS5_PKf5uint3iiiiiS8_S8_iiiS8_S8_iiiS8_";
+        let mut matrix = 0x10_0000usize;
+        let mut activations = 0x20_0000usize;
+        let mut ids_dst = 0x30_0000usize;
+        let mut expert_bounds = 0x40_0000usize;
+        let mut output = 0x50_0000usize;
+        let mut tmp_fixup = 0x60_0000usize;
+        let mut y_scale = 0usize;
+        let mut blocks_per_ne00 = super::NvidiaCudaUint3 { x: 0, y: 0, z: 16 };
+        let mut nrows_x = 4096i32;
+        let mut ncols_dst = 160i32;
+        let mut stride_row_x = 16i32;
+        let mut ncols_y = 160i32;
+        let mut stride_col_dst = 4096i32;
+        let mut channel_ratio = super::NvidiaCudaUint3 { x: 0, y: 0, z: 1 };
+        let mut nchannels_y = super::NvidiaCudaUint3 { x: 0, y: 0, z: 512 };
+        let mut stride_channel_x = 65_536i32;
+        let mut stride_channel_y = 20_480i32;
+        let mut stride_channel_dst = 655_360i32;
+        let mut sample_ratio = super::NvidiaCudaUint3 { x: 0, y: 0, z: 1 };
+        let mut nsamples_y = super::NvidiaCudaUint3 { x: 0, y: 0, z: 1 };
+        let mut stride_sample_x = 33_554_432i32;
+        let mut stride_sample_y = 20_480i32;
+        let mut stride_sample_dst = 655_360i32;
+        let mut ntx = super::NvidiaCudaUint3 { x: 0, y: 0, z: 10 };
+        let mut params = [
+            (&mut matrix as *mut usize).cast::<c_void>(),
+            (&mut activations as *mut usize).cast::<c_void>(),
+            (&mut ids_dst as *mut usize).cast::<c_void>(),
+            (&mut expert_bounds as *mut usize).cast::<c_void>(),
+            (&mut output as *mut usize).cast::<c_void>(),
+            (&mut tmp_fixup as *mut usize).cast::<c_void>(),
+            (&mut y_scale as *mut usize).cast::<c_void>(),
+            (&mut blocks_per_ne00 as *mut super::NvidiaCudaUint3).cast::<c_void>(),
+            (&mut nrows_x as *mut i32).cast::<c_void>(),
+            (&mut ncols_dst as *mut i32).cast::<c_void>(),
+            (&mut stride_row_x as *mut i32).cast::<c_void>(),
+            (&mut ncols_y as *mut i32).cast::<c_void>(),
+            (&mut stride_col_dst as *mut i32).cast::<c_void>(),
+            (&mut channel_ratio as *mut super::NvidiaCudaUint3).cast::<c_void>(),
+            (&mut nchannels_y as *mut super::NvidiaCudaUint3).cast::<c_void>(),
+            (&mut stride_channel_x as *mut i32).cast::<c_void>(),
+            (&mut stride_channel_y as *mut i32).cast::<c_void>(),
+            (&mut stride_channel_dst as *mut i32).cast::<c_void>(),
+            (&mut sample_ratio as *mut super::NvidiaCudaUint3).cast::<c_void>(),
+            (&mut nsamples_y as *mut super::NvidiaCudaUint3).cast::<c_void>(),
+            (&mut stride_sample_x as *mut i32).cast::<c_void>(),
+            (&mut stride_sample_y as *mut i32).cast::<c_void>(),
+            (&mut stride_sample_dst as *mut i32).cast::<c_void>(),
+            (&mut ntx as *mut super::NvidiaCudaUint3).cast::<c_void>(),
+        ];
+
+        let launch =
+            unsafe { super::nvidia_read_cuda13_moe_iq1s_mmq_launch(kernel, params.as_mut_ptr()) }
+                .unwrap();
+
+        assert_eq!(launch.matrix_base, matrix);
+        assert_eq!(launch.activation_base, activations);
+        assert_eq!(launch.ids_dst, ids_dst);
+        assert_eq!(launch.expert_bounds, expert_bounds);
+        assert_eq!(launch.output_base, output);
+        assert_eq!(launch.ncols_x, 4096);
+        assert_eq!(launch.nrows_x, 4096);
+        assert_eq!(launch.active_routes, 160);
+        assert_eq!(launch.activation_pitch, 160);
+        assert_eq!(launch.expert_count, 512);
+        assert_eq!(launch.matrix_expert_stride_blocks, 65_536);
+    }
+
+    #[test]
+    fn nvidia_cuda13_moe_mmq_restores_original_route_order() {
+        let layout = super::NvidiaCuda13MoeMmqLaunch {
+            matrix_base: 0x10_0000,
+            activation_base: 0x20_0000,
+            ids_dst: 0x30_0000,
+            expert_bounds: 0x40_0000,
+            output_base: 0x50_0000,
+            ncols_x: 256,
+            nrows_x: 2,
+            active_routes: 20,
+            matrix_row_stride_blocks: 1,
+            activation_pitch: 20,
+            output_stride: 2,
+            expert_count: 4,
+            matrix_expert_stride_blocks: 2,
+        };
+        let ids_dst = [
+            3, 7, 11, 15, 19, 0, 4, 8, 12, 16, 1, 5, 9, 13, 17, 2, 6, 10, 14, 18,
+        ];
+        let expert_bounds = [0, 5, 10, 15, 20];
+
+        let plans = super::nvidia_plan_cuda13_moe_iq1s_mmq(
+            "_Z9mul_mat_qIL9ggml_type19ELi16ELb0EE",
+            layout,
+            &ids_dst,
+            &expert_bounds,
+        )
+        .unwrap();
+
+        assert_eq!(plans.len(), 20);
+        assert_eq!(plans[0].destination_index, 0);
+        assert_eq!(plans[0].compact_index, 5);
+        assert_eq!(plans[0].expert, 1);
+        assert_eq!(plans[0].matrix_ptr, 0x10_0000 + 2 * 50);
+        assert_eq!(plans[0].activation_ptr, 0x20_0000 + 5 * 144);
+        assert_eq!(plans[0].output_ptr, 0x50_0000);
+        assert_eq!(plans[0].signature.ne00, 256);
+        assert_eq!(plans[0].signature.ne01, 2);
+        assert_eq!(plans[0].signature.stride01, 1);
+        assert_eq!(plans[0].signature.ne11, 1);
+        assert_eq!(plans[0].signature.stride11, 1);
+
+        let mut duplicate = ids_dst;
+        duplicate[6] = 0;
+        let error = super::nvidia_plan_cuda13_moe_iq1s_mmq(
+            "_Z9mul_mat_qIL9ggml_type19ELi16ELb0EE",
+            layout,
+            &duplicate,
+            &expert_bounds,
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate destination"), "{error}");
+    }
+
+    #[test]
+    fn nvidia_cuda13_moe_mmq_gathers_each_routes_strided_q8_records() {
+        let layout = super::NvidiaCuda13MoeMmqLaunch {
+            matrix_base: 0x10_0000,
+            activation_base: 0x20_0000,
+            ids_dst: 0x30_0000,
+            expert_bounds: 0x40_0000,
+            output_base: 0x50_0000,
+            ncols_x: 256,
+            nrows_x: 2,
+            active_routes: 20,
+            matrix_row_stride_blocks: 1,
+            activation_pitch: 20,
+            output_stride: 2,
+            expert_count: 4,
+            matrix_expert_stride_blocks: 2,
+        };
+        let mut packed = vec![0u8; 2 * 20 * 144];
+        packed[5 * 144..6 * 144].fill(0x15);
+        packed[25 * 144..26 * 144].fill(0x25);
+
+        let dense = super::nvidia_gather_cuda13_moe_mmq_activation(layout, 5, &packed).unwrap();
+
+        assert_eq!(dense.len(), 2 * 144);
+        assert!(dense[..144].iter().all(|byte| *byte == 0x15));
+        assert!(dense[144..].iter().all(|byte| *byte == 0x25));
+        assert!(
+            super::nvidia_gather_cuda13_moe_mmq_activation(layout, 20, &packed)
+                .unwrap_err()
+                .contains("compact route")
+        );
     }
 
     #[test]
@@ -11751,6 +12453,56 @@ mod nvidia_bitnet_route_tests {
 
     struct FakeCapturedExecutor {
         executions: Arc<AtomicUsize>,
+    }
+
+    #[test]
+    fn cuda13_gate_up_reuses_one_shared_input_copy_and_rejects_identity_change() {
+        let key = crate::r#impl::iq1s_layer::LayerKey {
+            session_generation: 9,
+            transaction_id: 77,
+            layer_id: 7,
+            stream: 0x55,
+        };
+        let identity = NvidiaCuda13SharedInputIdentity {
+            activation_base: 0x1000,
+            ids_dst: 0x2000,
+            expert_bounds: 0x3000,
+            ncols_x: 4096,
+            nrows_x: 1024,
+            active_routes: 320,
+            activation_pitch: 32,
+            expert_count: 512,
+        };
+        let expected = NvidiaCuda13SharedInputs {
+            ids: vec![1; 16],
+            bounds: vec![2; 16],
+            activations: vec![3; 32],
+        };
+        let mut cache = std::collections::HashMap::new();
+        let mut copies = 0;
+        let gate = nvidia_cuda13_shared_inputs_with(&mut cache, key, identity, || {
+            copies += 1;
+            Ok(expected.clone())
+        })
+        .unwrap();
+        let up = nvidia_cuda13_shared_inputs_with(&mut cache, key, identity, || {
+            copies += 1;
+            Ok(expected.clone())
+        })
+        .unwrap();
+        assert_eq!(gate, expected);
+        assert_eq!(up, expected);
+        assert_eq!(copies, 1);
+        assert!(cache.is_empty());
+
+        nvidia_cuda13_shared_inputs_with(&mut cache, key, identity, || Ok(expected.clone()))
+            .unwrap();
+        let mut changed = identity;
+        changed.activation_pitch += 1;
+        assert!(
+            nvidia_cuda13_shared_inputs_with(&mut cache, key, changed, || { Ok(expected.clone()) })
+                .is_err()
+        );
     }
 
     impl crate::r#impl::iq1s_xrt::CapturedLaunchExecutor for FakeCapturedExecutor {

@@ -236,13 +236,7 @@ impl OpcodeDefinitions {
         }
         for idx in start..=groups.len() - remaining {
             current.push(groups[idx].clone());
-            Self::visit_modifier_group_combinations(
-                groups,
-                target_len,
-                idx + 1,
-                current,
-                visitor,
-            );
+            Self::visit_modifier_group_combinations(groups, target_len, idx + 1, current, visitor);
             current.pop();
         }
     }

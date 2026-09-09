@@ -93,10 +93,12 @@ pub(crate) fn tmatmul_backend_from_env() -> Result<Option<TmatmulBackend>, Strin
         .map(str::trim)
     {
         None | Some("") => Ok(None),
-        Some("cxl") => Ok(Some(TmatmulBackend::Cxl)),
+        Some("cxl" | "ia780i" | "hardware" | "hw" | "fpga") => {
+            Ok(Some(TmatmulBackend::Cxl))
+        }
         Some("xrt") => Ok(Some(TmatmulBackend::Xrt)),
         Some(value) => Err(format!(
-            "unsupported HETGPU_TMATMUL_BACKEND={value:?}; expected cxl or xrt"
+            "unsupported HETGPU_TMATMUL_BACKEND={value:?}; expected cxl, ia780i, hardware, hw, fpga, or xrt"
         )),
     }
 }
@@ -1066,6 +1068,18 @@ mod tests {
             tmatmul_backend_from_env().unwrap(),
             Some(TmatmulBackend::Xrt)
         );
+    }
+
+    #[test]
+    fn backend_env_maps_hardware_aliases_to_cxl() {
+        for alias in ["ia780i", "hardware", "hw", "fpga"] {
+            let _guard = EnvGuard::set(&[("HETGPU_TMATMUL_BACKEND", Some(alias))]);
+            assert_eq!(
+                tmatmul_backend_from_env().unwrap(),
+                Some(TmatmulBackend::Cxl),
+                "alias={alias}"
+            );
+        }
     }
 
     #[test]

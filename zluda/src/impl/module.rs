@@ -3383,9 +3383,7 @@ pub(crate) fn load_data(module: &mut CUmodule, image: *const std::ffi::c_void) -
         eprintln!("[NVIDIA Backend] Detected CUBIN/binary module");
         try_lift_nvidia_cubin_image(image)
     })
-    .map(|ptx| {
-        crate::r#impl::concordia_instrument::annotate_ptx_with_concordia_safe_points(&ptx)
-    });
+    .map(|ptx| crate::r#impl::concordia_instrument::annotate_ptx_with_concordia_safe_points(&ptx));
 
     // IMPORTANT: Register PTX source BEFORE loading with NVIDIA driver
     // This ensures PTX is available for checkpointing even if module loading fails
@@ -3633,7 +3631,10 @@ pub(crate) fn load_data(module: &mut CUmodule, image: *const std::ffi::c_void) -
     // Bind this CUDA module to the current logical SIFIVE device/context.
     let device = unsafe { sifive_runtime_sys::sifive_CreateDevice(device_id as u32) };
     if device.is_null() {
-        eprintln!("[SIFIVE Backend] Failed to create SIFIVE device {}", device_id);
+        eprintln!(
+            "[SIFIVE Backend] Failed to create SIFIVE device {}",
+            device_id
+        );
         return Err(CUerror::UNKNOWN);
     }
     if std::env::var("HETGPU_SIFIVE_LOG_PROGRAM_LOADS")

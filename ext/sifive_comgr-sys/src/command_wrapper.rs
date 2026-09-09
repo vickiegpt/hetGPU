@@ -214,7 +214,10 @@ pub fn perform_action(
     };
 
     if keep_action_tempdir() {
-        eprintln!("SIFIVE: keeping temporary directory {}", dir.path().display());
+        eprintln!(
+            "SIFIVE: keeping temporary directory {}",
+            dir.path().display()
+        );
     }
 
     let result = match action_kind.0 {
@@ -354,7 +357,8 @@ fn add_file_to_set(
         .unwrap_or_else(|| CString::new("output").unwrap());
     sifive_comgr_data_set_name(data, name.as_ptr())?;
 
-    let content = fs::read(file_path).map_err(|_| sifive_comgr_status_s::SIFIVE_COMGR_STATUS_ERROR)?;
+    let content =
+        fs::read(file_path).map_err(|_| sifive_comgr_status_s::SIFIVE_COMGR_STATUS_ERROR)?;
     sifive_comgr_data_set_bytes(data, content.as_ptr() as *const c_void, content.len())?;
     sifive_comgr_data_set_add(data_set, data)?;
     sifive_comgr_release_data(data)?;

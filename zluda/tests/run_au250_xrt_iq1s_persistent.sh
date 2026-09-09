@@ -105,7 +105,11 @@ summary = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert summary["status"] == "pass"
 assert summary["xclbin_uuid"] == sys.argv[2]
 assert summary["persistent_starts_per_cu"] == [1, 1, 1, 1]
-assert summary["ring_generations_per_cu"] == [[0, 1]] * 4
+assert len(summary["command_baselines_per_cu"]) == 4
+assert summary["ring_generations_per_cu"] == [
+    [baseline, baseline + 1]
+    for baseline in summary["command_baselines_per_cu"]
+]
 assert summary["per_cu_completions"] == [2, 2, 2, 2]
 assert summary["sticky_fault_codes"] == [0, 0, 0, 0]
 assert summary["quiescent_before_shutdown"] == [1, 1, 1, 1]

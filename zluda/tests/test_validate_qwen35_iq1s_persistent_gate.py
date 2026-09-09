@@ -395,6 +395,28 @@ def test_compact_persistent_ledger_rejects_every_missing_phase_field(tmp_path, f
     assert "tps" not in result.stdout.lower()
 
 
+def test_compact_persistent_ledger_rejects_progress_records(tmp_path):
+    root = tmp_path / "progress-is-not-proof"
+    write_bundle(root)
+    progress = {
+        "schema_version": 1,
+        "stage": "phase_collected",
+        "generation": 1,
+        "model_sha256": "0a" * 32,
+        "xclbin_sha256": "9c" * 32,
+        "transaction": 17,
+        "layer": 7,
+        "phase": "A",
+        "slot_generation": 3,
+    }
+    (root / "phase-ledger.jsonl").write_text(
+        json.dumps(progress, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    result = validate(root)
+    assert result.returncode != 0
+    assert "tps" not in result.stdout.lower()
+
+
 @pytest.mark.parametrize(
     "mutation",
     (

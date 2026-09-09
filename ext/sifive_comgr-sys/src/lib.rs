@@ -32,8 +32,10 @@ pub type sifive_comgr_language_t = sifive_comgr_language_s;
 
 impl sifive_comgr_language_s {
     pub const SIFIVE_COMGR_LANGUAGE_NONE: sifive_comgr_language_s = sifive_comgr_language_s(0);
-    pub const SIFIVE_COMGR_LANGUAGE_OPENCL_1_2: sifive_comgr_language_s = sifive_comgr_language_s(1);
-    pub const SIFIVE_COMGR_LANGUAGE_OPENCL_2_0: sifive_comgr_language_s = sifive_comgr_language_s(2);
+    pub const SIFIVE_COMGR_LANGUAGE_OPENCL_1_2: sifive_comgr_language_s =
+        sifive_comgr_language_s(1);
+    pub const SIFIVE_COMGR_LANGUAGE_OPENCL_2_0: sifive_comgr_language_s =
+        sifive_comgr_language_s(2);
     pub const SIFIVE_COMGR_LANGUAGE_SYCL: sifive_comgr_language_s = sifive_comgr_language_s(3);
     pub const SIFIVE_COMGR_LANGUAGE_LLVM_IR: sifive_comgr_language_s = sifive_comgr_language_s(4);
     pub const SIFIVE_COMGR_LANGUAGE_LAST: sifive_comgr_language_s = sifive_comgr_language_s(4);
@@ -47,16 +49,21 @@ pub type sifive_comgr_data_kind_t = sifive_comgr_data_kind_s;
 impl sifive_comgr_data_kind_s {
     pub const SIFIVE_COMGR_DATA_KIND_UNDEF: sifive_comgr_data_kind_s = sifive_comgr_data_kind_s(0);
     pub const SIFIVE_COMGR_DATA_KIND_SOURCE: sifive_comgr_data_kind_s = sifive_comgr_data_kind_s(1);
-    pub const SIFIVE_COMGR_DATA_KIND_INCLUDE: sifive_comgr_data_kind_s = sifive_comgr_data_kind_s(2);
+    pub const SIFIVE_COMGR_DATA_KIND_INCLUDE: sifive_comgr_data_kind_s =
+        sifive_comgr_data_kind_s(2);
     pub const SIFIVE_COMGR_DATA_KIND_PRECOMPILED_HEADER: sifive_comgr_data_kind_s =
         sifive_comgr_data_kind_s(3);
-    pub const SIFIVE_COMGR_DATA_KIND_DIAGNOSTIC: sifive_comgr_data_kind_s = sifive_comgr_data_kind_s(4);
+    pub const SIFIVE_COMGR_DATA_KIND_DIAGNOSTIC: sifive_comgr_data_kind_s =
+        sifive_comgr_data_kind_s(4);
     pub const SIFIVE_COMGR_DATA_KIND_LOG: sifive_comgr_data_kind_s = sifive_comgr_data_kind_s(5);
     pub const SIFIVE_COMGR_DATA_KIND_BC: sifive_comgr_data_kind_s = sifive_comgr_data_kind_s(6);
-    pub const SIFIVE_COMGR_DATA_KIND_RELOCATABLE: sifive_comgr_data_kind_s = sifive_comgr_data_kind_s(7);
-    pub const SIFIVE_COMGR_DATA_KIND_EXECUTABLE: sifive_comgr_data_kind_s = sifive_comgr_data_kind_s(8);
+    pub const SIFIVE_COMGR_DATA_KIND_RELOCATABLE: sifive_comgr_data_kind_s =
+        sifive_comgr_data_kind_s(7);
+    pub const SIFIVE_COMGR_DATA_KIND_EXECUTABLE: sifive_comgr_data_kind_s =
+        sifive_comgr_data_kind_s(8);
     pub const SIFIVE_COMGR_DATA_KIND_BYTES: sifive_comgr_data_kind_s = sifive_comgr_data_kind_s(9);
-    pub const SIFIVE_COMGR_DATA_KIND_FATBIN: sifive_comgr_data_kind_s = sifive_comgr_data_kind_s(16);
+    pub const SIFIVE_COMGR_DATA_KIND_FATBIN: sifive_comgr_data_kind_s =
+        sifive_comgr_data_kind_s(16);
     pub const SIFIVE_COMGR_DATA_KIND_LAST: sifive_comgr_data_kind_s = sifive_comgr_data_kind_s(16);
 }
 
@@ -140,13 +147,18 @@ pub type sifive_comgr_symbol_type_t = sifive_comgr_symbol_type_s;
 impl sifive_comgr_symbol_type_s {
     pub const SIFIVE_COMGR_SYMBOL_TYPE_UNKNOWN: sifive_comgr_symbol_type_s =
         sifive_comgr_symbol_type_s(-1);
-    pub const SIFIVE_COMGR_SYMBOL_TYPE_NOTYPE: sifive_comgr_symbol_type_s = sifive_comgr_symbol_type_s(0);
-    pub const SIFIVE_COMGR_SYMBOL_TYPE_OBJECT: sifive_comgr_symbol_type_s = sifive_comgr_symbol_type_s(1);
-    pub const SIFIVE_COMGR_SYMBOL_TYPE_FUNC: sifive_comgr_symbol_type_s = sifive_comgr_symbol_type_s(2);
+    pub const SIFIVE_COMGR_SYMBOL_TYPE_NOTYPE: sifive_comgr_symbol_type_s =
+        sifive_comgr_symbol_type_s(0);
+    pub const SIFIVE_COMGR_SYMBOL_TYPE_OBJECT: sifive_comgr_symbol_type_s =
+        sifive_comgr_symbol_type_s(1);
+    pub const SIFIVE_COMGR_SYMBOL_TYPE_FUNC: sifive_comgr_symbol_type_s =
+        sifive_comgr_symbol_type_s(2);
     pub const SIFIVE_COMGR_SYMBOL_TYPE_SECTION: sifive_comgr_symbol_type_s =
         sifive_comgr_symbol_type_s(3);
-    pub const SIFIVE_COMGR_SYMBOL_TYPE_FILE: sifive_comgr_symbol_type_s = sifive_comgr_symbol_type_s(4);
-    pub const SIFIVE_COMGR_SYMBOL_TYPE_COMMON: sifive_comgr_symbol_type_s = sifive_comgr_symbol_type_s(5);
+    pub const SIFIVE_COMGR_SYMBOL_TYPE_FILE: sifive_comgr_symbol_type_s =
+        sifive_comgr_symbol_type_s(4);
+    pub const SIFIVE_COMGR_SYMBOL_TYPE_COMMON: sifive_comgr_symbol_type_s =
+        sifive_comgr_symbol_type_s(5);
 }
 
 pub struct sifive_comgr_symbol_info_s(pub c_uint);
@@ -155,13 +167,18 @@ pub type sifive_comgr_symbol_info_t = sifive_comgr_symbol_info_s;
 impl sifive_comgr_symbol_info_s {
     pub const SIFIVE_COMGR_SYMBOL_INFO_NAME_LENGTH: sifive_comgr_symbol_info_s =
         sifive_comgr_symbol_info_s(0);
-    pub const SIFIVE_COMGR_SYMBOL_INFO_NAME: sifive_comgr_symbol_info_s = sifive_comgr_symbol_info_s(1);
-    pub const SIFIVE_COMGR_SYMBOL_INFO_TYPE: sifive_comgr_symbol_info_s = sifive_comgr_symbol_info_s(2);
-    pub const SIFIVE_COMGR_SYMBOL_INFO_SIZE: sifive_comgr_symbol_info_s = sifive_comgr_symbol_info_s(3);
+    pub const SIFIVE_COMGR_SYMBOL_INFO_NAME: sifive_comgr_symbol_info_s =
+        sifive_comgr_symbol_info_s(1);
+    pub const SIFIVE_COMGR_SYMBOL_INFO_TYPE: sifive_comgr_symbol_info_s =
+        sifive_comgr_symbol_info_s(2);
+    pub const SIFIVE_COMGR_SYMBOL_INFO_SIZE: sifive_comgr_symbol_info_s =
+        sifive_comgr_symbol_info_s(3);
     pub const SIFIVE_COMGR_SYMBOL_INFO_IS_UNDEFINED: sifive_comgr_symbol_info_s =
         sifive_comgr_symbol_info_s(4);
-    pub const SIFIVE_COMGR_SYMBOL_INFO_VALUE: sifive_comgr_symbol_info_s = sifive_comgr_symbol_info_s(5);
-    pub const SIFIVE_COMGR_SYMBOL_INFO_LAST: sifive_comgr_symbol_info_s = sifive_comgr_symbol_info_s(5);
+    pub const SIFIVE_COMGR_SYMBOL_INFO_VALUE: sifive_comgr_symbol_info_s =
+        sifive_comgr_symbol_info_s(5);
+    pub const SIFIVE_COMGR_SYMBOL_INFO_LAST: sifive_comgr_symbol_info_s =
+        sifive_comgr_symbol_info_s(5);
 }
 
 // Code object info
@@ -352,7 +369,9 @@ pub fn sifive_comgr_data_set_name(
     }
 }
 
-pub fn sifive_comgr_create_data_set(data_set: *mut sifive_comgr_data_set_t) -> sifive_comgr_status_t {
+pub fn sifive_comgr_create_data_set(
+    data_set: *mut sifive_comgr_data_set_t,
+) -> sifive_comgr_status_t {
     if data_set.is_null() {
         return Err(sifive_comgr_status_s::SIFIVE_COMGR_STATUS_ERROR_INVALID_ARGUMENT);
     }

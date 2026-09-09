@@ -97,7 +97,9 @@ pub(crate) fn library_get_kernel(
     library: CUlibrary,
     name: *const c_char,
 ) -> CUresult {
-    nvidia_status_to_cu_result(nvidia_runtime_sys::cuLibraryGetKernel(kernel, library, name))
+    nvidia_status_to_cu_result(nvidia_runtime_sys::cuLibraryGetKernel(
+        kernel, library, name,
+    ))
 }
 
 #[cfg(all(

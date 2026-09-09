@@ -2,6 +2,7 @@
 """Run one deterministic Qwen 3.5 TQ1 llama-server evaluation mode."""
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import math
@@ -11,6 +12,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -27,7 +29,7 @@ PROFILES = {
     },
     "full": {
         "request_count": 64,
-        "max_active": 16,
+        "max_active": 32,
         "tokens_per_request": 32,
         "measurements": 3,
         "warmups": 1,
@@ -39,9 +41,14 @@ REQUEST_COUNT = PROFILES["full"]["request_count"]
 MAX_ACTIVE_REQUESTS = PROFILES["full"]["max_active"]
 PREDICT_TOKENS = PROFILES["full"]["tokens_per_request"]
 PROMPT_TOKENS = 256
+PROMPT_TOKENS_BY_PROFILE = {"one-token": 16, "full": PROMPT_TOKENS}
 CONTEXT_TOKENS_PER_REQUEST = 512
 SERVER_CONTEXT_TOKENS = MAX_ACTIVE_REQUESTS * CONTEXT_TOKENS_PER_REQUEST
 SEMANTIC_PROMPT = "Reply with exactly OK and no other text."
+SEMANTIC_PROMPTS_BY_PROFILE = {
+    "one-token": "Reply OK.",
+    "full": SEMANTIC_PROMPT,
+}
 MODEL_SIZE = 94_155_830_880
 MODEL_SHA256 = "0a32c2702fbb61934960cfeef34524b81ec6d9267158f246d45fc86f5aaa7568"
 LLAMA_REVISION = "925e1179947ea0c0ebfb0032df18af3a729822be"
@@ -104,6 +111,19 @@ def atomic_json(path, value):
     os.replace(temporary, path)
 
 
+def atomic_stream_events(path, status, events, parser_error=None):
+    if path is None:
+        return
+    payload = {
+        "schema_version": 1,
+        "status": status,
+        "events": events,
+    }
+    if parser_error is not None:
+        payload["parser_error"] = parser_error
+    atomic_json(path, payload)
+
+
 def post_json(base_url, route, body, timeout):
     request = urllib.request.Request(
         base_url + route,
@@ -135,7 +155,7 @@ def wait_for_health(base_url, process, timeout):
     raise EvaluationError(f"llama-server did not become healthy: {last_error}")
 
 
-def stream_completion(base_url, body, timeout):
+def stream_completion(base_url, body, timeout, events_path=None):
     request = urllib.request.Request(
         base_url + "/completion",
         data=json.dumps(body).encode("utf-8"),
@@ -161,6 +181,13 @@ def stream_completion(base_url, body, timeout):
                     continue
                 event = json.loads(payload)
                 events.append(event)
+                error_payload = event.get("error")
+                if error_payload is not None:
+                    if isinstance(error_payload, dict):
+                        message = error_payload.get("message", json.dumps(error_payload, sort_keys=True))
+                    else:
+                        message = str(error_payload)
+                    raise EvaluationError(f"completion stream error: {message}")
                 content = event.get("content", "")
                 tokens = event.get("tokens", [])
                 is_prompt_progress = "prompt_progress" in event
@@ -173,15 +200,24 @@ def stream_completion(base_url, body, timeout):
                     token_ids.extend(tokens)
                 if event.get("stop") is True:
                     final = event
+    except EvaluationError as error:
+        atomic_stream_events(events_path, "error", events, str(error))
+        raise
     except (OSError, urllib.error.URLError, UnicodeError, json.JSONDecodeError) as error:
-        raise EvaluationError(f"/completion failed: {error}") from error
+        message = f"/completion failed: {error}"
+        atomic_stream_events(events_path, "error", events, message)
+        raise EvaluationError(message) from error
     finished = time.monotonic()
     if final is None or first_token is None:
-        raise EvaluationError("completion stream omitted final response or generated tokens")
+        message = "completion stream omitted final response or generated tokens"
+        atomic_stream_events(events_path, "error", events, message)
+        raise EvaluationError(message)
     timings = final.get("timings")
     if not isinstance(timings, dict):
-        raise EvaluationError("completion final response omitted timings")
-    return {
+        message = "completion final response omitted timings"
+        atomic_stream_events(events_path, "error", events, message)
+        raise EvaluationError(message)
+    result = {
         "text": "".join(text_parts),
         "token_ids": token_ids,
         "ttft_ms": (first_token - started) * 1000.0,
@@ -190,10 +226,13 @@ def stream_completion(base_url, body, timeout):
         "events": events,
         "tokens_predicted": final.get("tokens_predicted"),
         "tokens_evaluated": final.get("tokens_evaluated"),
+        "id_slot": final.get("id_slot"),
     }
+    atomic_stream_events(events_path, "pass", events)
+    return result
 
 
-def stream_completion_batch(base_url, body, batch_size, timeout):
+def stream_completion_batch(base_url, body, batch_size, timeout, events_path=None):
     request = urllib.request.Request(
         base_url + "/completion",
         data=json.dumps(body).encode("utf-8"),
@@ -205,6 +244,7 @@ def stream_completion_batch(base_url, body, batch_size, timeout):
         {"text": [], "token_ids": [], "first_token": None, "final": None, "finished": None}
         for _ in range(batch_size)
     ]
+    events = []
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             for raw_line in response:
@@ -217,6 +257,14 @@ def stream_completion_batch(base_url, body, batch_size, timeout):
                 if payload == "[DONE]":
                     continue
                 event = json.loads(payload)
+                events.append(event)
+                error_payload = event.get("error")
+                if error_payload is not None:
+                    if isinstance(error_payload, dict):
+                        message = error_payload.get("message", json.dumps(error_payload, sort_keys=True))
+                    else:
+                        message = str(error_payload)
+                    raise EvaluationError(f"batched completion stream error: {message}")
                 index = event.get("index")
                 if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < batch_size:
                     raise EvaluationError("batched completion event has an invalid index")
@@ -234,21 +282,32 @@ def stream_completion_batch(base_url, body, batch_size, timeout):
                 if event.get("stop") is True:
                     state["final"] = event
                     state["finished"] = time.monotonic()
+    except EvaluationError as error:
+        atomic_stream_events(events_path, "error", events, str(error))
+        raise
     except (OSError, urllib.error.URLError, UnicodeError, json.JSONDecodeError) as error:
-        raise EvaluationError(f"batched /completion failed: {error}") from error
+        message = f"batched /completion failed: {error}"
+        atomic_stream_events(events_path, "error", events, message)
+        raise EvaluationError(message) from error
     results = []
     for index, state in enumerate(states):
         final = state["final"]
         first_token = state["first_token"]
         finished = state["finished"]
         if final is None or first_token is None or finished is None:
-            raise EvaluationError(f"batched completion {index} omitted final response or generated tokens")
+            message = f"batched completion {index} omitted final response or generated tokens"
+            atomic_stream_events(events_path, "error", events, message)
+            raise EvaluationError(message)
         timings = final.get("timings")
         if not isinstance(timings, dict):
-            raise EvaluationError(f"batched completion {index} omitted timings")
+            message = f"batched completion {index} omitted timings"
+            atomic_stream_events(events_path, "error", events, message)
+            raise EvaluationError(message)
         id_slot = final.get("id_slot")
         if isinstance(id_slot, bool) or not isinstance(id_slot, int):
-            raise EvaluationError(f"batched completion {index} omitted its slot assignment")
+            message = f"batched completion {index} omitted its slot assignment"
+            atomic_stream_events(events_path, "error", events, message)
+            raise EvaluationError(message)
         results.append({
             "text": "".join(state["text"]),
             "token_ids": state["token_ids"],
@@ -260,17 +319,20 @@ def stream_completion_batch(base_url, body, batch_size, timeout):
             "id_slot": id_slot,
         })
     if sorted(result["id_slot"] for result in results) != list(range(batch_size)):
-        raise EvaluationError("batched completion did not use every server slot exactly once")
+        message = "batched completion did not use every server slot exactly once"
+        atomic_stream_events(events_path, "error", events, message)
+        raise EvaluationError(message)
+    atomic_stream_events(events_path, "pass", events)
     return results
 
 
-def exact_prompt(base_url, seed_path, timeout):
+def exact_prompt(base_url, seed_path, timeout, prompt_tokens=PROMPT_TOKENS):
     seed = Path(seed_path).read_text(encoding="utf-8")
     tokenized = post_json(base_url, "/tokenize", {"content": seed, "add_special": False}, timeout)
     tokens = tokenized.get("tokens")
-    if not isinstance(tokens, list) or len(tokens) < PROMPT_TOKENS:
-        raise EvaluationError("prompt seed cannot provide exactly 256 tokens")
-    selected = tokens[:PROMPT_TOKENS]
+    if not isinstance(tokens, list) or len(tokens) < prompt_tokens:
+        raise EvaluationError(f"prompt seed cannot provide exactly {prompt_tokens} tokens")
+    selected = tokens[:prompt_tokens]
     if any(isinstance(value, bool) or not isinstance(value, int) for value in selected):
         raise EvaluationError("prompt token IDs are not integers")
     detokenized = post_json(base_url, "/detokenize", {"tokens": selected}, timeout)
@@ -284,7 +346,9 @@ def exact_prompt(base_url, seed_path, timeout):
         timeout,
     ).get("tokens")
     if retokenized != selected:
-        raise EvaluationError("retokenized prompt does not exactly match the selected 256 token IDs")
+        raise EvaluationError(
+            f"retokenized prompt does not exactly match the selected {prompt_tokens} token IDs"
+        )
     return prompt_text, selected
 
 
@@ -316,21 +380,150 @@ def erase_all_slots(base_url, timeout, max_active=MAX_ACTIVE_REQUESTS):
     return erased
 
 
-def run_continuous_batch(base_url, request_body, timeout, profile=None):
+def _validate_completed_request(item, request_id, prompt_tokens, tokens_per_request):
+    tokens = item.get("token_ids", [])
+    if (
+        item.get("tokens_predicted") != tokens_per_request
+        or item.get("tokens_evaluated") != prompt_tokens
+        or len(tokens) != tokens_per_request
+        or any(isinstance(token, bool) or not isinstance(token, int) for token in tokens)
+    ):
+        raise EvaluationError(
+            f"continuous request {request_id} did not execute the fixed "
+            f"{prompt_tokens}+{tokens_per_request} workload"
+        )
+
+
+def _slot_refill_requests(base_url, request_body, timeout, profile, batch_started,
+                          events_dir, events_prefix):
+    """One request chain per slot; only that chain's completion permits reuse."""
+    max_active = profile["max_active"]
+    lock = threading.Lock()
+    stopped = threading.Event()
+    active = 0
+    events = []
+    erases = []
+
+    def record(kind, request_id, slot, delta):
+        nonlocal active
+        # Caller owns lock so admission and failure-stop have one ordering.
+        active += delta
+        events.append({"event": kind, "request_id": request_id, "id_slot": slot,
+                       "active": active,
+                       "elapsed_ms": (time.monotonic() - batch_started) * 1000.0})
+
+    def run_slot(slot):
+        completed = []
+        try:
+            for request_id in range(slot, profile["request_count"], max_active):
+                with lock:
+                    if stopped.is_set():
+                        return completed
+                    started = time.monotonic()
+                    record("admit", request_id, slot, 1)
+                body = dict(request_body, id_slot=slot)
+                path = None
+                if events_dir is not None and events_prefix is not None:
+                    path = Path(events_dir) / f"{events_prefix}-request-{request_id}-stream-events.json"
+                try:
+                    result = stream_completion(base_url, body, timeout, path)
+                    if type(result.get("id_slot")) is not int or result["id_slot"] != slot:
+                        raise EvaluationError(f"continuous request {request_id} returned the wrong slot")
+                    _validate_completed_request(result, request_id, len(body["prompt"]),
+                                                profile["tokens_per_request"])
+                except BaseException:
+                    with lock:
+                        stopped.set()
+                        record("error", request_id, slot, -1)
+                    raise
+                finished = time.monotonic()
+                with lock:
+                    record("complete", request_id, slot, -1)
+                item = {k: v for k, v in result.items() if k != "events"}
+                item.update(request_id=request_id,
+                            queue_ms=(started - batch_started) * 1000.0,
+                            service_ms=(finished - started) * 1000.0,
+                            completed_from_batch_start_ms=(finished - batch_started) * 1000.0)
+                completed.append(item)
+                if request_id + max_active < profile["request_count"] and not stopped.is_set():
+                    response = post_json(base_url, f"/slots/{slot}?action=erase", {}, timeout)
+                    if (type(response.get("id_slot")) is not int or response["id_slot"] != slot
+                            or type(response.get("n_erased")) is not int or response["n_erased"] < 0):
+                        raise EvaluationError(f"slot erase response for slot {slot} is invalid")
+                    with lock:
+                        erases.append({"id_slot": slot, "after_request_id": request_id,
+                                       "n_erased": response["n_erased"],
+                                       "elapsed_ms": (time.monotonic() - batch_started) * 1000.0})
+            return completed
+        except BaseException:
+            with lock:
+                stopped.set()
+            raise
+
+    requests = []
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_active) as pool:
+            futures = [pool.submit(run_slot, slot)
+                       for slot in range(min(max_active, profile["request_count"]))]
+            for future in concurrent.futures.as_completed(futures):
+                requests.extend(future.result())
+    finally:
+        # Also retain a failed admission timeline; it never constitutes a pass.
+        if events_dir is not None and events_prefix is not None:
+            atomic_json(Path(events_dir) / f"{events_prefix}-admission.json", {
+                "scheduler": "slot-refill", "status": "error" if stopped.is_set() else "pass",
+                "events": events, "slot_reuse_evidence": erases,
+            })
+    return requests, sorted(erases, key=lambda e: e["after_request_id"]), events
+
+
+def run_continuous_batch(
+    base_url,
+    request_body,
+    timeout,
+    profile=None,
+    events_dir=None,
+    events_prefix=None,
+    scheduler="waves",
+):
     profile = dict(PROFILES["full"] if profile is None else profile)
     request_count = profile["request_count"]
     max_active = profile["max_active"]
     tokens_per_request = profile["tokens_per_request"]
+    prompt_tokens = len(request_body["prompt"])
+    if scheduler not in ("waves", "slot-refill"):
+        raise EvaluationError("unknown request scheduler")
+    if any(type(value) is not int or value <= 0
+           for value in (request_count, max_active, tokens_per_request)) or max_active > 32:
+        raise EvaluationError("invalid request count or active slot bound (maximum 32)")
     batch_started = time.monotonic()
     requests = []
     wave_slot_erase_evidence = []
-    for wave_start in range(0, request_count, max_active):
+    slot_reuse_evidence = []
+    admission_events = []
+    if scheduler == "slot-refill":
+        requests, slot_reuse_evidence, admission_events = _slot_refill_requests(
+            base_url, request_body, timeout, profile, batch_started, events_dir, events_prefix,
+        )
+    for wave_start in range(0, request_count if scheduler == "waves" else 0, max_active):
         wave_stop = min(wave_start + max_active, request_count)
         active = wave_stop - wave_start
         wave_started = time.monotonic()
         body = dict(request_body)
         body["prompt"] = [request_body["prompt"] for _ in range(active)]
-        results = stream_completion_batch(base_url, body, active, timeout)
+        events_path = None
+        if events_dir is not None and events_prefix is not None:
+            wave_index = wave_start // max_active
+            events_path = (
+                Path(events_dir)
+                / f"{events_prefix}-wave-{wave_index}-stream-events.json"
+            )
+        if events_path is None:
+            results = stream_completion_batch(base_url, body, active, timeout)
+        else:
+            results = stream_completion_batch(
+                base_url, body, active, timeout, events_path
+            )
         for index, result in enumerate(results):
             request_id = wave_start + index
             item = dict(result)
@@ -350,14 +543,7 @@ def run_continuous_batch(base_url, request_body, timeout, profile=None):
     if [item["request_id"] for item in requests] != list(range(request_count)):
         raise EvaluationError("continuous batch request IDs are missing or duplicated")
     for item in requests:
-        if (
-            item.get("tokens_predicted") != tokens_per_request
-            or item.get("tokens_evaluated") != PROMPT_TOKENS
-            or len(item.get("token_ids", [])) != tokens_per_request
-        ):
-            raise EvaluationError(
-                f"continuous request {item['request_id']} did not execute the fixed 256+32 workload"
-            )
+        _validate_completed_request(item, item["request_id"], prompt_tokens, tokens_per_request)
     wall_seconds = batch_finished - batch_started
     if not math.isfinite(wall_seconds) or wall_seconds <= 0:
         raise EvaluationError("continuous batch wall time is not positive and finite")
@@ -368,6 +554,10 @@ def run_continuous_batch(base_url, request_body, timeout, profile=None):
     result = {
         "request_count": request_count,
         "max_active": max_active,
+        "wave_count": math.ceil(request_count / max_active) if scheduler == "waves" else 0,
+        "scheduler": scheduler,
+        "slot_reuse_evidence": slot_reuse_evidence,
+        "admission_events": admission_events,
         "tokens_per_request": tokens_per_request,
         "generated_tokens": generated_tokens,
         "wall_seconds": wall_seconds,
@@ -377,6 +567,49 @@ def run_continuous_batch(base_url, request_body, timeout, profile=None):
     if profile == PROFILES["full"]:
         result["aggregate_generated_tokens_per_second"] = throughput
     return result
+
+
+def enforce_aggregate_target(measurements, target_tps=28.0):
+    if len(measurements) != 3:
+        raise EvaluationError("full run omitted three measurements")
+    if not math.isfinite(target_tps) or target_tps <= 0:
+        raise EvaluationError("aggregate TPS target must be positive and finite")
+    max_wall_seconds = 2048.0 / target_tps
+    tps = []
+    for item in measurements:
+        scheduler = item.get("scheduler", "waves")
+        expected_waves = {"waves": 2, "slot-refill": 0}.get(scheduler)
+        if (expected_waves is None or item.get("generated_tokens") != 2048
+                or item.get("wave_count") != expected_waves):
+            raise EvaluationError(
+                "full run did not execute fixed 64x32 workload with a known scheduler"
+            )
+        value = item.get("generation_tokens_per_second")
+        wall_seconds = item.get("measured_wall_seconds")
+        if (
+            not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+            or not isinstance(wall_seconds, (int, float))
+            or not math.isfinite(wall_seconds)
+            or wall_seconds <= 0
+        ):
+            raise EvaluationError("full run contains invalid aggregate timing data")
+        if value < target_tps:
+            raise EvaluationError("full run is below the aggregate TPS target")
+        if wall_seconds > max_wall_seconds:
+            raise EvaluationError("full run exceeded the aggregate wall-time budget")
+        if not math.isclose(value, 2048.0 / wall_seconds, rel_tol=1e-9, abs_tol=1e-9):
+            raise EvaluationError("aggregate TPS does not equal generated tokens / measured wall time")
+        tps.append(value)
+    return {
+        "target_tps": target_tps,
+        "max_wall_seconds": max_wall_seconds,
+        "minimum_tps": min(tps),
+        "median_tps": statistics.median(tps),
+        "maximum_tps": max(tps),
+        "measurement_tps": tps,
+    }
 
 
 def semantic_completion_request(prompt):
@@ -391,12 +624,12 @@ def hardware_probe_request(prompt):
     return request
 
 
-def templated_semantic_prompt(base_url, timeout):
+def templated_semantic_prompt(base_url, timeout, instruction=SEMANTIC_PROMPT, max_tokens=None):
     response = post_json(
         base_url,
         "/apply-template",
         {
-            "messages": [{"role": "user", "content": SEMANTIC_PROMPT}],
+            "messages": [{"role": "user", "content": instruction}],
             "chat_template_kwargs": {"enable_thinking": False},
         },
         timeout,
@@ -404,6 +637,18 @@ def templated_semantic_prompt(base_url, timeout):
     prompt = response.get("prompt")
     if not isinstance(prompt, str) or not prompt:
         raise EvaluationError("apply-template omitted the semantic prompt")
+    if max_tokens is not None:
+        tokenized = post_json(
+            base_url,
+            "/tokenize",
+            {"content": prompt, "add_special": False},
+            timeout,
+        ).get("tokens")
+        if not isinstance(tokenized, list) or len(tokenized) > max_tokens:
+            actual = "invalid" if not isinstance(tokenized, list) else len(tokenized)
+            raise EvaluationError(
+                f"templated semantic prompt has {actual} tokens; limit is {max_tokens}"
+            )
     return prompt
 
 
@@ -1088,6 +1333,7 @@ def stop_process(process):
 def run(args):
     profile = {"name": args.profile, **PROFILES[args.profile]}
     profile_values = PROFILES[args.profile]
+    prompt_tokens = PROMPT_TOKENS_BY_PROFILE[args.profile]
     proof_dir = Path(args.proof_dir)
     proof_dir.mkdir(parents=True, exist_ok=False)
     model = Path(args.model)
@@ -1140,10 +1386,12 @@ def run(args):
     before_health = capture_health(args, proof_dir, "before")
     slot_save_path = proof_dir / "slot-state"
     slot_save_path.mkdir()
+    server_batch = 16 if args.profile == "one-token" else profile_values["max_active"]
     command = [
         str(server), "--model", str(model), "--ctx-size", str(profile_values["max_active"] * CONTEXT_TOKENS_PER_REQUEST), "--n-gpu-layers", "999",
         "--threads", str(args.threads), "--host", "127.0.0.1", "--port", str(args.port),
         "--seed", "42", "--parallel", str(profile_values["max_active"]), "--reasoning", "off", "--verbosity", "4",
+        "--batch-size", str(server_batch), "--ubatch-size", str(server_batch),
         "--cache-ram", "0", "--flash-attn", "on", "--no-cache-prompt", "--slot-save-path", str(slot_save_path),
         "--no-warmup", "--no-webui",
     ]
@@ -1178,15 +1426,23 @@ def run(args):
             process = subprocess.Popen(command, stdout=stdout, stderr=stderr, text=True, env=server_environment)
             base_url = f"http://127.0.0.1:{args.port}"
             wait_for_health(base_url, process, args.startup_timeout)
-            prompt_text, prompt_ids = exact_prompt(base_url, args.prompt_seed, args.request_timeout)
+            prompt_text, prompt_ids = exact_prompt(
+                base_url, args.prompt_seed, args.request_timeout, prompt_tokens
+            )
             (proof_dir / "prompt.txt").write_text(prompt_text, encoding="utf-8")
             atomic_json(proof_dir / "prompt-token-ids.json", prompt_ids)
 
-            semantic_prompt = templated_semantic_prompt(base_url, args.request_timeout)
+            semantic_prompt = templated_semantic_prompt(
+                base_url,
+                args.request_timeout,
+                SEMANTIC_PROMPTS_BY_PROFILE[args.profile],
+                prompt_tokens if args.profile == "one-token" else None,
+            )
             semantic_result = stream_completion(
                 base_url,
                 semantic_completion_request(semantic_prompt),
                 args.request_timeout,
+                proof_dir / "semantic-stream-events.json",
             )
             semantic_text = semantic_result["text"].strip()
             if semantic_text != "OK":
@@ -1200,6 +1456,7 @@ def run(args):
                 base_url,
                 hardware_probe_request(semantic_prompt),
                 args.request_timeout,
+                proof_dir / "hardware-probe-stream-events.json",
             )
             if len(hardware_probe["token_ids"]) != 2:
                 raise EvaluationError("hardware probe did not produce exactly two token IDs")
@@ -1244,20 +1501,36 @@ def run(args):
             timed_request = completion_request(prompt_ids, profile_values["tokens_per_request"])
             warmups = []
             slot_erase_evidence = []
-            for _ in range(profile_values["warmups"]):
+            for warmup_index in range(profile_values["warmups"]):
                 slot_erase_evidence.append(
                     erase_all_slots(base_url, args.request_timeout, profile_values["max_active"])
                 )
                 warmups.append(
-                    run_continuous_batch(base_url, timed_request, args.request_timeout, profile_values)
+                    run_continuous_batch(
+                        base_url,
+                        timed_request,
+                        args.request_timeout,
+                        profile_values,
+                        proof_dir,
+                        f"warmup-{warmup_index}",
+                        scheduler=args.scheduler,
+                    )
                 )
             measured = []
-            for _ in range(profile_values["measurements"]):
+            for measurement_index in range(profile_values["measurements"]):
                 slot_erase_evidence.append(
                     erase_all_slots(base_url, args.request_timeout, profile_values["max_active"])
                 )
                 measured.append(
-                    run_continuous_batch(base_url, timed_request, args.request_timeout, profile_values)
+                    run_continuous_batch(
+                        base_url,
+                        timed_request,
+                        args.request_timeout,
+                        profile_values,
+                        proof_dir,
+                        f"measurement-{measurement_index}",
+                        scheduler=args.scheduler,
+                    )
                 )
             generated_by_request = [
                 item["token_ids"] for item in measured[0]["requests"]
@@ -1349,6 +1622,8 @@ def run(args):
             "measured_wall_seconds": batch["wall_seconds"],
             "request_count": batch["request_count"],
             "max_active": batch["max_active"],
+            "wave_count": batch["wave_count"],
+            "scheduler": batch["scheduler"],
             "generated_tokens": batch["generated_tokens"],
         }
         if args.profile == "full":
@@ -1366,7 +1641,7 @@ def run(args):
         "llama_revision": args.llama_revision,
         "binary_sha256": args.binary_sha256,
         "placement": placement,
-        "prompt_tokens": PROMPT_TOKENS,
+        "prompt_tokens": prompt_tokens,
         "prompt_text": prompt_text,
         "prompt_token_ids": prompt_ids,
         "generated_token_ids": generated_by_request[0],
@@ -1377,6 +1652,12 @@ def run(args):
         "wave_slot_erase_evidence": [
             batch["wave_slot_erase_evidence"] for batch in warmups + measured
         ],
+        "scheduler": args.scheduler,
+        "scheduler_evidence": [{
+            "admission_events": batch["admission_events"],
+            "slot_reuse_evidence": batch["slot_reuse_evidence"],
+            "wall_seconds": batch["wall_seconds"],
+        } for batch in warmups + measured],
         "semantic": {"text": semantic_text, "token_ids": semantic_result["token_ids"]},
         "hardware_probe": {"token_ids": hardware_probe["token_ids"], "n_predict": 2},
         "sampled_ffn_comparison": sampled_ffn_comparison,
@@ -1625,7 +1906,7 @@ def render_iq1s_report(normalized, proof_path):
             "Both modes used the same verified GGUF and binary, full CUDA layer placement, "
             "a 512-token context, greedy seed-42 sampling, an exact 256-token timed prompt, "
             "and 32 generated tokens per request. Each mode used one 64-request warm-up and "
-            "three measured 64-request continuous batches with at most 16 active requests.",
+            "three measured 64-request continuous batches with at most 32 active requests.",
             "",
             "Hybrid intercepted only exact type-19 IQ1_S MMQ/MMVQ launches for the 141 eligible "
             "routed-expert tensors. CUDA retained attention, linear attention, routing, shared "
@@ -1781,6 +2062,7 @@ def parser():
         "--mode", choices=("cuda", "handwritten", "compiler"), required=True
     )
     result.add_argument("--profile", choices=tuple(PROFILES), required=True)
+    result.add_argument("--scheduler", choices=("waves", "slot-refill"), default="waves")
     result.add_argument("--evidence-kind", choices=("tq1", "iq1s"), default="tq1")
     result.add_argument("--server", required=True)
     result.add_argument("--model", required=True)

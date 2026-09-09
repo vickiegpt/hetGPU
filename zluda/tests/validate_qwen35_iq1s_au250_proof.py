@@ -16,6 +16,23 @@ LLAMA_REVISION = "925e1179947ea0c0ebfb0032df18af3a729822be"
 EXPERT_TYPES = {"IQ1_S": 141, "IQ2_XXS": 24, "IQ3_S": 4, "MXFP4": 11}
 MODES = ("cuda", "handwritten", "compiler")
 HYBRID_MODES = ("handwritten", "compiler")
+PROFILES = {
+    "one-token": {
+        "request_count": 1,
+        "max_active": 1,
+        "tokens_per_request": 1,
+        "measurements": 1,
+        "warmups": 0,
+    },
+    "full": {
+        "request_count": 64,
+        "max_active": 16,
+        "tokens_per_request": 32,
+        "measurements": 3,
+        "warmups": 1,
+    },
+}
+PROMPT_TOKENS_BY_PROFILE = {"one-token": 16, "full": 256}
 REQUEST_COUNT = 64
 MAX_ACTIVE = 16
 TOKENS_PER_REQUEST = 32
@@ -95,6 +112,20 @@ def _keys(value, keys, label):
     missing = [key for key in keys if key not in value]
     if missing:
         _fail(f"{label} missing keys: {', '.join(missing)}")
+
+
+def _validate_profile(value):
+    profile = _mapping(value, "profile")
+    fields = ("name", "request_count", "max_active", "tokens_per_request", "measurements", "warmups")
+    _keys(profile, fields, "profile")
+    if set(profile) != set(fields):
+        _fail("profile contains fields outside the fixed contract")
+    name = profile["name"]
+    if name not in PROFILES:
+        _fail("profile.name is not one-token or full")
+    expected = {"name": name, **PROFILES[name]}
+    _expect(profile, expected, "profile")
+    return dict(profile)
 
 
 def _sha(value, label, nonzero=False):
@@ -210,7 +241,7 @@ def _validate_artifacts(root):
     _sha(source_hash, "repository_diff_sha256", nonzero=True)
 
     xclbin = _read_text(root / "xclbin-info.txt")
-    for name in ("iq1s_layer_big_1", "iq1s_layer_big_2", "iq1s_layer_big_3", "iq1s_layer_small_1"):
+    for name in ("ternip_big_1", "ternip_big_2", "ternip_big_3", "ternip_small_1"):
         if f"Instance:        {name}" not in xclbin:
             _fail(f"xclbin topology is missing {name}")
     pcie = _read_text(root / "pcie-link.txt")
@@ -429,29 +460,41 @@ def _validate_ffn(mode, comparison):
     return comparison
 
 
-def _validate_measurements(mode, values):
+def _validate_measurements(mode, values, profile):
+    profile = _validate_profile(profile)
     values = _list(values, f"{mode}.measurements")
-    if len(values) != MEASUREMENT_COUNT:
-        _fail(f"{mode}.measurements must contain exactly three entries")
-    columns = {key: [] for key in TIMING_KEYS}
+    if len(values) != profile["measurements"]:
+        _fail(
+            f"{mode}.measurements must contain exactly {profile['measurements']} entries"
+        )
+    timing_keys = tuple(
+        key
+        for key in TIMING_KEYS
+        if profile["name"] == "full" or key != "generation_tokens_per_second"
+    )
+    columns = {key: [] for key in timing_keys}
     throughput = []
+    generated_tokens = profile["request_count"] * profile["tokens_per_request"]
     for index, raw in enumerate(values):
         item = _mapping(raw, f"{mode}.measurements[{index}]")
-        _keys(item, (*TIMING_KEYS, "request_count", "max_active", "generated_tokens"), f"{mode}.measurements[{index}]")
-        for key in TIMING_KEYS:
+        _keys(item, (*timing_keys, "request_count", "max_active", "generated_tokens"), f"{mode}.measurements[{index}]")
+        for key in timing_keys:
             columns[key].append(_number(item[key], f"{mode}.measurements[{index}].{key}", positive=key != "model_load_ms"))
-        _expect(item["request_count"], REQUEST_COUNT, f"{mode}.measurements[{index}].request_count")
+        _expect(item["request_count"], profile["request_count"], f"{mode}.measurements[{index}].request_count")
         active = _integer(item["max_active"], f"{mode}.measurements[{index}].max_active", 1)
-        if active > MAX_ACTIVE:
-            _fail(f"{mode}.measurements[{index}].max_active exceeds 16")
-        _expect(item["generated_tokens"], GENERATED_TOKENS, f"{mode}.measurements[{index}].generated_tokens")
-        computed = GENERATED_TOKENS / columns["measured_wall_seconds"][-1]
-        observed = columns["generation_tokens_per_second"][-1]
-        if not math.isclose(computed, observed, rel_tol=1e-9, abs_tol=1e-9):
-            _fail(f"{mode}.measurements[{index}] throughput does not equal 2048/wall_seconds")
-        if mode in HYBRID_MODES and computed < MIN_HYBRID_TOKENS_PER_SECOND:
-            _fail(f"{mode}.measurements[{index}] is below 15 aggregate generated tok/s")
-        throughput.append(computed)
+        if active > profile["max_active"]:
+            _fail(
+                f"{mode}.measurements[{index}].max_active exceeds {profile['max_active']}"
+            )
+        _expect(item["generated_tokens"], generated_tokens, f"{mode}.measurements[{index}].generated_tokens")
+        if profile["name"] == "full":
+            computed = generated_tokens / columns["measured_wall_seconds"][-1]
+            observed = columns["generation_tokens_per_second"][-1]
+            if not math.isclose(computed, observed, rel_tol=1e-9, abs_tol=1e-9):
+                _fail(f"{mode}.measurements[{index}] throughput does not equal 2048/wall_seconds")
+            if mode in HYBRID_MODES and computed < MIN_HYBRID_TOKENS_PER_SECOND:
+                _fail(f"{mode}.measurements[{index}] is below 15 aggregate generated tok/s")
+            throughput.append(computed)
     summaries = {}
     for key, column in columns.items():
         mean = statistics.fmean(column)
@@ -463,10 +506,61 @@ def _validate_measurements(mode, values):
     return summaries, throughput
 
 
+def _validate_refill_round(evidence, request_count, max_active, context):
+    evidence = _mapping(evidence, context)
+    events = _list(evidence.get("admission_events"), f"{context}.admission_events")
+    erases = _list(evidence.get("slot_reuse_evidence"), f"{context}.slot_reuse_evidence")
+    wall_ms = 1000 * _number(evidence.get("wall_seconds"), f"{context}.wall_seconds", positive=True)
+    if len(events) != 2 * request_count or len(erases) != max(0, request_count - max_active):
+        _fail(f"{context} missing admission/completion or slot erase evidence")
+    live, admissions, completions = {}, {}, {}
+    previous_ms = 0.0
+    for raw in events:
+        event = _mapping(raw, context)
+        request_id = _integer(event.get("request_id"), context, 0)
+        slot = _integer(event.get("id_slot"), context, 0)
+        elapsed = _number(event.get("elapsed_ms"), context)
+        if request_id >= request_count or slot != request_id % max_active:
+            _fail(f"{context} request/slot identity mismatch")
+        if not previous_ms <= elapsed <= wall_ms:
+            _fail(f"{context} event timestamp outside ordered measurement window")
+        previous_ms = elapsed
+        if event.get("event") == "admit":
+            if slot in live or request_id in admissions:
+                _fail(f"{context} duplicate admission or live slot reuse")
+            if request_id >= max_active and request_id - max_active not in completions:
+                _fail(f"{context} previous slot generation did not complete")
+            admissions[request_id] = elapsed
+            live[slot] = request_id
+        elif event.get("event") == "complete":
+            if live.get(slot) != request_id or request_id in completions:
+                _fail(f"{context} completion has no live owner")
+            completions[request_id] = elapsed
+            del live[slot]
+        else:
+            _fail(f"{context} failed or unknown admission event")
+        if _integer(event.get("active"), context, 0) != len(live) or len(live) > max_active:
+            _fail(f"{context} active request accounting mismatch")
+    if live or set(completions) != set(range(request_count)):
+        _fail(f"{context} incomplete request timeline")
+    erased = set()
+    for raw in erases:
+        item = _mapping(raw, context)
+        after = _integer(item.get("after_request_id"), context, 0)
+        slot = _integer(item.get("id_slot"), context, 0)
+        _integer(item.get("n_erased"), context, 0)
+        elapsed = _number(item.get("elapsed_ms"), context)
+        if after in erased or after + max_active >= request_count or slot != after % max_active:
+            _fail(f"{context} duplicate or wrong slot erase identity")
+        if not completions[after] <= elapsed <= admissions[after + max_active]:
+            _fail(f"{context} erase did not occur between slot generations")
+        erased.add(after)
+
+
 def _validate_mode(mode, record, audit_sha256):
     record = _mapping(record, mode)
     required = (
-        "schema_version", "evidence_kind", "mode", "model_size", "model_sha256",
+        "schema_version", "evidence_kind", "mode", "profile", "model_size", "model_sha256",
         "model_audit_sha256", "llama_revision", "binary_sha256", "placement",
         "prompt_tokens", "prompt_text", "prompt_token_ids", "generated_token_ids",
         "generated_token_ids_by_request", "token_equivalence_measurement",
@@ -479,6 +573,11 @@ def _validate_mode(mode, record, audit_sha256):
         "server_context_tokens",
     )
     _keys(record, required, mode)
+    profile = _validate_profile(record["profile"])
+    scheduler = record.get("scheduler", "waves")
+    if scheduler not in ("waves", "slot-refill"):
+        _fail(f"{mode} unknown scheduler")
+    prompt_tokens = PROMPT_TOKENS_BY_PROFILE[profile["name"]]
     _expect(record["schema_version"], 2, f"{mode}.schema_version")
     _expect(record["evidence_kind"], "iq1s", f"{mode}.evidence_kind")
     _expect(record["mode"], mode, f"{mode}.mode")
@@ -488,57 +587,72 @@ def _validate_mode(mode, record, audit_sha256):
     _expect(record["llama_revision"], LLAMA_REVISION, f"{mode}.llama_revision")
     binary = _sha(record["binary_sha256"], f"{mode}.binary_sha256", True)
     _expect(record["placement"], {"all_layers_on_gpu": True, "cpu_layers": 0}, f"{mode}.placement")
-    _expect(record["prompt_tokens"], 256, f"{mode}.prompt_tokens")
+    _expect(record["prompt_tokens"], prompt_tokens, f"{mode}.prompt_tokens")
     if not isinstance(record["prompt_text"], str) or not record["prompt_text"]:
         _fail(f"{mode}.prompt_text must be nonempty")
     prompt_ids = _list(record["prompt_token_ids"], f"{mode}.prompt_token_ids")
-    if len(prompt_ids) != 256 or any(isinstance(item, bool) or not isinstance(item, int) for item in prompt_ids):
-        _fail(f"{mode}.prompt_token_ids must contain 256 integers")
+    if len(prompt_ids) != prompt_tokens or any(isinstance(item, bool) or not isinstance(item, int) for item in prompt_ids):
+        _fail(f"{mode}.prompt_token_ids must contain {prompt_tokens} integers")
     generated = _list(record["generated_token_ids"], f"{mode}.generated_token_ids")
-    if len(generated) != TOKENS_PER_REQUEST:
-        _fail(f"{mode}.generated_token_ids must contain 32 IDs")
+    if len(generated) != profile["tokens_per_request"]:
+        _fail(f"{mode}.generated_token_ids must contain {profile['tokens_per_request']} IDs")
     by_request = _list(record["generated_token_ids_by_request"], f"{mode}.generated_token_ids_by_request")
-    if len(by_request) != REQUEST_COUNT:
-        _fail(f"{mode} must retain 64 deterministic request outputs")
+    if len(by_request) != profile["request_count"]:
+        _fail(f"{mode} must retain {profile['request_count']} deterministic request outputs")
     for index, item in enumerate(by_request):
         item = _list(item, f"{mode}.generated_token_ids_by_request[{index}]")
-        if len(item) != TOKENS_PER_REQUEST or any(isinstance(token, bool) or not isinstance(token, int) for token in item):
-            _fail(f"{mode}.generated_token_ids_by_request[{index}] must contain 32 integer IDs")
+        if len(item) != profile["tokens_per_request"] or any(isinstance(token, bool) or not isinstance(token, int) for token in item):
+            _fail(f"{mode}.generated_token_ids_by_request[{index}] must contain {profile['tokens_per_request']} integer IDs")
     _expect(generated, by_request[0], f"{mode}.generated_token_ids request-zero binding")
     _expect(record["token_equivalence_measurement"], 0, f"{mode}.token_equivalence_measurement")
     slot_ids = _list(record["slot_ids_by_request"], f"{mode}.slot_ids_by_request")
-    if len(slot_ids) != REQUEST_COUNT:
-        _fail(f"{mode}.slot_ids_by_request must contain 64 assignments")
-    for wave_start in range(0, REQUEST_COUNT, MAX_ACTIVE):
-        wave = slot_ids[wave_start:wave_start + MAX_ACTIVE]
-        if sorted(wave) != list(range(MAX_ACTIVE)):
-            _fail(f"{mode}.slot_ids_by_request wave {wave_start // MAX_ACTIVE} must be a slot permutation")
+    if len(slot_ids) != profile["request_count"]:
+        _fail(f"{mode}.slot_ids_by_request must contain {profile['request_count']} assignments")
+    for wave_start in range(0, profile["request_count"], profile["max_active"]):
+        wave = slot_ids[wave_start:wave_start + profile["max_active"]]
+        if sorted(wave) != list(range(len(wave))):
+            _fail(f"{mode}.slot_ids_by_request wave {wave_start // profile['max_active']} must be a slot permutation")
+    if scheduler == "slot-refill" and slot_ids != [i % profile["max_active"] for i in range(profile["request_count"])]:
+        _fail(f"{mode} refill request IDs must retain their recurrent slot")
     slot_erases = _list(record["slot_erase_evidence"], f"{mode}.slot_erase_evidence")
-    if len(slot_erases) != 1 + MEASUREMENT_COUNT:
-        _fail(f"{mode}.slot_erase_evidence must contain four pre-batch rounds")
+    expected_rounds = profile["warmups"] + profile["measurements"]
+    if len(slot_erases) != expected_rounds:
+        _fail(f"{mode}.slot_erase_evidence must contain {expected_rounds} pre-batch rounds")
     for round_index, values in enumerate(slot_erases):
         values = _list(values, f"{mode}.slot_erase_evidence[{round_index}]")
-        if len(values) != MAX_ACTIVE or any(_integer(value, f"{mode}.slot_erase_evidence[{round_index}]", 0) < 0 for value in values):
-            _fail(f"{mode}.slot_erase_evidence[{round_index}] must bind all 16 slots")
+        if len(values) != profile["max_active"] or any(_integer(value, f"{mode}.slot_erase_evidence[{round_index}]", 0) < 0 for value in values):
+            _fail(f"{mode}.slot_erase_evidence[{round_index}] must bind all {profile['max_active']} slots")
     wave_erases = _list(record["wave_slot_erase_evidence"], f"{mode}.wave_slot_erase_evidence")
-    if len(wave_erases) != 1 + MEASUREMENT_COUNT:
-        _fail(f"{mode}.wave_slot_erase_evidence must contain four batch rounds")
+    if len(wave_erases) != expected_rounds:
+        _fail(f"{mode}.wave_slot_erase_evidence must contain {expected_rounds} batch rounds")
+    if scheduler == "slot-refill":
+        rounds = _list(record.get("scheduler_evidence"), f"{mode}.scheduler_evidence")
+        if len(rounds) != expected_rounds or any(wave_erases):
+            _fail(f"{mode} refill must retain every round and no wave barrier")
+        for index, evidence in enumerate(rounds):
+            _validate_refill_round(evidence, profile["request_count"], profile["max_active"], f"{mode}.refill[{index}]")
+            if index >= profile["warmups"]:
+                measurement = record["measurements"][index - profile["warmups"]]
+                _expect(measurement.get("scheduler"), scheduler, f"{mode}.measurement scheduler")
+                _expect(measurement.get("wave_count"), 0, f"{mode}.measurement wave barriers")
+                _expect(measurement.get("measured_wall_seconds"), evidence["wall_seconds"], f"{mode}.refill wall binding")
     for batch_index, batch_erases in enumerate(wave_erases):
         batch_erases = _list(batch_erases, f"{mode}.wave_slot_erase_evidence[{batch_index}]")
-        if len(batch_erases) != (REQUEST_COUNT // MAX_ACTIVE) - 1:
-            _fail(f"{mode}.wave_slot_erase_evidence[{batch_index}] must contain three wave barriers")
+        wave_count = math.ceil(profile["request_count"] / profile["max_active"])
+        if len(batch_erases) != (wave_count - 1 if scheduler == "waves" else 0):
+            _fail(f"{mode}.wave_slot_erase_evidence[{batch_index}] must contain {wave_count - 1} wave barriers")
         for wave_index, values in enumerate(batch_erases):
             values = _list(values, f"{mode}.wave_slot_erase_evidence[{batch_index}][{wave_index}]")
-            if len(values) != MAX_ACTIVE or any(_integer(value, f"{mode}.wave_slot_erase_evidence[{batch_index}][{wave_index}]", 0) < 0 for value in values):
-                _fail(f"{mode}.wave_slot_erase_evidence[{batch_index}][{wave_index}] must bind all 16 slots")
-    _expect(record["request_count"], REQUEST_COUNT, f"{mode}.request_count")
-    _expect(record["max_active_requests"], MAX_ACTIVE, f"{mode}.max_active_requests")
-    _expect(record["generated_tokens_per_request"], TOKENS_PER_REQUEST, f"{mode}.generated_tokens_per_request")
+            if len(values) != profile["max_active"] or any(_integer(value, f"{mode}.wave_slot_erase_evidence[{batch_index}][{wave_index}]", 0) < 0 for value in values):
+                _fail(f"{mode}.wave_slot_erase_evidence[{batch_index}][{wave_index}] must bind all {profile['max_active']} slots")
+    _expect(record["request_count"], profile["request_count"], f"{mode}.request_count")
+    _expect(record["max_active_requests"], profile["max_active"], f"{mode}.max_active_requests")
+    _expect(record["generated_tokens_per_request"], profile["tokens_per_request"], f"{mode}.generated_tokens_per_request")
     _expect(record["context_tokens_per_request"], CONTEXT_TOKENS_PER_REQUEST, f"{mode}.context_tokens_per_request")
-    _expect(record["server_context_tokens"], SERVER_CONTEXT_TOKENS, f"{mode}.server_context_tokens")
-    _expect(record["warmup_count"], 1, f"{mode}.warmup_count")
+    _expect(record["server_context_tokens"], profile["max_active"] * CONTEXT_TOKENS_PER_REQUEST, f"{mode}.server_context_tokens")
+    _expect(record["warmup_count"], profile["warmups"], f"{mode}.warmup_count")
     expected_contract = {
-        "prompt": prompt_ids, "n_predict": 32, "temperature": 0.0, "seed": 42,
+        "prompt": prompt_ids, "n_predict": profile["tokens_per_request"], "temperature": 0.0, "seed": 42,
         "ignore_eos": True, "cache_prompt": False, "return_tokens": True, "stream": True,
         "timings_per_token": True, "return_progress": True,
     }
@@ -575,9 +689,10 @@ def _validate_mode(mode, record, audit_sha256):
             _fail(f"{mode} final evidence does not include its semantic hardware gate")
         gate_result = {"routes": gate_routes, "xrt": gate_xrt}
     comparison = _validate_ffn(mode, record["sampled_ffn_comparison"])
-    metrics, throughput = _validate_measurements(mode, record["measurements"])
+    metrics, throughput = _validate_measurements(mode, record["measurements"], profile)
     return {
-        "binary_sha256": binary, "prompt_text": record["prompt_text"],
+        "scheduler": scheduler,
+        "binary_sha256": binary, "profile": profile, "prompt_text": record["prompt_text"],
         "prompt_token_ids": prompt_ids, "generated_token_ids": generated,
         "generated_token_ids_by_request": by_request,
         "slot_ids_by_request": slot_ids,
@@ -600,7 +715,7 @@ def validate_proof(proof_root):
     reference = modes["cuda"]
     for mode in HYBRID_MODES:
         current = modes[mode]
-        for field in ("prompt_text", "prompt_token_ids", "generated_token_ids", "generated_token_ids_by_request", "slot_erase_evidence", "wave_slot_erase_evidence", "semantic_token_ids", "probe_token_ids"):
+        for field in ("scheduler", "profile", "prompt_text", "prompt_token_ids", "generated_token_ids", "generated_token_ids_by_request", "slot_erase_evidence", "wave_slot_erase_evidence", "semantic_token_ids", "probe_token_ids"):
             _expect(current[field], reference[field], f"{mode}.{field} CUDA equivalence")
     _expect(modes["handwritten"]["routes"]["eligible_kernels"], modes["compiler"]["routes"]["eligible_kernels"], "hybrid eligible launch set")
     handwritten_semantics = {item["trace_semantic_sha256"] for item in modes["handwritten"]["xrt"]["physical_completions"]}
@@ -610,7 +725,7 @@ def validate_proof(proof_root):
     for mode in MODES:
         item = modes[mode]
         normalized_modes[mode] = {
-            "measurements": MEASUREMENT_COUNT, "metrics": item["metrics"],
+            "profile": item["profile"], "measurements": item["profile"]["measurements"], "metrics": item["metrics"],
             "measured_throughput": item["measured_throughput"], "routes": item["routes"],
             "xrt": item["xrt"], "gpu_attention_routes": item["gpu_attention_routes"],
             "sampled_ffn_comparison": item["sampled_ffn_comparison"],

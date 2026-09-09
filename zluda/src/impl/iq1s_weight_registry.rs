@@ -699,9 +699,17 @@ mod tests {
         let files = [tensor_file(0x31), tensor_file(0x32), tensor_file(0x33)];
         let registry = Iq1sWeightRegistry::default();
         for (file, name, role) in [
-            (&files[0], "blk.9.ffn_down_exps.weight", Iq1sExpertRole::Down),
+            (
+                &files[0],
+                "blk.9.ffn_down_exps.weight",
+                Iq1sExpertRole::Down,
+            ),
             (&files[1], "blk.2.ffn_up_exps.weight", Iq1sExpertRole::Up),
-            (&files[2], "blk.2.ffn_gate_exps.weight", Iq1sExpertRole::Gate),
+            (
+                &files[2],
+                "blk.2.ffn_gate_exps.weight",
+                Iq1sExpertRole::Gate,
+            ),
         ] {
             registry.register(registration(file, name, role)).unwrap();
         }

@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 2456f7dcc..a9fe419b1 100644
+index 2456f7dcc..c35f5e5c5 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -69,6 +69,7 @@
@@ -22,7 +22,7 @@ index 2456f7dcc..a9fe419b1 100644
  #include <cfloat>
  #include <initializer_list>
  #include <limits>
-@@ -90,13 +96,424 @@
+@@ -90,13 +96,455 @@
  #include <string>
  #include <vector>
 
@@ -103,6 +103,7 @@ index 2456f7dcc..a9fe419b1 100644
 +    const float * route_weights = nullptr;
 +    size_t route_weight_count = 0;
 +    uint32_t * token_ids_device = nullptr;
++    int32_t * expert_ids_device = nullptr;
 +};
 +
 +static std::mutex hetgpu_iq1s_streams_lock;
@@ -228,6 +229,20 @@ index 2456f7dcc..a9fe419b1 100644
 +    }
 +}
 +
++static bool hetgpu_iq1s_try_close_gpu_down(hetgpu_iq1s_stream_state & state) {
++    if (state.transaction == 0 || !state.phase_a_committed || state.down_seen) {
++        return false;
++    }
++    const auto & hooks = hetgpu_iq1s_hooks();
++    const int commit_result = hooks.commit(HETGPU_IQ1S_LAYER_ABI_VERSION, state.transaction);
++    if (commit_result != HETGPU_IQ1S_HANDLED) {
++        return false;
++    }
++    hetgpu_iq1s_clear_transaction(state);
++    hetgpu_iq1s_active_stream = nullptr;
++    return true;
++}
++
 +static void hetgpu_iq1s_note_route_weights(cudaStream_t stream, const ggml_tensor * tensor) {
 +    if (!hetgpu_tq1_env_is_one("HETGPU_QWEN_IQ1S_STRICT")) {
 +        return;
@@ -241,7 +256,8 @@ index 2456f7dcc..a9fe419b1 100644
 +    }
 +    std::lock_guard<std::mutex> guard(hetgpu_iq1s_streams_lock);
 +    auto & state = hetgpu_iq1s_streams[reinterpret_cast<void *>(stream)];
-+    if (state.transaction != 0 && state.layer != layer) {
++    if (state.transaction != 0 && state.layer != layer &&
++        !hetgpu_iq1s_try_close_gpu_down(state)) {
 +        hetgpu_iq1s_fail_locked(state, 2, "IQ1_S layer changed before the prior transaction closed");
 +    }
 +    state.route_layer = layer;
@@ -249,10 +265,11 @@ index 2456f7dcc..a9fe419b1 100644
 +    state.route_weight_count = ggml_nelements(tensor);
 +}
 +
++constexpr uint32_t max_batch = 32;
++constexpr uint32_t top_k = 10;
++
 +static void hetgpu_iq1s_ensure_token_ids(
 +        hetgpu_iq1s_stream_state & state, cudaStream_t stream) {
-+    constexpr uint32_t max_batch = 16;
-+    constexpr uint32_t top_k = 10;
 +    if (state.token_ids_device != nullptr) {
 +        return;
 +    }
@@ -275,6 +292,11 @@ index 2456f7dcc..a9fe419b1 100644
 +    if (copy_error != cudaSuccess) {
 +        GGML_ABORT("failed to upload IQ1_S positional route IDs: %s", cudaGetErrorString(copy_error));
 +    }
++    const cudaError_t expert_alloc_error = cudaMalloc(
++        reinterpret_cast<void **>(&state.expert_ids_device), max_batch * top_k * sizeof(int32_t));
++    if (expert_alloc_error != cudaSuccess) {
++        GGML_ABORT("failed to allocate IQ1_S packed expert IDs: %s", cudaGetErrorString(expert_alloc_error));
++    }
 +}
 +
 +static hetgpu_iq1s_projection_role hetgpu_iq1s_before_projection(
@@ -283,14 +305,16 @@ index 2456f7dcc..a9fe419b1 100644
 +    const ggml_tensor * ids = dst->src[2];
 +    uint32_t layer = UINT32_MAX;
 +    hetgpu_iq1s_projection_role role = hetgpu_iq1s_projection_role::none;
++    constexpr size_t top_k_bytes = top_k * sizeof(int32_t);
 +    if (!hetgpu_tq1_env_is_one("HETGPU_QWEN_IQ1S_STRICT") || src0->type != GGML_TYPE_IQ1_S ||
 +        !hetgpu_iq1s_parse_projection(src0->name, layer, role)) {
 +        return hetgpu_iq1s_projection_role::none;
 +    }
 +    if (ids == nullptr || ids->type != GGML_TYPE_I32 || ids->data == nullptr ||
-+        ids->ne[0] != 10 || ids->ne[1] < 1 || ids->ne[1] > 16 ||
-+        ids->nb[0] != sizeof(int32_t) || ids->nb[1] != 10 * sizeof(int32_t)) {
-+        GGML_ABORT("strict HetGPU IQ1_S requires contiguous top-10 IDs for 1..16 tokens");
++        ids->ne[0] != top_k || ids->ne[1] < 1 || ids->ne[1] > max_batch ||
++        ids->ne[2] != 1 || ids->ne[3] != 1 ||
++        ids->nb[0] != sizeof(int32_t) || ids->nb[1] < top_k_bytes) {
++        GGML_ABORT("strict HetGPU IQ1_S requires strided top-10 IDs for 1..32 tokens");
 +    }
 +
 +    cudaStream_t stream = ctx.stream();
@@ -317,6 +341,13 @@ index 2456f7dcc..a9fe419b1 100644
 +            GGML_ABORT("strict HetGPU IQ1_S v2 lifecycle hooks are unavailable");
 +        }
 +        hetgpu_iq1s_ensure_token_ids(state, stream);
++        const cudaError_t pack_error = cudaMemcpy2DAsync(
++            state.expert_ids_device, top_k_bytes,
++            ids->data, ids->nb[1], top_k_bytes, static_cast<size_t>(ids->ne[1]),
++            cudaMemcpyDeviceToDevice, stream);
++        if (pack_error != cudaSuccess) {
++            GGML_ABORT("failed to pack IQ1_S top-10 expert IDs: %s", cudaGetErrorString(pack_error));
++        }
 +        const uint64_t transaction = hetgpu_iq1s_next_transaction.fetch_add(1, std::memory_order_relaxed);
 +        if (transaction == 0) {
 +            GGML_ABORT("HetGPU IQ1_S transaction counter overflow");
@@ -332,7 +363,7 @@ index 2456f7dcc..a9fe419b1 100644
 +        hetgpu_iq1s_active_stream = stream_key;
 +        const int set_routes_result = hooks.set_routes(
 +            HETGPU_IQ1S_LAYER_ABI_VERSION, transaction, state.token_ids_device,
-+            static_cast<const int32_t *>(ids->data), state.route_weights, 10);
++            static_cast<const int32_t *>(state.expert_ids_device), state.route_weights, 10);
 +        if (set_routes_result != HETGPU_IQ1S_HANDLED) {
 +            hetgpu_iq1s_fail_locked(state, 4, "HetGPU IQ1_S set-routes hook failed");
 +        }
@@ -414,7 +445,7 @@ index 2456f7dcc..a9fe419b1 100644
 +    }
 +    std::lock_guard<std::mutex> guard(hetgpu_iq1s_streams_lock);
 +    for (auto & entry : hetgpu_iq1s_streams) {
-+        if (entry.second.transaction != 0) {
++        if (entry.second.transaction != 0 && !hetgpu_iq1s_try_close_gpu_down(entry.second)) {
 +            hetgpu_iq1s_abort_checked(entry.second, 13);
 +            GGML_ABORT("IQ1_S graph %s found an incomplete layer transaction", boundary);
 +        }
@@ -447,7 +478,7 @@ index 2456f7dcc..a9fe419b1 100644
      int id = -1; // in case cudaGetDevice fails
      (void)cudaGetDevice(&id);
 
-@@ -882,6 +1299,24 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
+@@ -882,6 +1315,24 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
      return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
  }
 
@@ -472,7 +503,7 @@ index 2456f7dcc..a9fe419b1 100644
  static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
      ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
-@@ -929,7 +1364,7 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
+@@ -929,7 +1380,7 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
      /* .get_name         = */ ggml_backend_cuda_buffer_type_get_name,
      /* .alloc_buffer     = */ ggml_backend_cuda_buffer_type_alloc_buffer,
      /* .get_alignment    = */ ggml_backend_cuda_buffer_type_get_alignment,
@@ -481,7 +512,7 @@ index 2456f7dcc..a9fe419b1 100644
      /* .get_alloc_size   = */ ggml_backend_cuda_buffer_type_get_alloc_size,
      /* .is_host          = */ NULL,
  };
-@@ -1788,6 +2223,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+@@ -1788,6 +2239,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
      ggml_tensor *       src0 = tensor->src[0];
      ggml_tensor *       src1 = tensor->src[1];
      const ggml_tensor * dst  = tensor;
@@ -492,7 +523,7 @@ index 2456f7dcc..a9fe419b1 100644
 
      const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                     ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
-@@ -1905,6 +2344,66 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -1905,6 +2360,66 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
      const ggml_tensor * src1 = dst->src[1];
      const ggml_tensor * ids  = dst->src[2];
 
@@ -559,7 +590,7 @@ index 2456f7dcc..a9fe419b1 100644
      GGML_ASSERT(src1->type == GGML_TYPE_F32);
      GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
-@@ -2250,7 +2749,21 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2250,7 +2765,21 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
              ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
              break;
          case GGML_OP_MUL_MAT_ID:
@@ -582,7 +613,7 @@ index 2456f7dcc..a9fe419b1 100644
              break;
          case GGML_OP_OUT_PROD:
              ggml_cuda_out_prod(ctx, dst);
-@@ -2412,6 +2925,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2412,6 +2941,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          CUDA_CHECK(err);
      }
 
@@ -591,7 +622,7 @@ index 2456f7dcc..a9fe419b1 100644
      return true;
  }
 
-@@ -2548,6 +3063,11 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
+@@ -2548,6 +3079,11 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
  static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
      bool use_cuda_graph = true;
@@ -603,7 +634,7 @@ index 2456f7dcc..a9fe419b1 100644
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
      for (int i = 0; i < cgraph->n_nodes; i++) {
-@@ -3276,6 +3796,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -3276,6 +3812,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -615,7 +646,7 @@ index 2456f7dcc..a9fe419b1 100644
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
      if (disable_fusion) {
          return 0;
-@@ -4248,6 +4773,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4248,6 +4789,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
      ggml_cuda_set_device(cuda_ctx->device);
@@ -623,7 +654,7 @@ index 2456f7dcc..a9fe419b1 100644
 
      bool use_cuda_graph             = false;
      bool cuda_graph_update_required = false;
-@@ -4298,7 +4824,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4298,7 +4840,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
          CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
      }
 

@@ -39,6 +39,7 @@ typedef void (*register_function_fn)(
 typedef cudaError_t (*launch_kernel_fn)(
     const void *, dim3, dim3, void **, size_t, cudaStream_t);
 typedef cudaError_t (*launch_kernel_ex_fn)(const cudaLaunchConfig_t *, const void *, void **);
+typedef cudaError_t (*func_get_name_fn)(const char **, const void *);
 typedef int (*launch_named_fn)(
     const char *,
     unsigned int,
@@ -113,6 +114,37 @@ static const char *registered_name(const void *host_function) {
     return name;
 }
 
+static const char *resolve_function_name_with(
+    const void *function,
+    func_get_name_fn runtime_lookup) {
+    const char *name = registered_name(function);
+    if (name || !runtime_lookup) {
+        return name;
+    }
+    const char *runtime_name = NULL;
+    if (runtime_lookup(&runtime_name, function) != 0 || !runtime_name || !runtime_name[0]) {
+        return NULL;
+    }
+    remember_function(function, runtime_name);
+    return registered_name(function);
+}
+
+static const char *resolve_function_name(const void *function) {
+    static func_get_name_fn runtime_lookup;
+    if (!runtime_lookup) {
+        runtime_lookup = (func_get_name_fn)resolve_next("cudaFuncGetName");
+    }
+    return resolve_function_name_with(function, runtime_lookup);
+}
+
+#ifdef HETGPU_QWEN35_LAUNCH_SHIM_TEST
+const char *hetgpu_qwen35_resolve_function_name_for_test(
+    const void *function,
+    func_get_name_fn runtime_lookup) {
+    return resolve_function_name_with(function, runtime_lookup);
+}
+#endif
+
 static int env_enabled(const char *name) {
     const char *value = getenv(name);
     return value && value[0] && strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 &&
@@ -129,7 +161,7 @@ static cudaError_t try_named_launch(
     if (!env_enabled("HETGPU_CUDART_PRELAUNCH_NAMED_KERNEL")) {
         return 1;
     }
-    const char *name = registered_name(function);
+    const char *name = resolve_function_name(function);
     if (!name) {
         return 1;
     }

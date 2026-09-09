@@ -13,6 +13,7 @@ use std::time::UNIX_EPOCH;
 pub(crate) const ARENA_BANK_COUNT: usize = 4;
 pub(crate) const ARENA_ALIGNMENT: u64 = 4 * 1024;
 pub(crate) const ARENA_SUPERBLOCK_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const ARENA_STAGING_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const ARENA_BANK_CAPACITY_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub(crate) const ARENA_EXPECTED_TENSORS: usize = 141;
 pub(crate) const ARENA_EXPECTED_EXPERTS: u64 = 512;
@@ -757,7 +758,7 @@ pub(crate) fn load_arena<B: ArenaBackend>(
                 .checked_sub(superblock_start)
                 .ok_or("IQ1_S arena superblock start exceeds its shards")?;
             if span_bytes > ARENA_SUPERBLOCK_BYTES {
-                return Err("IQ1_S arena shard crosses a 512 MiB superblock".to_string());
+                return Err("IQ1_S arena shard crosses its device superblock".to_string());
             }
             let mut staging = vec![
                 0u8;
@@ -823,20 +824,28 @@ fn validate_persistent_plan(plan: &ArenaPlan) -> Result<(), String> {
 
 fn persistent_chunk_blueprint(
     bank: u8,
-    superblock: u16,
+    logical_offset: u64,
     shards: &mut [&ArenaShard],
 ) -> Result<ArenaChunkSpec, String> {
     if shards.is_empty() {
         return Err("persistent IQ1_S chunk has no arena shards".to_string());
     }
+    if logical_offset % ARENA_ALIGNMENT != 0 {
+        return Err("persistent IQ1_S staging chunk offset is not aligned".to_string());
+    }
     shards.sort_by_key(|shard| shard.offset);
-    let start = u64::from(superblock)
+    let superblock = u16::try_from(logical_offset / ARENA_SUPERBLOCK_BYTES)
+        .map_err(|_| "persistent IQ1_S chunk superblock does not fit u16")?;
+    let superblock_start = u64::from(superblock)
         .checked_mul(ARENA_SUPERBLOCK_BYTES)
         .ok_or("persistent IQ1_S chunk start overflow")?;
-    let limit = start
+    let superblock_limit = superblock_start
         .checked_add(ARENA_SUPERBLOCK_BYTES)
         .ok_or("persistent IQ1_S chunk limit overflow")?;
-    let mut cursor = start;
+    let staging_limit = logical_offset
+        .checked_add(ARENA_STAGING_CHUNK_BYTES)
+        .ok_or("persistent IQ1_S staging chunk limit overflow")?;
+    let mut cursor = logical_offset;
     let mut specs = Vec::with_capacity(shards.len());
     for shard in shards {
         if shard.bank != bank || shard.superblock != superblock {
@@ -853,8 +862,11 @@ fn persistent_chunk_blueprint(
             .offset
             .checked_add(shard.bytes)
             .ok_or("persistent IQ1_S shard end overflow")?;
-        if cursor > limit {
-            return Err("persistent IQ1_S chunk exceeds 512 MiB".to_string());
+        if cursor > superblock_limit {
+            return Err("persistent IQ1_S chunk crosses its device superblock".to_string());
+        }
+        if cursor > staging_limit {
+            return Err("persistent IQ1_S chunk exceeds the 64 MiB staging bound".to_string());
         }
         let role = match shard.tensor.role {
             Iq1sExpertRole::Gate => IQ1S_ROLE_GATE as u16,
@@ -877,14 +889,14 @@ fn persistent_chunk_blueprint(
             sha256: shard.sha256,
         });
     }
-    let bytes = usize::try_from(cursor - start)
+    let bytes = usize::try_from(cursor - logical_offset)
         .map_err(|_| "persistent IQ1_S chunk bytes do not fit usize")?;
-    if bytes == 0 || bytes as u64 > ARENA_SUPERBLOCK_BYTES {
+    if bytes == 0 || bytes as u64 > ARENA_STAGING_CHUNK_BYTES {
         return Err("persistent IQ1_S chunk has an invalid byte count".to_string());
     }
     Ok(ArenaChunkSpec {
         bank,
-        logical_offset: start,
+        logical_offset,
         bytes,
         sha256: [0; 32],
         shards: specs,
@@ -914,8 +926,32 @@ fn persistent_chunk_blueprints(plan: &ArenaPlan) -> Result<Vec<ArenaChunkSpec>, 
     }
 
     let mut chunks = Vec::with_capacity(grouped.len());
-    for ((bank, superblock), mut shards) in grouped {
-        chunks.push(persistent_chunk_blueprint(bank, superblock, &mut shards)?);
+    for ((bank, _superblock), mut shards) in grouped {
+        shards.sort_by_key(|shard| shard.offset);
+        let mut begin = 0usize;
+        while begin < shards.len() {
+            let logical_offset = shards[begin].offset;
+            let mut end = begin + 1;
+            while end < shards.len() {
+                let candidate_end = shards[end]
+                    .offset
+                    .checked_add(shards[end].bytes)
+                    .ok_or("persistent IQ1_S staging candidate overflow")?;
+                let candidate_bytes = candidate_end
+                    .checked_sub(logical_offset)
+                    .ok_or("persistent IQ1_S staging candidate precedes its chunk")?;
+                if candidate_bytes > ARENA_STAGING_CHUNK_BYTES {
+                    break;
+                }
+                end += 1;
+            }
+            chunks.push(persistent_chunk_blueprint(
+                bank,
+                logical_offset,
+                &mut shards[begin..end],
+            )?);
+            begin = end;
+        }
     }
     chunks.sort_by_key(|chunk| (chunk.bank, chunk.logical_offset));
     Ok(chunks)
@@ -927,21 +963,30 @@ fn assemble_persistent_chunk(
     chunk: &ArenaChunkSpec,
     verify_chunk_hash: bool,
 ) -> Result<Vec<u8>, String> {
-    if chunk.bytes == 0 || chunk.bytes as u64 > ARENA_SUPERBLOCK_BYTES {
-        return Err("persistent IQ1_S chunk exceeds the 512 MiB staging bound".to_string());
+    if chunk.bytes == 0 || chunk.bytes as u64 > ARENA_STAGING_CHUNK_BYTES {
+        return Err("persistent IQ1_S chunk exceeds the staging chunk bound".to_string());
     }
     validate_persistent_plan(plan)?;
-    if chunk.logical_offset % ARENA_SUPERBLOCK_BYTES != 0 {
-        return Err("persistent IQ1_S chunk offset is not superblock aligned".to_string());
+    if chunk.logical_offset % ARENA_ALIGNMENT != 0 {
+        return Err("persistent IQ1_S staging chunk offset is not aligned".to_string());
     }
-    let superblock = u16::try_from(chunk.logical_offset / ARENA_SUPERBLOCK_BYTES)
-        .map_err(|_| "persistent IQ1_S chunk superblock does not fit u16")?;
+    let chunk_end = chunk
+        .logical_offset
+        .checked_add(chunk.bytes as u64)
+        .ok_or("persistent IQ1_S chunk range overflow")?;
     let mut plan_shards = plan
         .shards
         .iter()
-        .filter(|shard| shard.bank == chunk.bank && shard.superblock == superblock)
+        .filter(|shard| {
+            shard.bank == chunk.bank
+                && shard.offset >= chunk.logical_offset
+                && shard
+                    .offset
+                    .checked_add(shard.bytes)
+                    .is_some_and(|end| end <= chunk_end)
+        })
         .collect::<Vec<_>>();
-    let blueprint = persistent_chunk_blueprint(chunk.bank, superblock, &mut plan_shards)?;
+    let blueprint = persistent_chunk_blueprint(chunk.bank, chunk.logical_offset, &mut plan_shards)?;
     if blueprint.bytes != chunk.bytes || blueprint.shards != chunk.shards {
         return Err("persistent IQ1_S chunk metadata differs from the arena plan".to_string());
     }
@@ -1302,16 +1347,30 @@ mod tests {
         }
 
         let mut misaligned = chunks[0].clone();
-        misaligned.logical_offset += ARENA_ALIGNMENT;
+        misaligned.logical_offset += 1;
         assert!(read_persistent_chunk(&plan, &sources, &misaligned)
             .unwrap_err()
-            .contains("superblock aligned"));
+            .contains("staging chunk offset is not aligned"));
 
         let mut gapped = plan;
         gapped.shards[4].offset += ARENA_ALIGNMENT;
         assert!(persistent_chunk_specs(&gapped)
             .unwrap_err()
             .contains("alignment padding"));
+    }
+
+    #[test]
+    fn qwen_persistent_weight_staging_is_bounded_to_64_mib() {
+        let sources = canonical_sources(Path::new("/tmp/qwen-metadata.gguf"), [0x31; 32]);
+        let mut plan = build_plan(&sources, 15, true, false).unwrap();
+        plan.hashes_verified = true;
+        for shard in &mut plan.shards {
+            shard.sha256 = [0x5a; 32];
+        }
+        let chunks = persistent_chunk_blueprints(&plan).unwrap();
+
+        assert!(chunks.len() > ARENA_BANK_COUNT);
+        assert!(chunks.iter().all(|chunk| chunk.bytes <= 64 * 1024 * 1024));
     }
 
     #[test]

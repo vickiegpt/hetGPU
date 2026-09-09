@@ -1,5 +1,7 @@
-use super::cxl_tmatmul::copy_host_to_cuda;
-use super::iq1s_layer::{CapturedProjection, LayerKey, RouteAssignment};
+use super::iq1s_layer::{
+    enqueue_cuda_output_batch, CapturedProjection, LayerKey, PendingCudaOutputBatch,
+    RouteAssignment,
+};
 use super::iq1s_layer_trace::{
     compile_layer_phase, ActivationRange, CompiledLayerPhase, LayerPhase, LayerPhasePlan,
     SemanticIq1sCommand,
@@ -8,25 +10,30 @@ use super::iq1s_persistent_proof::{
     checked_proof_path_from_env, hex_sha256, PersistentPhaseRecord, PersistentProofLedger,
     PhaseComparison, PhaseTimingsUs, LIBGGML_REFERENCE_BACKEND,
 };
-use super::iq1s_tmatmul::{libggml_iq1s_reference_outputs, GgmlType19Signature, Q8_1_MMQ_BYTES};
+use super::iq1s_tmatmul::{
+    libggml_iq1s_reference_outputs, CapturedActivationLaunch, GgmlType19Signature,
+    Q8_1_MMQ_BYTES,
+};
 use super::iq1s_trace::QWEN_MODEL_CONTEXT_LIMIT;
 use super::iq1s_weight_arena::{
     persistent_chunk_specs, plan_registered_arena, read_persistent_chunk, ArenaPlan, ArenaShard,
-    ARENA_ALIGNMENT, ARENA_EXPECTED_RAW_BYTES, ARENA_EXPECTED_TENSORS,
+    ARENA_ALIGNMENT, ARENA_BANK_COUNT, ARENA_EXPECTED_RAW_BYTES, ARENA_EXPECTED_TENSORS,
 };
 use super::iq1s_weight_registry::{global_registry, Iq1sExpertRole, Iq1sTensorSource};
 use super::xrt_iq1s_persistent::{
     CompletedLayerPhase, HostRange, PersistentIq1sConfig, PersistentIq1sPool, PhaseBuffers,
+    SubmissionTicket, TicketPoll,
 };
 use super::xrt_tmatmul::RealXrt;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::Read;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const QWEN_MODEL_SHA256: [u8; 32] = [
     0x0a, 0x32, 0xc2, 0x70, 0x2f, 0xbb, 0x61, 0x93, 0x49, 0x60, 0xcf, 0xee, 0xf3, 0x45, 0x24, 0xb8,
@@ -37,6 +44,20 @@ const PERSISTENT_XCLBIN_SHA256: [u8; 32] = [
     0xf1, 0xeb, 0xf8, 0x84, 0x8a, 0x43, 0x70, 0x35, 0xfe, 0xf1, 0x45, 0x1d, 0xee, 0x77, 0x70, 0xa3,
 ];
 const PERSISTENT_XCLBIN_NAME: &str = "qwen397b_iq1s_layer_persistent_9c83dcae.xclbin";
+const GRIDROM_PERSISTENT_XCLBIN_SHA256: [u8; 32] = [
+    0xd7, 0x2f, 0xf7, 0x33, 0x6c, 0xb4, 0xdd, 0x49, 0x86, 0x7c, 0x5f, 0x22, 0x08, 0xa3, 0x43, 0x92,
+    0x81, 0xea, 0xab, 0x1b, 0x0a, 0x9e, 0x59, 0x4b, 0x45, 0x8a, 0x4f, 0xec, 0xc6, 0xb7, 0x99, 0x48,
+];
+const GRIDROM_PERSISTENT_XCLBIN_NAME: &str =
+    "qwen397b_iq1s_layer_persistent_d72ff7336cb4dd49.xclbin";
+
+fn qualified_persistent_xclbin_identity(name: &str, sha256: [u8; 32]) -> bool {
+    matches!(
+        (name, sha256),
+        (PERSISTENT_XCLBIN_NAME, PERSISTENT_XCLBIN_SHA256)
+            | (GRIDROM_PERSISTENT_XCLBIN_NAME, GRIDROM_PERSISTENT_XCLBIN_SHA256)
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PersistentRuntimeIdentity {
@@ -44,6 +65,104 @@ pub(crate) struct PersistentRuntimeIdentity {
     pub(crate) xclbin_sha256: [u8; 32],
     pub(crate) device_index: u32,
     pub(crate) session_generation: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ProgressRecord<'a> {
+    schema_version: u32,
+    stage: &'a str,
+    generation: u64,
+    model_sha256: String,
+    xclbin_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bank: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logical_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layer: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+}
+
+struct ProgressSink {
+    file: File,
+    generation: u64,
+    model_sha256: String,
+    xclbin_sha256: String,
+}
+
+impl ProgressSink {
+    fn create(ledger_path: &Path, identity: &PersistentRuntimeIdentity) -> Result<Self, String> {
+        let path = PathBuf::from(
+            std::env::var("HETGPU_QWEN_IQ1S_PROGRESS_LOG")
+                .map_err(|_| "HETGPU_QWEN_IQ1S_PROGRESS_LOG is required".to_string())?,
+        );
+        Self::create_at(&path, ledger_path, identity)
+    }
+
+    fn create_at(
+        path: &Path,
+        ledger_path: &Path,
+        identity: &PersistentRuntimeIdentity,
+    ) -> Result<Self, String> {
+        if path.parent() != ledger_path.parent() {
+            return Err("persistent progress log must be beside the proof ledger".to_string());
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("create persistent progress log: {error}"))?;
+        Ok(Self {
+            file,
+            generation: identity.session_generation,
+            model_sha256: hex_sha256(&identity.model_sha256),
+            xclbin_sha256: hex_sha256(&identity.xclbin_sha256),
+        })
+    }
+
+    fn append(
+        &mut self,
+        stage: &str,
+        bank: Option<u8>,
+        logical_offset: Option<u64>,
+        bytes: Option<usize>,
+        transaction: Option<u64>,
+        layer: Option<u32>,
+        phase: Option<&str>,
+        slot_generation: Option<u64>,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let record = ProgressRecord {
+            schema_version: 1,
+            stage,
+            generation: self.generation,
+            model_sha256: self.model_sha256.clone(),
+            xclbin_sha256: self.xclbin_sha256.clone(),
+            bank,
+            logical_offset,
+            bytes,
+            transaction,
+            layer,
+            phase,
+            slot_generation,
+            error,
+        };
+        serde_json::to_writer(&mut self.file, &record)
+            .map_err(|error| format!("serialize persistent progress record: {error}"))?;
+        self.file
+            .write_all(b"\n")
+            .and_then(|_| self.file.flush())
+            .map_err(|error| format!("flush persistent progress record: {error}"))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -90,20 +209,68 @@ pub(crate) struct PhaseOutcome {
     pub(crate) outputs: Vec<PublishedOutput>,
 }
 
+struct ActivePhase {
+    phase_wall_start: Instant,
+    layer_id: u32,
+    phase_name: &'static str,
+    snapshot_stream: usize,
+    prepare_us: u64,
+    trace_mode: String,
+    prepared: PreparedPhase,
+    ticket: SubmissionTicket,
+}
+
 pub(crate) struct PersistentRuntime {
     identity: PersistentRuntimeIdentity,
     arena: Arc<ArenaPlan>,
     sources: Vec<Arc<Iq1sTensorSource>>,
     pool: PersistentIq1sPool<RealXrt>,
     ledger: PersistentProofLedger,
+    progress: ProgressSink,
+    failure_capture_dir: PathBuf,
     sampled_comparison_complete: bool,
+    output_publisher: NativeResultPublisher,
     poisoned: Option<String>,
 }
 
-// XRT opaque handles and the dlopen handle are process-wide C handles.  The
-// runtime never exposes them and every operation is serialized by RUNTIME's
-// mutex, so moving this owner between CUDA-calling host threads cannot create
-// concurrent access or outlive the owning pool.
+trait ResultPublisher {
+    fn publish_batch(&mut self, stream: usize, outputs: &[PublishedOutput]) -> Result<(), String>;
+}
+
+#[derive(Default)]
+struct NativeResultPublisher {
+    pending: VecDeque<PendingCudaOutputBatch>,
+}
+
+impl ResultPublisher for NativeResultPublisher {
+    fn publish_batch(&mut self, stream: usize, outputs: &[PublishedOutput]) -> Result<(), String> {
+        // Two retained staging buffers match the two XRT ticket slots. Reap
+        // the oldest only when its pinned storage would otherwise be reused.
+        while self.pending.len() >= 2 {
+            self.pending.pop_front().expect("length checked").finish()?;
+        }
+        let copies = outputs
+            .iter()
+            .map(|output| (output.cuda_ptr, output.bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let pending = unsafe { enqueue_cuda_output_batch(stream, &copies) }?;
+        self.pending.push_back(pending);
+        Ok(())
+    }
+}
+
+fn publish_outputs_with(
+    publisher: &mut impl ResultPublisher,
+    stream: usize,
+    outputs: &[PublishedOutput],
+) -> Result<(), String> {
+    publisher.publish_batch(stream, outputs)
+}
+
+// XRT opaque handles and the dlopen handle are process-wide C handles. The
+// runtime never exposes them, and each short ticket operation is serialized by
+// the phase-pipeline mutex. Pending callers release that mutex before sleeping,
+// so two hardware tickets can remain in flight without concurrent XRT access.
 unsafe impl Send for PersistentRuntime {}
 
 type RuntimeBinding = Option<(PersistentRuntimeIdentity, Arc<ArenaPlan>)>;
@@ -126,8 +293,8 @@ fn bind_runtime_identity(
 }
 
 pub(crate) fn pack_q8_lanes(lanes: &[Vec<u8>], records: usize) -> Result<Vec<u8>, String> {
-    if lanes.is_empty() || lanes.len() > 16 || records == 0 {
-        return Err("persistent IQ1_S Q8 pack requires 1..=16 lanes and positive K records".into());
+    if lanes.is_empty() || lanes.len() > 32 || records == 0 {
+        return Err("persistent IQ1_S Q8 pack requires 1..=32 lanes and positive K records".into());
     }
     let lane_bytes = records
         .checked_mul(Q8_1_MMQ_BYTES)
@@ -156,6 +323,26 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, String> {
         .ok_or("persistent IQ1_S slab alignment overflow".to_string())
 }
 
+fn packed_activation_identity(
+    key: &LayerKey,
+    lanes: &[(RouteAssignment, CapturedActivationLaunch)],
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"hetgpu-qwen-iq1s-packed-activation-v1\0");
+    hash.update(key.session_generation.to_le_bytes());
+    hash.update(key.transaction_id.to_le_bytes());
+    hash.update(key.layer_id.to_le_bytes());
+    hash.update((key.stream as u64).to_le_bytes());
+    hash.update((lanes.len() as u64).to_le_bytes());
+    for (route, launch) in lanes {
+        hash.update(route.token_id.to_le_bytes());
+        hash.update((launch.launch.activation_ptr as u64).to_le_bytes());
+        hash.update((launch.packed_activations().len() as u64).to_le_bytes());
+        hash.update(Sha256::digest(launch.packed_activations()));
+    }
+    hash.finalize().into()
+}
+
 fn role_matches_phase(role: Iq1sExpertRole, phase: LayerPhase) -> bool {
     matches!(
         (role, phase),
@@ -177,7 +364,7 @@ pub(crate) fn prepare_phase(
     if snapshot.key.session_generation != arena.generation
         || snapshot.key.transaction_id == 0
         || snapshot.batch_count == 0
-        || snapshot.batch_count > 16
+        || snapshot.batch_count > 32
         || snapshot.routes.is_empty()
         || snapshot.projections.is_empty()
     {
@@ -220,7 +407,7 @@ pub(crate) fn prepare_phase(
         {
             if !route.route_weight.is_finite()
                 || route.expert_id >= 512
-                || launch.launch.allocation_generation != arena.generation
+                || launch.launch.allocation_generation != projection.weight.allocation_generation
                 || launch.launch.content_hash != projection.weight.content_sha256
                 || launch.launch.signature.ne00 != projection.weight.identity.ne[0]
                 || launch.launch.signature.ne01 != projection.weight.identity.ne[1]
@@ -238,8 +425,9 @@ pub(crate) fn prepare_phase(
     let mut token_cursor = 0u64;
     let mut output_cursor = 0u64;
     let mut commands = Vec::new();
-    let mut activation_manifest = Vec::new();
-    let mut activation_buffers = Vec::new();
+    let mut activation_manifest: Vec<ActivationRange> = Vec::new();
+    let mut activation_buffers: Vec<HostRange> = Vec::new();
+    let mut activation_cache = BTreeMap::<[u8; 32], usize>::new();
     let mut token_maps = Vec::new();
     let mut output_bindings = Vec::new();
     for ((role, expert_id), mut lanes) in groups {
@@ -258,22 +446,48 @@ pub(crate) fn prepare_phase(
             .ok_or("persistent IQ1_S group lost its projection identity")?;
         let k_records = usize::try_from(identity.ne[0] / 128)
             .map_err(|_| "persistent IQ1_S K record count does not fit usize")?;
-        let lane_bytes = lanes
-            .iter()
-            .map(|(_, launch)| launch.packed_activations().to_vec())
-            .collect::<Vec<_>>();
-        let packed = pack_q8_lanes(&lane_bytes, k_records)?;
-        activation_cursor = align_up(activation_cursor, ARENA_ALIGNMENT)?;
-        token_cursor = align_up(token_cursor, ARENA_ALIGNMENT)?;
-        output_cursor = align_up(output_cursor, ARENA_ALIGNMENT)?;
-        let activation_offset = activation_cursor;
-        let token_offset = token_cursor;
-        let output_offset = output_cursor;
-        let token_bytes = lanes
-            .iter()
-            .flat_map(|(route, _)| route.token_id.to_le_bytes())
-            .collect::<Vec<_>>();
-        let shards = (0..4u8)
+        // The ABI lane mask is 16 bits. A 32-active server batch therefore
+        // remains one layer transaction but is encoded as at most two
+        // commands per expert, with global token IDs carried by token_map.
+        for lanes in lanes.chunks(16) {
+            let lane_bytes = lanes
+                .iter()
+                .map(|(_, launch)| launch.packed_activations().to_vec())
+                .collect::<Vec<_>>();
+            let packed = pack_q8_lanes(&lane_bytes, k_records)?;
+            let source_identity_sha256 = packed_activation_identity(&snapshot.key, lanes);
+            let cached_activation = activation_cache
+                .get(&source_identity_sha256)
+                .copied();
+            let (activation_offset, activation_is_new) =
+                if let Some(buffer_index) = cached_activation {
+                    let cached = activation_buffers
+                        .get(buffer_index)
+                        .ok_or("persistent IQ1_S activation cache index is invalid")?;
+                    let cached_manifest = activation_manifest
+                        .get(buffer_index)
+                        .ok_or("persistent IQ1_S activation manifest cache index is invalid")?;
+                    if cached.bytes != packed
+                        || cached_manifest.cuda_ptr != lanes[0].1.launch.activation_ptr
+                    {
+                        return Err(
+                            "persistent IQ1_S packed activation identity collision".to_string(),
+                        );
+                    }
+                    (cached.offset, false)
+                } else {
+                    activation_cursor = align_up(activation_cursor, ARENA_ALIGNMENT)?;
+                    (activation_cursor, true)
+                };
+            token_cursor = align_up(token_cursor, ARENA_ALIGNMENT)?;
+            output_cursor = align_up(output_cursor, ARENA_ALIGNMENT)?;
+            let token_offset = token_cursor;
+            let output_offset = output_cursor;
+            let token_bytes = lanes
+                .iter()
+                .flat_map(|(route, _)| route.token_id.to_le_bytes())
+                .collect::<Vec<_>>();
+            let shards = (0..4u8)
             .map(|bank| {
                 arena
                     .shards
@@ -291,73 +505,80 @@ pub(crate) fn prepare_phase(
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let lane_count = u64::try_from(lanes.len())
-            .map_err(|_| "persistent IQ1_S lane count does not fit u64")?;
-        let max_result_bytes = shards
-            .iter()
-            .map(|shard| u64::from(shard.row_count) * 4 * lane_count)
-            .max()
-            .ok_or("persistent IQ1_S group has no arena shards")?;
-        let token_ids = lanes
-            .iter()
-            .map(|(route, _)| route.token_id)
-            .collect::<Vec<_>>();
-        let lane_mask = token_ids
-            .iter()
-            .fold(0u16, |mask, token| mask | (1u16 << *token));
-        for shard in &shards {
-            commands.push(SemanticIq1sCommand {
-                layer_id: snapshot.key.layer_id,
-                phase: snapshot.phase,
-                role,
-                expert_id,
-                lane_mask,
-                token_ids: token_ids.clone(),
-                input_offset: activation_offset,
-                output_offset,
-                token_map_offset: token_offset,
-                row_shard: shard.clone(),
+            let lane_count = u64::try_from(lanes.len())
+                .map_err(|_| "persistent IQ1_S lane count does not fit u64")?;
+            let max_result_bytes = shards
+                .iter()
+                .map(|shard| u64::from(shard.row_count) * 4 * lane_count)
+                .max()
+                .ok_or("persistent IQ1_S group has no arena shards")?;
+            let token_ids = (0..lanes.len() as u32).collect::<Vec<_>>();
+            let lane_mask = if lanes.len() == 16 {
+                u16::MAX
+            } else {
+                (1u16 << lanes.len()) - 1
+            };
+            for shard in &shards {
+                commands.push(SemanticIq1sCommand {
+                    layer_id: snapshot.key.layer_id,
+                    phase: snapshot.phase,
+                    role,
+                    expert_id,
+                    lane_mask,
+                    token_ids: token_ids.clone(),
+                    input_offset: activation_offset,
+                    output_offset,
+                    token_map_offset: token_offset,
+                    row_shard: shard.clone(),
+                });
+            }
+            for (lane_index, (route, launch)) in lanes.iter().enumerate() {
+                output_bindings.push(OutputBinding {
+                    cuda_ptr: launch.launch.output_ptr,
+                    expert_id,
+                    token_id: route.token_id,
+                    row_count: u32::try_from(identity.ne[1])
+                        .map_err(|_| "persistent IQ1_S output rows do not fit u32")?,
+                    role,
+                    lane_index,
+                    lane_count: lanes.len(),
+                    input_offset: activation_offset,
+                    output_offset,
+                    shards: shards.clone(),
+                });
+            }
+            if activation_is_new {
+                activation_manifest.push(ActivationRange {
+                    cuda_ptr: lanes[0].1.launch.activation_ptr,
+                    slab_offset: activation_offset,
+                    bytes: u32::try_from(packed.len())
+                        .map_err(|_| "persistent IQ1_S activation bytes do not fit u32")?,
+                    stream: snapshot.key.stream,
+                    source_identity_sha256,
+                });
+                activation_buffers.push(HostRange {
+                    offset: activation_offset,
+                    bytes: packed,
+                });
+                activation_cache.insert(
+                    source_identity_sha256,
+                    activation_buffers.len() - 1,
+                );
+                activation_cursor = activation_offset
+                    .checked_add(activation_buffers.last().unwrap().bytes.len() as u64)
+                    .ok_or("persistent IQ1_S activation slab overflow")?;
+            }
+            token_maps.push(HostRange {
+                offset: token_offset,
+                bytes: token_bytes,
             });
+            token_cursor = token_offset
+                .checked_add(token_maps.last().unwrap().bytes.len() as u64)
+                .ok_or("persistent IQ1_S token-map slab overflow")?;
+            output_cursor = output_offset
+                .checked_add(max_result_bytes)
+                .ok_or("persistent IQ1_S result slab overflow")?;
         }
-        for (lane_index, (route, launch)) in lanes.iter().enumerate() {
-            output_bindings.push(OutputBinding {
-                cuda_ptr: launch.launch.output_ptr,
-                expert_id,
-                token_id: route.token_id,
-                row_count: u32::try_from(identity.ne[1])
-                    .map_err(|_| "persistent IQ1_S output rows do not fit u32")?,
-                role,
-                lane_index,
-                lane_count: lanes.len(),
-                input_offset: activation_offset,
-                output_offset,
-                shards: shards.clone(),
-            });
-        }
-        activation_manifest.push(ActivationRange {
-            cuda_ptr: lanes[0].1.launch.activation_ptr,
-            slab_offset: activation_offset,
-            bytes: u32::try_from(packed.len())
-                .map_err(|_| "persistent IQ1_S activation bytes do not fit u32")?,
-            stream: snapshot.key.stream,
-        });
-        activation_buffers.push(HostRange {
-            offset: activation_offset,
-            bytes: packed,
-        });
-        token_maps.push(HostRange {
-            offset: token_offset,
-            bytes: token_bytes,
-        });
-        activation_cursor = activation_offset
-            .checked_add(activation_buffers.last().unwrap().bytes.len() as u64)
-            .ok_or("persistent IQ1_S activation slab overflow")?;
-        token_cursor = token_offset
-            .checked_add(token_maps.last().unwrap().bytes.len() as u64)
-            .ok_or("persistent IQ1_S token-map slab overflow")?;
-        output_cursor = output_offset
-            .checked_add(max_result_bytes)
-            .ok_or("persistent IQ1_S result slab overflow")?;
     }
     let compiled = compile_layer_phase(
         &LayerPhasePlan {
@@ -595,9 +816,193 @@ fn sample_activation(prepared: &PreparedPhase, binding: &OutputBinding) -> Resul
     Ok(activation)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct NumericalMismatch {
+    index: usize,
+    actual: f32,
+    reference: f32,
+    absolute_error: f32,
+    limit: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct FailureCaptureFile {
+    name: String,
+    bytes: usize,
+    sha256: String,
+}
+
+fn write_capture_file(
+    root: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<FailureCaptureFile, String> {
+    let path = root.join(name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| format!("create numerical failure capture {}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("write numerical failure capture {}: {error}", path.display()))?;
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    Ok(FailureCaptureFile {
+        name: name.to_string(),
+        bytes: bytes.len(),
+        sha256: hex_sha256(&digest),
+    })
+}
+
+fn f32_bytes(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+}
+
+fn command_json(command: &super::iq1s_layer_abi::Iq1sCommand) -> serde_json::Value {
+    serde_json::json!({
+        "magic": command.magic,
+        "abi_version": command.abi_version,
+        "descriptor_bytes": command.descriptor_bytes,
+        "crc32": command.crc32,
+        "flags": command.flags,
+        "session_generation": command.session_generation,
+        "transaction_id": command.transaction_id,
+        "program_id": command.program_id,
+        "trace_id": command.trace_id,
+        "layer_id": command.layer_id,
+        "phase": command.phase,
+        "role": command.role,
+        "expert_id": command.expert_id,
+        "lane_mask": command.lane_mask,
+        "lane_count": command.lane_count,
+        "weight_format": command.weight_format,
+        "arena_offset": command.arena_offset,
+        "input_offset": command.input_offset,
+        "output_offset": command.output_offset,
+        "row_start": command.row_start,
+        "row_count": command.row_count,
+        "input_bytes": command.input_bytes,
+        "output_bytes": command.output_bytes,
+        "token_map_offset": command.token_map_offset,
+        "dependency_fence": command.dependency_fence,
+        "completion_slot": command.completion_slot,
+        "reserved": command.reserved,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_numerical_failure_capture_at(
+    root: &Path,
+    identity: &PersistentRuntimeIdentity,
+    trace_mode: &str,
+    prepared: &PreparedPhase,
+    binding: &OutputBinding,
+    matrix: &[u8],
+    activation: &[u8],
+    reference: &[f32],
+    actual: &[f32],
+    mismatch: NumericalMismatch,
+) -> Result<(), String> {
+    std::fs::create_dir(root).map_err(|error| {
+        format!(
+            "create numerical failure capture directory {}: {error}",
+            root.display()
+        )
+    })?;
+    let mut files = Vec::new();
+    files.push(write_capture_file(root, "matrix.iq1s.bin", matrix)?);
+    files.push(write_capture_file(root, "activation.q8_1.bin", activation)?);
+    files.push(write_capture_file(
+        root,
+        "reference.f32.bin",
+        &f32_bytes(reference),
+    )?);
+    files.push(write_capture_file(root, "actual.f32.bin", &f32_bytes(actual))?);
+    for bank in 0..ARENA_BANK_COUNT {
+        let commands = prepared.compiled.commands[bank]
+            .iter()
+            .map(command_json)
+            .collect::<Vec<_>>();
+        let command_bytes = serde_json::to_vec_pretty(&commands)
+            .map_err(|error| format!("serialize bank {bank} failure commands: {error}"))?;
+        files.push(write_capture_file(
+            root,
+            &format!("bank-{bank}.commands.json"),
+            &command_bytes,
+        )?);
+        files.push(write_capture_file(
+            root,
+            &format!("bank-{bank}.program.bin"),
+            &prepared.compiled.programs[bank].encoded,
+        )?);
+        files.push(write_capture_file(
+            root,
+            &format!("bank-{bank}.program.asm"),
+            prepared.compiled.programs[bank].assembly.as_bytes(),
+        )?);
+    }
+    let tensor = &binding.shards[0].tensor;
+    let command_counts_per_bank: [usize; ARENA_BANK_COUNT] =
+        std::array::from_fn(|bank| prepared.compiled.commands[bank].len());
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "status": "numerical_mismatch_nonproof",
+        "trace_mode": trace_mode,
+        "model_sha256": hex_sha256(&identity.model_sha256),
+        "xclbin_sha256": hex_sha256(&identity.xclbin_sha256),
+        "device_index": identity.device_index,
+        "session_generation": identity.session_generation,
+        "transaction_id": prepared.compiled.transaction_id,
+        "layer_id": tensor.layer,
+        "phase": match prepared.compiled.phase {
+            LayerPhase::PhaseA => "A",
+            LayerPhase::PhaseB => "B",
+        },
+        "semantic_sha256": hex_sha256(&prepared.compiled.semantic_sha256),
+        "mismatch": {
+            "index": mismatch.index,
+            "actual": mismatch.actual,
+            "reference": mismatch.reference,
+            "absolute_error": mismatch.absolute_error,
+            "limit": mismatch.limit,
+        },
+        "binding": {
+            "tensor_name": tensor.name,
+            "tensor_content_sha256": hex_sha256(&tensor.content_sha256),
+            "expert_id": binding.expert_id,
+            "token_id": binding.token_id,
+            "role": format!("{:?}", binding.role).to_ascii_lowercase(),
+            "lane_index": binding.lane_index,
+            "lane_count": binding.lane_count,
+            "row_count": binding.row_count,
+            "input_offset": binding.input_offset,
+            "output_offset": binding.output_offset,
+            "ne": tensor.ne,
+            "nb": tensor.nb,
+            "shards": binding.shards.iter().map(|shard| serde_json::json!({
+                "bank": shard.bank,
+                "row_start": shard.row_start,
+                "row_count": shard.row_count,
+                "arena_offset": shard.offset,
+                "bytes": shard.bytes,
+                "sha256": hex_sha256(&shard.sha256),
+            })).collect::<Vec<_>>(),
+        },
+        "command_counts_per_bank": command_counts_per_bank,
+        "files": files,
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| format!("serialize numerical failure capture manifest: {error}"))?;
+    write_capture_file(root, "manifest.json", &manifest_bytes)?;
+    Ok(())
+}
+
 fn compare_sampled_output(
     prepared: &PreparedPhase,
     outputs: &[PublishedOutput],
+    identity: &PersistentRuntimeIdentity,
+    trace_mode: &str,
+    failure_capture_dir: &Path,
 ) -> Result<PhaseComparison, String> {
     let binding = prepared
         .output_bindings
@@ -629,24 +1034,48 @@ fn compare_sampled_output(
     }
     let mut max_abs_error = 0.0_f32;
     let mut max_rel_error = 0.0_f32;
-    for (index, (&reference, &actual)) in reference.iter().zip(&actual).enumerate() {
-        if !reference.is_finite() || !actual.is_finite() {
+    for (index, (&reference_value, &actual_value)) in reference.iter().zip(&actual).enumerate() {
+        if !reference_value.is_finite() || !actual_value.is_finite() {
             return Err(format!(
                 "persistent IQ1_S sampled output {index} is nonfinite"
             ));
         }
-        let abs = (actual - reference).abs();
-        let rel = if reference == 0.0 {
+        let abs = (actual_value - reference_value).abs();
+        let rel = if reference_value == 0.0 {
             abs
         } else {
-            abs / reference.abs()
+            abs / reference_value.abs()
         };
         max_abs_error = max_abs_error.max(abs);
         max_rel_error = max_rel_error.max(rel);
-        let limit = 1.0e-4 + 1.0e-3 * reference.abs();
+        let limit = 1.0e-4 + 1.0e-3 * reference_value.abs();
         if abs > limit {
+            let mismatch = NumericalMismatch {
+                index,
+                actual: actual_value,
+                reference: reference_value,
+                absolute_error: abs,
+                limit,
+            };
+            let original = format!(
+                "persistent IQ1_S libggml sample {index} is outside tolerance: actual={actual_value}, reference={reference_value}, absolute_error={abs}, limit={limit}"
+            );
+            write_numerical_failure_capture_at(
+                failure_capture_dir,
+                identity,
+                trace_mode,
+                prepared,
+                binding,
+                &matrix,
+                &activation,
+                &reference,
+                &actual,
+                mismatch,
+            )
+            .map_err(|capture_error| format!("{original}; failure capture failed: {capture_error}"))?;
             return Err(format!(
-                "persistent IQ1_S libggml sample {index} is outside tolerance: actual={actual}, reference={reference}, absolute_error={abs}, limit={limit}"
+                "{original}; failure_capture={}",
+                failure_capture_dir.display()
             ));
         }
     }
@@ -672,6 +1101,10 @@ fn env_truthy(name: &str) -> bool {
     std::env::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
         .unwrap_or(false)
+}
+
+fn initial_sampled_comparison_complete(diagnostic_finite_only: bool) -> bool {
+    diagnostic_finite_only
 }
 
 fn env_u64(name: &str, default: u64) -> Result<u64, String> {
@@ -726,9 +1159,11 @@ fn initialize_runtime_from_env() -> Result<PersistentRuntime, String> {
         std::env::var("HETGPU_XRT_XCLBIN")
             .map_err(|_| "HETGPU_XRT_XCLBIN is required for persistent IQ1_S".to_string())?,
     );
-    if xclbin.file_name().and_then(|name| name.to_str()) != Some(PERSISTENT_XCLBIN_NAME)
-        || sha256_file(&xclbin)? != PERSISTENT_XCLBIN_SHA256
-    {
+    let xclbin_sha256 = sha256_file(&xclbin)?;
+    if !qualified_persistent_xclbin_identity(
+        xclbin.file_name().and_then(|name| name.to_str()).unwrap_or(""),
+        xclbin_sha256,
+    ) {
         return Err("persistent IQ1_S xclbin name or SHA-256 is not qualified".to_string());
     }
     let device_index = u32::try_from(env_u64("HETGPU_XRT_DEVICE_INDEX", 0)?)
@@ -737,136 +1172,281 @@ fn initialize_runtime_from_env() -> Result<PersistentRuntime, String> {
         .map_err(|_| "HETGPU_QWEN_IQ1S_RING_CAPACITY does not fit u32")?;
     let timeout_ms = u32::try_from(env_u64("HETGPU_XRT_TIMEOUT_MS", 10_000)?)
         .map_err(|_| "HETGPU_XRT_TIMEOUT_MS does not fit u32")?;
+    let identity = PersistentRuntimeIdentity {
+        model_sha256: QWEN_MODEL_SHA256,
+        xclbin_sha256,
+        device_index,
+        session_generation: generation,
+    };
     let ledger_path = checked_proof_path_from_env()?;
+    let failure_capture_dir = ledger_path
+        .parent()
+        .ok_or("persistent IQ1_S proof ledger has no parent")?
+        .join("failure-capture");
+    let mut progress = ProgressSink::create(&ledger_path, &identity)?;
+    let diagnostic_finite_only =
+        env_truthy("HETGPU_QWEN_IQ1S_DIAGNOSTIC_FINITE_ONLY");
+    if diagnostic_finite_only {
+        progress.append(
+            "diagnostic_finite_only_enabled",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+    }
+    progress.append(
+        "arena_plan",
+        None,
+        None,
+        Some(
+            usize::try_from(ARENA_EXPECTED_RAW_BYTES)
+                .map_err(|_| "persistent IQ1_S arena byte count does not fit usize".to_string())?,
+        ),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
     let ledger = PersistentProofLedger::create(&ledger_path)?;
     let chunks = persistent_chunk_specs(&arena)?;
     let ops = RealXrt::load(true).map_err(|error| error.to_string())?;
     let config =
         PersistentIq1sConfig::checked(xclbin, device_index, Some(ring_capacity), timeout_ms)
             .map_err(|error| error.to_string())?;
-    let pool = PersistentIq1sPool::open(ops, config, generation, &chunks, |chunk| {
-        read_persistent_chunk(&arena, &sources, chunk)
-    })
-    .map_err(|error| error.to_string())?;
-    Ok(PersistentRuntime {
-        identity: PersistentRuntimeIdentity {
-            model_sha256: QWEN_MODEL_SHA256,
-            xclbin_sha256: PERSISTENT_XCLBIN_SHA256,
-            device_index,
-            session_generation: generation,
+    let pool = PersistentIq1sPool::open(
+        ops,
+        config,
+        generation,
+        &chunks,
+        |chunk| read_persistent_chunk(&arena, &sources, chunk),
+        |chunk| {
+            progress.append(
+                "arena_chunk_resident",
+                Some(chunk.bank),
+                Some(chunk.logical_offset),
+                Some(chunk.bytes),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         },
+    )
+    .map_err(|error| error.to_string())?;
+    progress.append("pool_ready", None, None, None, None, None, None, None, None)?;
+    Ok(PersistentRuntime {
+        identity,
         arena,
         sources,
         pool,
         ledger,
-        sampled_comparison_complete: false,
+        progress,
+        failure_capture_dir,
+        // This opt-in exists only to obtain diagnostic hardware timing from an
+        // otherwise finite run. The strict proof validator still requires a
+        // sampled libggml comparison and therefore rejects this mode.
+        sampled_comparison_complete: initial_sampled_comparison_complete(
+            diagnostic_finite_only,
+        ),
+        output_publisher: NativeResultPublisher::default(),
         poisoned: None,
     })
 }
 
-enum GlobalRuntimeState {
-    Uninitialized,
-    Ready(PersistentRuntime),
-    Failed(String),
-    Poisoned {
-        error: String,
-        runtime: Option<PersistentRuntime>,
-    },
+trait PhasePipelineEngine: Send {
+    type Input;
+    type Active;
+    type Output;
+
+    fn has_capacity(&self) -> bool;
+    fn start(&mut self, input: Self::Input) -> Result<Self::Active, String>;
+    fn poll(&mut self, active: &Self::Active) -> Result<TicketPoll, String>;
+    fn finish(&mut self, active: Self::Active) -> Result<Self::Output, String>;
+    fn poison(&mut self, error: &str);
 }
 
-static RUNTIME: OnceLock<Mutex<GlobalRuntimeState>> = OnceLock::new();
+enum PhasePipelineState<E> {
+    Uninitialized,
+    Ready(E),
+    Failed(String),
+    Poisoned { error: String, engine: Option<E> },
+}
 
-fn global_runtime_state() -> &'static Mutex<GlobalRuntimeState> {
-    RUNTIME.get_or_init(|| Mutex::new(GlobalRuntimeState::Uninitialized))
+struct PhasePipeline<E: PhasePipelineEngine> {
+    state: Mutex<PhasePipelineState<E>>,
+    capacity: Condvar,
+    initialize: Option<fn() -> Result<E, String>>,
+}
+
+impl<E: PhasePipelineEngine> PhasePipeline<E> {
+    fn with_engine(engine: E) -> Self {
+        Self {
+            state: Mutex::new(PhasePipelineState::Ready(engine)),
+            capacity: Condvar::new(),
+            initialize: None,
+        }
+    }
+
+    fn lazy(initialize: fn() -> Result<E, String>) -> Self {
+        Self {
+            state: Mutex::new(PhasePipelineState::Uninitialized),
+            capacity: Condvar::new(),
+            initialize: Some(initialize),
+        }
+    }
+
+    fn poison_locked(state: &mut PhasePipelineState<E>, error: String) {
+        let previous = std::mem::replace(state, PhasePipelineState::Uninitialized);
+        *state = match previous {
+            PhasePipelineState::Ready(mut engine) => {
+                engine.poison(&error);
+                PhasePipelineState::Poisoned {
+                    error,
+                    engine: Some(engine),
+                }
+            }
+            PhasePipelineState::Poisoned {
+                error: first_error,
+                engine,
+            } => PhasePipelineState::Poisoned {
+                error: first_error,
+                engine,
+            },
+            PhasePipelineState::Failed(first_error) => PhasePipelineState::Poisoned {
+                error: first_error,
+                engine: None,
+            },
+            PhasePipelineState::Uninitialized => PhasePipelineState::Poisoned {
+                error,
+                engine: None,
+            },
+        };
+    }
+
+    fn initialize_locked(&self, state: &mut PhasePipelineState<E>) {
+        if !matches!(state, PhasePipelineState::Uninitialized) {
+            return;
+        }
+        *state = match self.initialize {
+            Some(initialize) => match initialize() {
+                Ok(engine) => PhasePipelineState::Ready(engine),
+                Err(error) => PhasePipelineState::Failed(error),
+            },
+            None => PhasePipelineState::Failed(
+                "persistent IQ1_S phase pipeline has no initializer".to_string(),
+            ),
+        };
+    }
+
+    fn execute(&self, input: E::Input) -> Result<E::Output, String> {
+        let mut input = Some(input);
+        let active = loop {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "persistent IQ1_S pipeline lock poisoned".to_string())?;
+            self.initialize_locked(&mut state);
+            match &mut *state {
+                PhasePipelineState::Ready(engine) if engine.has_capacity() => {
+                    let input = input.take().expect("pipeline input consumed once");
+                    match engine.start(input) {
+                        Ok(active) => break active,
+                        Err(error) => {
+                            Self::poison_locked(&mut state, error.clone());
+                            self.capacity.notify_all();
+                            return Err(error);
+                        }
+                    }
+                }
+                PhasePipelineState::Ready(_) => {
+                    state = self
+                        .capacity
+                        .wait(state)
+                        .map_err(|_| "persistent IQ1_S pipeline lock poisoned".to_string())?;
+                    drop(state);
+                }
+                PhasePipelineState::Failed(error) => return Err(error.clone()),
+                PhasePipelineState::Poisoned { error, .. } => {
+                    return Err(format!("persistent IQ1_S runtime is poisoned: {error}"));
+                }
+                PhasePipelineState::Uninitialized => {
+                    return Err("persistent IQ1_S runtime remained uninitialized".to_string());
+                }
+            }
+        };
+
+        let mut backoff_us = 1u64;
+        loop {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "persistent IQ1_S pipeline lock poisoned".to_string())?;
+            match &mut *state {
+                PhasePipelineState::Ready(engine) => match engine.poll(&active) {
+                    Ok(TicketPoll::Pending) => {
+                        drop(state);
+                        std::thread::sleep(Duration::from_micros(backoff_us));
+                        backoff_us = (backoff_us * 2).min(1_000);
+                    }
+                    Ok(TicketPoll::Complete) => match engine.finish(active) {
+                        Ok(output) => {
+                            self.capacity.notify_one();
+                            return Ok(output);
+                        }
+                        Err(error) => {
+                            Self::poison_locked(&mut state, error.clone());
+                            self.capacity.notify_all();
+                            return Err(error);
+                        }
+                    },
+                    Err(error) => {
+                        Self::poison_locked(&mut state, error.clone());
+                        self.capacity.notify_all();
+                        return Err(error);
+                    }
+                },
+                PhasePipelineState::Failed(error) => return Err(error.clone()),
+                PhasePipelineState::Poisoned { error, .. } => {
+                    return Err(format!("persistent IQ1_S runtime is poisoned: {error}"));
+                }
+                PhasePipelineState::Uninitialized => {
+                    return Err("persistent IQ1_S runtime remained uninitialized".to_string());
+                }
+            }
+        }
+    }
+
+    fn poison(&self, error: &str) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        Self::poison_locked(&mut state, error.to_string());
+        self.capacity.notify_all();
+    }
+}
+
+fn global_phase_pipeline() -> &'static PhasePipeline<PersistentRuntime> {
+    static PIPELINE: OnceLock<PhasePipeline<PersistentRuntime>> = OnceLock::new();
+    PIPELINE.get_or_init(|| PhasePipeline::lazy(initialize_runtime_from_env))
+}
+
+pub(crate) fn execute_global_persistent_phase(snapshot: PhaseSnapshot) -> Result<(), String> {
+    global_phase_pipeline().execute(snapshot).map(|_| ())
 }
 
 pub(crate) fn poison_global_persistent_runtime(error: &str) {
-    let Ok(mut state) = global_runtime_state().lock() else {
-        return;
-    };
-    let previous = std::mem::replace(&mut *state, GlobalRuntimeState::Uninitialized);
-    *state = match previous {
-        GlobalRuntimeState::Poisoned { error, runtime } => {
-            GlobalRuntimeState::Poisoned { error, runtime }
-        }
-        GlobalRuntimeState::Ready(mut runtime) => {
-            runtime.poisoned = Some(error.to_string());
-            GlobalRuntimeState::Poisoned {
-                error: error.to_string(),
-                runtime: Some(runtime),
-            }
-        }
-        GlobalRuntimeState::Failed(first_error) => GlobalRuntimeState::Poisoned {
-            error: first_error,
-            runtime: None,
-        },
-        GlobalRuntimeState::Uninitialized => GlobalRuntimeState::Poisoned {
-            error: error.to_string(),
-            runtime: None,
-        },
-    };
-}
-
-pub(crate) fn with_global_persistent_runtime<T>(
-    operation: impl FnOnce(&mut PersistentRuntime) -> Result<T, String>,
-) -> Result<T, String> {
-    let mut state = global_runtime_state()
-        .lock()
-        .map_err(|_| "persistent IQ1_S runtime lock poisoned".to_string())?;
-    if matches!(*state, GlobalRuntimeState::Uninitialized) {
-        *state = match initialize_runtime_from_env() {
-            Ok(runtime) => GlobalRuntimeState::Ready(runtime),
-            Err(error) => GlobalRuntimeState::Failed(error),
-        };
-    }
-    let result = match &mut *state {
-        GlobalRuntimeState::Ready(runtime) => operation(runtime),
-        GlobalRuntimeState::Failed(error) => Err(error.clone()),
-        GlobalRuntimeState::Poisoned { error, .. } => {
-            Err(format!("persistent IQ1_S runtime is poisoned: {error}"))
-        }
-        GlobalRuntimeState::Uninitialized => {
-            Err("persistent IQ1_S runtime remained uninitialized".to_string())
-        }
-    };
-    match result {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            let previous = std::mem::replace(&mut *state, GlobalRuntimeState::Uninitialized);
-            *state = match previous {
-                GlobalRuntimeState::Ready(mut runtime) => {
-                    runtime.poisoned = Some(error.clone());
-                    GlobalRuntimeState::Poisoned {
-                        error: error.clone(),
-                        runtime: Some(runtime),
-                    }
-                }
-                GlobalRuntimeState::Poisoned {
-                    error: first_error,
-                    runtime,
-                } => GlobalRuntimeState::Poisoned {
-                    error: first_error,
-                    runtime,
-                },
-                GlobalRuntimeState::Failed(first_error) => GlobalRuntimeState::Poisoned {
-                    error: first_error,
-                    runtime: None,
-                },
-                GlobalRuntimeState::Uninitialized => GlobalRuntimeState::Poisoned {
-                    error: error.clone(),
-                    runtime: None,
-                },
-            };
-            Err(error)
-        }
-    }
+    global_phase_pipeline().poison(error);
 }
 
 impl PersistentRuntime {
-    pub(crate) fn execute_phase(
-        &mut self,
-        snapshot: PhaseSnapshot,
-    ) -> Result<PhaseOutcome, String> {
+    fn start_phase(&mut self, snapshot: PhaseSnapshot) -> Result<ActivePhase, String> {
         let phase_wall_start = Instant::now();
         if snapshot.key.session_generation != self.identity.session_generation
             || self.sources.len() != ARENA_EXPECTED_TENSORS
@@ -874,6 +1454,7 @@ impl PersistentRuntime {
             return Err("persistent IQ1_S runtime/session identity mismatch".to_string());
         }
         let layer_id = snapshot.key.layer_id;
+        let snapshot_stream = snapshot.key.stream;
         let phase_name = match snapshot.phase {
             LayerPhase::PhaseA => "A",
             LayerPhase::PhaseB => "B",
@@ -883,10 +1464,139 @@ impl PersistentRuntime {
         let prepare_start = Instant::now();
         let prepared = prepare_phase(&self.arena, snapshot, &trace_mode)?;
         let prepare_us = u64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(u64::MAX);
-        let completed = self
+        let transaction_id = prepared.compiled.transaction_id;
+        let ticket = match self
             .pool
-            .submit_phase(&prepared.compiled, &prepared.buffers)
-            .map_err(|error| error.to_string())?;
+            .prepare_ticket(&prepared.compiled, &prepared.buffers)
+        {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                let error = error.to_string();
+                self.progress.append(
+                    "phase_error",
+                    None,
+                    None,
+                    None,
+                    Some(transaction_id),
+                    Some(layer_id),
+                    Some(phase_name),
+                    None,
+                    Some(&error),
+                )?;
+                return Err(error);
+            }
+        };
+        self.progress.append(
+            "phase_prepared",
+            None,
+            None,
+            None,
+            Some(transaction_id),
+            Some(layer_id),
+            Some(phase_name),
+            Some(ticket.slot_generation()),
+            None,
+        )?;
+        if let Err(error) = self.pool.publish_ticket(&ticket) {
+            let error = error.to_string();
+            self.progress.append(
+                "phase_error",
+                None,
+                None,
+                None,
+                Some(transaction_id),
+                Some(layer_id),
+                Some(phase_name),
+                Some(ticket.slot_generation()),
+                Some(&error),
+            )?;
+            return Err(error);
+        }
+        self.progress.append(
+            "phase_published",
+            None,
+            None,
+            None,
+            Some(transaction_id),
+            Some(layer_id),
+            Some(phase_name),
+            Some(ticket.slot_generation()),
+            None,
+        )?;
+        Ok(ActivePhase {
+            phase_wall_start,
+            layer_id,
+            phase_name,
+            snapshot_stream,
+            prepare_us,
+            trace_mode,
+            prepared,
+            ticket,
+        })
+    }
+
+    fn poll_phase(&mut self, active: &ActivePhase) -> Result<TicketPoll, String> {
+        match self.pool.poll_ticket(&active.ticket) {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                let error = error.to_string();
+                self.progress.append(
+                    "phase_error",
+                    None,
+                    None,
+                    None,
+                    Some(active.prepared.compiled.transaction_id),
+                    Some(active.layer_id),
+                    Some(active.phase_name),
+                    Some(active.ticket.slot_generation()),
+                    Some(&error),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn finish_phase(&mut self, active: ActivePhase) -> Result<PhaseOutcome, String> {
+        let ActivePhase {
+            phase_wall_start,
+            layer_id,
+            phase_name,
+            snapshot_stream,
+            prepare_us,
+            trace_mode,
+            prepared,
+            ticket,
+        } = active;
+        let transaction_id = prepared.compiled.transaction_id;
+        let completed = match self.pool.collect_ticket(&ticket) {
+            Ok(completed) => completed,
+            Err(error) => {
+                let error = error.to_string();
+                self.progress.append(
+                    "phase_error",
+                    None,
+                    None,
+                    None,
+                    Some(transaction_id),
+                    Some(layer_id),
+                    Some(phase_name),
+                    Some(ticket.slot_generation()),
+                    Some(&error),
+                )?;
+                return Err(error);
+            }
+        };
+        self.progress.append(
+            "phase_collected",
+            None,
+            None,
+            None,
+            Some(transaction_id),
+            Some(layer_id),
+            Some(phase_name),
+            Some(ticket.slot_generation()),
+            None,
+        )?;
         let reconstruct_start = Instant::now();
         let outputs = reconstruct_full_rows(&prepared, &completed)?;
         let reconstruct_us =
@@ -896,7 +1606,13 @@ impl PersistentRuntime {
             finite_only_comparison(&outputs)?
         } else {
             validate_all_finite(&outputs)?;
-            compare_sampled_output(&prepared, &outputs)?
+            compare_sampled_output(
+                &prepared,
+                &outputs,
+                &self.identity,
+                &trace_mode,
+                &self.failure_capture_dir,
+            )?
         };
         let compare_us = u64::try_from(compare_start.elapsed().as_micros()).unwrap_or(u64::MAX);
         let commands_per_cu = std::array::from_fn(|cu| prepared.compiled.commands[cu].len());
@@ -944,15 +1660,56 @@ impl PersistentRuntime {
         if env_truthy("HETGPU_QWEN_IQ1S_PROOF_SYNC_PHASE") {
             self.ledger.sync_boundary()?;
         }
-        for output in &outputs {
-            unsafe { copy_host_to_cuda(output.cuda_ptr, &output.bytes) }
-                .map_err(|error| error.to_string())?;
-        }
+        publish_outputs_with(&mut self.output_publisher, snapshot_stream, &outputs)?;
         Ok(PhaseOutcome {
             prepared,
             completed,
             outputs,
         })
+    }
+
+    #[cfg(test)]
+    fn execute_phase(&mut self, snapshot: PhaseSnapshot) -> Result<PhaseOutcome, String> {
+        let active = self.start_phase(snapshot)?;
+        let mut backoff_us = 1u64;
+        loop {
+            match self.poll_phase(&active)? {
+                TicketPoll::Complete => break,
+                TicketPoll::Pending => {
+                    std::thread::sleep(Duration::from_micros(backoff_us));
+                    backoff_us = (backoff_us * 2).min(1_000);
+                }
+            }
+        }
+        self.finish_phase(active)
+    }
+}
+
+impl PhasePipelineEngine for PersistentRuntime {
+    type Input = PhaseSnapshot;
+    type Active = ActivePhase;
+    type Output = PhaseOutcome;
+
+    fn has_capacity(&self) -> bool {
+        self.pool.has_free_ticket_slot()
+    }
+
+    fn start(&mut self, input: Self::Input) -> Result<Self::Active, String> {
+        self.start_phase(input)
+    }
+
+    fn poll(&mut self, active: &Self::Active) -> Result<TicketPoll, String> {
+        self.poll_phase(active)
+    }
+
+    fn finish(&mut self, active: Self::Active) -> Result<Self::Output, String> {
+        self.finish_phase(active)
+    }
+
+    fn poison(&mut self, error: &str) {
+        if self.poisoned.is_none() {
+            self.poisoned = Some(error.to_string());
+        }
     }
 }
 
@@ -968,7 +1725,118 @@ mod tests {
         Iq1sExpertRole, Iq1sTensorIdentity, ResolvedIq1sWeight,
     };
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use tempfile::tempdir;
+
+    #[derive(Default)]
+    struct FakeResultPublisher {
+        batches: usize,
+        copies: usize,
+        streams: Vec<usize>,
+        context_synchronizations: usize,
+    }
+
+    impl ResultPublisher for FakeResultPublisher {
+        fn publish_batch(
+            &mut self,
+            stream: usize,
+            outputs: &[PublishedOutput],
+        ) -> Result<(), String> {
+            self.batches += 1;
+            self.copies += outputs.len();
+            self.streams.push(stream);
+            Ok(())
+        }
+    }
+
+    struct FakePipelinedEngine {
+        active: BTreeSet<u64>,
+        released: bool,
+        peak_active: Arc<AtomicUsize>,
+    }
+
+    impl PhasePipelineEngine for FakePipelinedEngine {
+        type Input = u64;
+        type Active = u64;
+        type Output = u64;
+
+        fn has_capacity(&self) -> bool {
+            self.active.len() < 2
+        }
+
+        fn start(&mut self, input: Self::Input) -> Result<Self::Active, String> {
+            if !self.active.insert(input) {
+                return Err("duplicate fake pipeline input".to_string());
+            }
+            self.peak_active
+                .fetch_max(self.active.len(), Ordering::SeqCst);
+            if self.active.len() == 2 {
+                self.released = true;
+            }
+            Ok(input)
+        }
+
+        fn poll(&mut self, _active: &Self::Active) -> Result<TicketPoll, String> {
+            Ok(if self.released {
+                TicketPoll::Complete
+            } else {
+                TicketPoll::Pending
+            })
+        }
+
+        fn finish(&mut self, active: Self::Active) -> Result<Self::Output, String> {
+            if !self.active.remove(&active) {
+                return Err("unknown fake pipeline ticket".to_string());
+            }
+            Ok(active)
+        }
+
+        fn poison(&mut self, _error: &str) {}
+    }
+
+    #[test]
+    fn persistent_pipeline_releases_the_runtime_lock_while_tickets_are_pending() {
+        let peak_active = Arc::new(AtomicUsize::new(0));
+        let pipeline = Arc::new(PhasePipeline::with_engine(FakePipelinedEngine {
+            active: BTreeSet::new(),
+            released: false,
+            peak_active: peak_active.clone(),
+        }));
+        let start = Arc::new(Barrier::new(3));
+        let workers = [17, 18].map(|transaction| {
+            let pipeline = pipeline.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                pipeline.execute(transaction)
+            })
+        });
+        start.wait();
+        let mut completed = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        completed.sort_unstable();
+        assert_eq!(completed, vec![17, 18]);
+        assert_eq!(peak_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn persistent_runtime_publishes_all_phase_outputs_in_one_stream_batch() {
+        let outputs = (0..4)
+            .map(|index| PublishedOutput {
+                cuda_ptr: 0x1000 + index * 0x100,
+                bytes: vec![index as u8; 64],
+            })
+            .collect::<Vec<_>>();
+        let mut publisher = FakeResultPublisher::default();
+        publish_outputs_with(&mut publisher, 0x55, &outputs).unwrap();
+        assert_eq!(publisher.batches, 1);
+        assert_eq!(publisher.copies, 4);
+        assert_eq!(publisher.streams, vec![0x55]);
+        assert_eq!(publisher.context_synchronizations, 0);
+    }
 
     fn identity(role: Iq1sExpertRole) -> Iq1sTensorIdentity {
         let (name, ne, nb) = match role {
@@ -1098,6 +1966,61 @@ mod tests {
         }
     }
 
+    fn shared_gate_up_phase(distinct_up_activation: bool) -> (Arc<ArenaPlan>, PhaseSnapshot) {
+        let gate_arena = arena(Iq1sExpertRole::Gate, 1);
+        let up_arena = arena(Iq1sExpertRole::Up, 1);
+        let mut shards = gate_arena.shards.clone();
+        shards.extend(up_arena.shards.iter().cloned().map(|mut shard| {
+            shard.offset += 8 * 1024 * 1024;
+            shard
+        }));
+        let combined_arena = Arc::new(ArenaPlan {
+            generation: gate_arena.generation,
+            model_sha256: gate_arena.model_sha256,
+            bank_bytes: gate_arena.bank_bytes,
+            weight_bytes: gate_arena.weight_bytes,
+            shards,
+            hashes_verified: true,
+        });
+
+        let mut phase = snapshot(2, false);
+        let up_identity = identity(Iq1sExpertRole::Up);
+        let up_launches = phase.projections[0]
+            .launches
+            .iter()
+            .enumerate()
+            .map(|(index, gate_launch)| {
+                let mut packed = gate_launch.packed_activations().to_vec();
+                if distinct_up_activation {
+                    packed[0] = packed[0].wrapping_add(1);
+                }
+                capture_activation_from_host(
+                    LogicalLaunch {
+                        matrix_ptr: 0x50_0000,
+                        activation_ptr: gate_launch.launch.activation_ptr,
+                        output_ptr: 0x60_0000 + index * 0x2000,
+                        allocation_generation: 9,
+                        content_hash: up_identity.content_sha256,
+                        signature: gate_launch.launch.signature.clone(),
+                    },
+                    &packed,
+                )
+                .unwrap()
+            })
+            .collect();
+        phase.projections.push(CapturedProjection {
+            role: Iq1sExpertRole::Up,
+            weight: ResolvedIq1sWeight {
+                identity: up_identity.clone(),
+                expert: 0,
+                allocation_generation: 9,
+                content_sha256: up_identity.content_sha256,
+            },
+            launches: up_launches,
+        });
+        (combined_arena, phase)
+    }
+
     #[test]
     fn iq1s_persistent_runtime_packs_q8_k_major_lane_minor() {
         let lane0 = (0..32 * Q8_1_MMQ_BYTES)
@@ -1122,14 +2045,14 @@ mod tests {
     #[test]
     fn iq1s_persistent_runtime_groups_experts_for_all_active_batches_and_modes() {
         let arena = arena(Iq1sExpertRole::Gate, 3);
-        for batch in [1, 6, 9, 16] {
+        for batch in [1, 6, 9, 16, 32] {
             for distinct in [false, true] {
                 for mode in ["handwritten", "compiler"] {
                     let prepared = prepare_phase(&arena, snapshot(batch, distinct), mode).unwrap();
                     let groups = if distinct {
                         usize::from(batch.min(3))
                     } else {
-                        1
+                        usize::from(batch).div_ceil(16)
                     };
                     assert_eq!(
                         prepared
@@ -1144,13 +2067,111 @@ mod tests {
                     assert_eq!(prepared.buffers.token_maps.len(), groups);
                     assert!(Arc::ptr_eq(&prepared.arena, &arena));
                     for commands in &prepared.compiled.commands {
-                        assert!(commands
-                            .windows(2)
-                            .all(|pair| pair[0].expert_id < pair[1].expert_id));
+                        assert!(commands.windows(2).all(|pair| (
+                            pair[0].expert_id,
+                            pair[0].token_map_offset
+                        ) < (
+                            pair[1].expert_id,
+                            pair[1].token_map_offset
+                        )));
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn iq1s_persistent_runtime_reuses_exact_gate_up_activation_slab() {
+        let (arena, phase) = shared_gate_up_phase(false);
+        let prepared = prepare_phase(&arena, phase, "compiler").unwrap();
+        assert_eq!(prepared.buffers.activations.len(), 1);
+        assert_eq!(prepared.compiled.activations.len(), 1);
+        assert_ne!(
+            prepared.compiled.activations[0].source_identity_sha256,
+            [0; 32]
+        );
+        for commands in &prepared.compiled.commands {
+            assert_eq!(commands.len(), 2);
+            assert_eq!(commands[0].input_offset, commands[1].input_offset);
+        }
+
+        let (arena, phase) = shared_gate_up_phase(true);
+        let distinct = prepare_phase(&arena, phase, "compiler").unwrap();
+        assert_eq!(distinct.buffers.activations.len(), 2);
+        assert_eq!(distinct.compiled.activations.len(), 2);
+        assert_ne!(
+            distinct.compiled.activations[0].source_identity_sha256,
+            distinct.compiled.activations[1].source_identity_sha256
+        );
+    }
+
+    #[test]
+    fn iq1s_persistent_runtime_activation_identity_binds_lane_order() {
+        let phase = snapshot(2, false);
+        let mut lanes = phase
+            .routes
+            .iter()
+            .copied()
+            .zip(phase.projections[0].launches.iter().cloned())
+            .collect::<Vec<_>>();
+        let forward = packed_activation_identity(&phase.key, &lanes);
+        lanes.reverse();
+        let reversed = packed_activation_identity(&phase.key, &lanes);
+        assert_ne!(forward, reversed);
+    }
+
+    #[test]
+    fn iq1s_persistent_runtime_keeps_allocation_and_session_generations_independent() {
+        let arena = arena(Iq1sExpertRole::Gate, 1);
+        let mut phase = snapshot(1, false);
+        phase.projections[0].weight.allocation_generation = 27;
+        phase.projections[0].launches[0]
+            .launch
+            .allocation_generation = 27;
+
+        let prepared = prepare_phase(&arena, phase, "handwritten").unwrap();
+        assert_eq!(prepared.arena.generation, 9);
+    }
+
+    #[test]
+    fn iq1s_persistent_runtime_diagnostic_comparison_policy_is_explicit_opt_in() {
+        assert!(!initial_sampled_comparison_complete(false));
+        assert!(initial_sampled_comparison_complete(true));
+    }
+
+    #[test]
+    fn iq1s_persistent_runtime_qualifies_complete_name_and_digest_pairs() {
+        let original = [
+            0x9c, 0x83, 0xdc, 0xae, 0x07, 0xb4, 0xc7, 0xbf, 0x1d, 0x2e, 0x1c, 0xeb,
+            0xf4, 0x6c, 0xcf, 0x0f, 0xf1, 0xeb, 0xf8, 0x84, 0x8a, 0x43, 0x70, 0x35,
+            0xfe, 0xf1, 0x45, 0x1d, 0xee, 0x77, 0x70, 0xa3,
+        ];
+        let gridrom = [
+            0xd7, 0x2f, 0xf7, 0x33, 0x6c, 0xb4, 0xdd, 0x49, 0x86, 0x7c, 0x5f, 0x22,
+            0x08, 0xa3, 0x43, 0x92, 0x81, 0xea, 0xab, 0x1b, 0x0a, 0x9e, 0x59, 0x4b,
+            0x45, 0x8a, 0x4f, 0xec, 0xc6, 0xb7, 0x99, 0x48,
+        ];
+
+        assert!(qualified_persistent_xclbin_identity(
+            "qwen397b_iq1s_layer_persistent_9c83dcae.xclbin",
+            original,
+        ));
+        assert!(qualified_persistent_xclbin_identity(
+            "qwen397b_iq1s_layer_persistent_d72ff7336cb4dd49.xclbin",
+            gridrom,
+        ));
+        assert!(!qualified_persistent_xclbin_identity(
+            "qwen397b_iq1s_layer_persistent_9c83dcae.xclbin",
+            gridrom,
+        ));
+        assert!(!qualified_persistent_xclbin_identity(
+            "qwen397b_iq1s_layer_persistent_d72ff7336cb4dd49.xclbin",
+            original,
+        ));
+        assert!(!qualified_persistent_xclbin_identity(
+            "qwen397b_iq1s_layer_persistent_unreviewed.xclbin",
+            [0x5a; 32],
+        ));
     }
 
     #[test]
@@ -1184,6 +2205,44 @@ mod tests {
         ] {
             assert!(bind_runtime_identity(&mut binding, changed, arena.clone()).is_err());
         }
+    }
+
+    #[test]
+    fn iq1s_persistent_progress_is_separate_fail_closed_nonproof_jsonl() {
+        let directory = tempdir().unwrap();
+        let ledger_path = directory.path().join("phase-ledger.jsonl");
+        let progress_path = directory.path().join("progress.jsonl");
+        let identity = PersistentRuntimeIdentity {
+            model_sha256: [0x11; 32],
+            xclbin_sha256: [0x33; 32],
+            device_index: 0,
+            session_generation: 9,
+        };
+        let mut sink = ProgressSink::create_at(&progress_path, &ledger_path, &identity).unwrap();
+        sink.append(
+            "phase_prepared",
+            None,
+            None,
+            None,
+            Some(71),
+            Some(7),
+            Some("A"),
+            Some(3),
+            None,
+        )
+        .unwrap();
+        drop(sink);
+
+        let line = std::fs::read_to_string(&progress_path).unwrap();
+        let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(record["schema_version"], 1);
+        assert_eq!(record["stage"], "phase_prepared");
+        assert_eq!(record["transaction"], 71);
+        assert_eq!(record["slot_generation"], 3);
+        for proof_only in ["comparison", "timings_us", "commands_per_cu", "status"] {
+            assert!(record.get(proof_only).is_none());
+        }
+        assert!(ProgressSink::create_at(&progress_path, &ledger_path, &identity).is_err());
     }
 
     #[test]
@@ -1225,5 +2284,93 @@ mod tests {
                 .all(|value| *value == bank as f32 + 1.0));
         }
         validate_all_finite(&outputs).unwrap();
+    }
+
+    #[test]
+    fn iq1s_persistent_numerical_failure_capture_is_complete_nonproof_and_immutable() {
+        let directory = tempdir().unwrap();
+        let capture = directory.path().join("failure-capture");
+        let prepared = prepare_phase(
+            &arena(Iq1sExpertRole::Gate, 1),
+            snapshot(1, false),
+            "handwritten",
+        )
+        .unwrap();
+        let binding = prepared.output_bindings[0].clone();
+        let identity = PersistentRuntimeIdentity {
+            model_sha256: [0x11; 32],
+            xclbin_sha256: [0x33; 32],
+            device_index: 0,
+            session_generation: 9,
+        };
+        let matrix = vec![0x41; 819_200];
+        let activation = vec![0x52; 32 * Q8_1_MMQ_BYTES];
+        let reference = vec![0.119_955_09_f32, -0.5];
+        let actual = vec![0.111_208_32_f32, -0.5];
+        let mismatch = NumericalMismatch {
+            index: 0,
+            actual: actual[0],
+            reference: reference[0],
+            absolute_error: (actual[0] - reference[0]).abs(),
+            limit: 1.0e-4 + 1.0e-3 * reference[0].abs(),
+        };
+
+        write_numerical_failure_capture_at(
+            &capture,
+            &identity,
+            "handwritten",
+            &prepared,
+            &binding,
+            &matrix,
+            &activation,
+            &reference,
+            &actual,
+            mismatch,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(capture.join("matrix.iq1s.bin")).unwrap(), matrix);
+        assert_eq!(std::fs::read(capture.join("activation.q8_1.bin")).unwrap(), activation);
+        assert_eq!(
+            std::fs::read(capture.join("reference.f32.bin")).unwrap(),
+            reference.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::fs::read(capture.join("actual.f32.bin")).unwrap(),
+            actual.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>()
+        );
+        for bank in 0..ARENA_BANK_COUNT {
+            assert!(capture.join(format!("bank-{bank}.commands.json")).is_file());
+            assert!(capture.join(format!("bank-{bank}.program.bin")).is_file());
+            assert!(capture.join(format!("bank-{bank}.program.asm")).is_file());
+        }
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(capture.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(manifest["status"], "numerical_mismatch_nonproof");
+        assert_eq!(manifest["trace_mode"], "handwritten");
+        assert_eq!(manifest["transaction_id"], 71);
+        assert_eq!(manifest["layer_id"], 7);
+        assert_eq!(manifest["mismatch"]["index"], 0);
+        assert_eq!(manifest["binding"]["tensor_name"], "blk.7.ffn_gate_exps.weight");
+        assert_eq!(manifest["files"].as_array().unwrap().len(), 16);
+        assert!(manifest.get("proof_status").is_none());
+
+        let error = write_numerical_failure_capture_at(
+            &capture,
+            &identity,
+            "handwritten",
+            &prepared,
+            &binding,
+            &matrix,
+            &activation,
+            &reference,
+            &actual,
+            mismatch,
+        )
+        .unwrap_err();
+        assert!(error.contains("create numerical failure capture directory"));
     }
 }

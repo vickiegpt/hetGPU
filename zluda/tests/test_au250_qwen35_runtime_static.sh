@@ -12,6 +12,7 @@ iq1s_runner="${repo_root}/tools/run_qwen35_iq1s_au250_hybrid.sh"
 iq1s_validator="${repo_root}/zluda/tests/validate_qwen35_iq1s_au250_proof.py"
 cuda13_launch_shim="${repo_root}/tools/qwen35_cuda13_launch_shim.c"
 cuda13_launch_map="${repo_root}/tools/qwen35_cuda13_launch_shim.map"
+cuda13_launch_shim_test="${repo_root}/zluda/tests/qwen35_cuda13_launch_shim_test.c"
 build_preflight="${repo_root}/tools/qwen35_build_preflight.py"
 function_rs="${repo_root}/zluda/src/impl/function.rs"
 iq1s_standalone="${repo_root}/zluda/tests/run_au250_xrt_iq1s.sh"
@@ -27,6 +28,8 @@ bash -n "${wrapper}"
 bash -n "${builder}"
 bash -n "${runner}"
 bash -n "${iq1s_runner}"
+grep -Fq 'profile=one-token' "${iq1s_runner}"
+test "$(grep -Fc -- '--profile "${profile}"' "${iq1s_runner}")" -eq 2
 grep -Fq '#define _GNU_SOURCE' "${cublas_shim}"
 
 grep -Fq 'AU250_QWEN_MODEL_ROOT:-/root/models/qwen35-tq1' "${wrapper}"
@@ -91,12 +94,31 @@ grep -Fq 'struct hetgpu_iq1s_stream_state' "${repo_root}/tools/llama-qwen35-tq1-
 grep -Fq 'state.gate_seen && state.up_seen && !state.phase_a_committed' \
     "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
 grep -Fq 'hetgpu_iq1s_commit_after_down' "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
+grep -Fq 'hetgpu_iq1s_try_close_gpu_down' "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
+grep -Fq '!hetgpu_iq1s_try_close_gpu_down(state)' \
+    "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
 grep -Fq 'hetgpu_iq1s_note_route_weights' "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
 grep -Fq 'static std::atomic<uint64_t> hetgpu_iq1s_next_transaction{1}' \
     "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
 grep -Fq 'hetgpu_iq1s_graph_boundary("exception")' \
     "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
 grep -Fq 'hetgpu_iq1s_abort_active_for_cuda_error();' \
+    "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
+grep -Fq 'int32_t * expert_ids_device = nullptr;' \
+    "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
+grep -Fq 'cudaMemcpy2DAsync(' \
+    "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
+grep -Fq 'constexpr uint32_t max_batch = 32;' \
+    "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
+grep -Fq 'ids->ne[1] > max_batch' \
+    "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
+grep -Fq 'max_batch * top_k' \
+    "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
+grep -Fq 'state.expert_ids_device, top_k_bytes,' \
+    "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
+grep -Fq 'ids->data, ids->nb[1], top_k_bytes, static_cast<size_t>(ids->ne[1]),' \
+    "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
+grep -Fq 'static_cast<const int32_t *>(state.expert_ids_device)' \
     "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch"
 python3 - "${repo_root}/tools/llama-qwen35-tq1-hetgpu.patch" <<'PY'
 import pathlib
@@ -121,20 +143,23 @@ test "$(grep -Fc -- '--ignore-submodules=all' "${builder}")" -ge 2
 grep -Fq 'cuda_math_header_sha256' "${builder}"
 grep -Fq '/qwen-build/manifest.json' "${builder}"
 
-grep -Fq -- '--ctx-size", str(SERVER_CONTEXT_TOKENS)' "${evaluator}"
+grep -Fq -- '--ctx-size", str(profile_values["max_active"] * CONTEXT_TOKENS_PER_REQUEST)' "${evaluator}"
 grep -Fq -- '--n-gpu-layers", "999"' "${evaluator}"
 grep -Fq -- '--verbosity", "4"' "${evaluator}"
-grep -Fq -- '--parallel", "16"' "${evaluator}"
-grep -Fq '"n_predict": 32' "${evaluator}"
+grep -Fq -- '--parallel", str(profile_values["max_active"])' "${evaluator}"
+grep -Fq 'server_batch = 16 if args.profile == "one-token" else profile_values["max_active"]' "${evaluator}"
+grep -Fq -- '"--batch-size", str(server_batch)' "${evaluator}"
+grep -Fq -- '"--ubatch-size", str(server_batch)' "${evaluator}"
+grep -Fq '"n_predict": tokens_per_request' "${evaluator}"
 grep -Fq '"temperature": 0.0' "${evaluator}"
 grep -Fq '"seed": 42' "${evaluator}"
 grep -Fq '"cache_prompt": False' "${evaluator}"
-grep -Fq 'REQUEST_COUNT = 64' "${evaluator}"
-grep -Fq 'MAX_ACTIVE_REQUESTS = 16' "${evaluator}"
+grep -Fq 'REQUEST_COUNT = PROFILES["full"]["request_count"]' "${evaluator}"
+grep -Fq 'MAX_ACTIVE_REQUESTS = PROFILES["full"]["max_active"]' "${evaluator}"
 grep -Fq 'CONTEXT_TOKENS_PER_REQUEST = 512' "${evaluator}"
-grep -Fq 'PREDICT_TOKENS = 32' "${evaluator}"
-grep -Fq 'MEASUREMENTS = 3' "${evaluator}"
-grep -Fq 'WARMUPS = 1' "${evaluator}"
+grep -Fq 'PREDICT_TOKENS = PROFILES["full"]["tokens_per_request"]' "${evaluator}"
+grep -Fq 'MEASUREMENTS = PROFILES["full"]["measurements"]' "${evaluator}"
+grep -Fq 'WARMUPS = PROFILES["full"]["warmups"]' "${evaluator}"
 grep -Fq 'Reply with exactly OK and no other text.' "${evaluator}"
 grep -Fq 'semantic' "${evaluator}"
 grep -Fq 'sha256' "${evaluator}"
@@ -164,6 +189,7 @@ grep -Fq 'qwen35_build_preflight.py' "${iq1s_runner}"
 grep -Fq -- '--build-root /qwen-build' "${iq1s_runner}"
 grep -Fq 'libggml="$(realpath -e /qwen-build/llama-build/bin/libggml.so)"' "${iq1s_runner}"
 grep -Fq 'HETGPU_QWEN_IQ1S_STRICT=1' "${iq1s_runner}"
+grep -Fq 'HETGPU_QWEN_IQ1S_PERSISTENT=1' "${iq1s_runner}"
 grep -Fq 'HETGPU_QWEN_MODEL_SHA256="${model_sha256}"' "${iq1s_runner}"
 test "$(grep -Fc 'export HETGPU_QWEN_MODEL_SHA256="${model_sha256}"' "${iq1s_runner}")" -eq 1
 model_sha_line="$(grep -Fn 'export HETGPU_QWEN_MODEL_SHA256="${model_sha256}"' "${iq1s_runner}" | cut -d: -f1)"
@@ -175,6 +201,13 @@ grep -Fq 'libqwen35_cuda13_launch_shim.so' "${iq1s_runner}"
 grep -Fq '"${cuda13_launch_shim}:${libnvcuda}"' "${iq1s_runner}"
 test -f "${cuda13_launch_shim}"
 test -f "${cuda13_launch_map}"
+test -f "${cuda13_launch_shim_test}"
+shim_test_dir="$(mktemp -d)"
+trap 'rm -rf -- "${shim_test_dir}"' EXIT
+cc -O2 -Wall -Wextra -Werror -DHETGPU_QWEN35_LAUNCH_SHIM_TEST \
+    "${cuda13_launch_shim}" "${cuda13_launch_shim_test}" \
+    -ldl -lpthread -o "${shim_test_dir}/qwen35_cuda13_launch_shim_test"
+"${shim_test_dir}/qwen35_cuda13_launch_shim_test"
 grep -Fq 'nvidia_capture_modern_iq1s_xrt_moe_mmvq' "${function_rs}"
 grep -Fq 'export CARGO_BUILD_JOBS=32' "${iq1s_standalone}"
 grep -Fq 'HETGPU_XRT_BAR0_RESOURCE=/sys/bus/pci/devices/0000:64:00.1/resource0' "${iq1s_standalone}"

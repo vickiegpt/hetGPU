@@ -7,6 +7,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -24,13 +25,93 @@ def load_evaluator():
     return module
 
 
-def test_continuous_batch_runs_64_requests_as_four_16_prompt_waves(monkeypatch):
+class FakeSseResponse:
+    def __init__(self, events):
+        self.lines = [
+            ("data: " + json.dumps(event) + "\n\n").encode("utf-8")
+            for event in events
+        ] + [b"data: [DONE]\n\n"]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
+def test_stream_completion_preserves_terminal_error_event(tmp_path, monkeypatch):
+    evaluator = load_evaluator()
+    events_path = tmp_path / "stream-events.json"
+    response = FakeSseResponse([
+        {"prompt_progress": {"processed": 15}, "content": "", "tokens": []},
+        {"error": {"type": "backend", "message": "phase A failed"}},
+    ])
+    monkeypatch.setattr(
+        evaluator.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: response,
+    )
+
+    with pytest.raises(evaluator.EvaluationError, match="phase A failed"):
+        evaluator.stream_completion("http://fake", {}, 1, events_path)
+
+    artifact = json.loads(events_path.read_text(encoding="utf-8"))
+    assert artifact["status"] == "error"
+    assert artifact["events"][-1]["error"]["message"] == "phase A failed"
+
+
+def test_stream_completion_preserves_empty_done_parser_error(tmp_path, monkeypatch):
+    evaluator = load_evaluator()
+    events_path = tmp_path / "stream-events.json"
+    monkeypatch.setattr(
+        evaluator.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: FakeSseResponse([]),
+    )
+
+    with pytest.raises(evaluator.EvaluationError, match="omitted final response"):
+        evaluator.stream_completion("http://fake", {}, 1, events_path)
+
+    artifact = json.loads(events_path.read_text(encoding="utf-8"))
+    assert artifact == {
+        "events": [],
+        "parser_error": "completion stream omitted final response or generated tokens",
+        "schema_version": 1,
+        "status": "error",
+    }
+
+
+def test_stream_completion_batch_preserves_terminal_error_event(tmp_path, monkeypatch):
+    evaluator = load_evaluator()
+    events_path = tmp_path / "batch-stream-events.json"
+    response = FakeSseResponse([
+        {"index": 0, "prompt_progress": {"processed": 15}, "content": "", "tokens": []},
+        {"error": {"type": "backend", "message": "slot generation stale"}},
+    ])
+    monkeypatch.setattr(
+        evaluator.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: response,
+    )
+
+    with pytest.raises(evaluator.EvaluationError, match="slot generation stale"):
+        evaluator.stream_completion_batch("http://fake", {}, 1, 1, events_path)
+
+    artifact = json.loads(events_path.read_text(encoding="utf-8"))
+    assert artifact["status"] == "error"
+    assert artifact["events"][-1]["error"]["message"] == "slot generation stale"
+
+
+def test_continuous_batch_runs_64_requests_as_two_32_prompt_waves(monkeypatch):
     evaluator = load_evaluator()
     observed_batches = []
 
     def fake_stream_batch(_base_url, body, batch_size, _timeout):
         observed_batches.append(body)
-        assert batch_size == 16
+        assert batch_size == 32
         return [{
             "token_ids": list(range(32)),
             "tokens_predicted": 32,
@@ -42,7 +123,7 @@ def test_continuous_batch_runs_64_requests_as_four_16_prompt_waves(monkeypatch):
         } for index in range(batch_size)]
 
     monkeypatch.setattr(evaluator, "stream_completion_batch", fake_stream_batch)
-    monkeypatch.setattr(evaluator, "erase_all_slots", lambda *_args: [287] * 16)
+    monkeypatch.setattr(evaluator, "erase_all_slots", lambda *_args: [287] * 32)
     batch = evaluator.run_continuous_batch(
         "http://127.0.0.1:1",
         evaluator.completion_request(list(range(256))),
@@ -51,12 +132,13 @@ def test_continuous_batch_runs_64_requests_as_four_16_prompt_waves(monkeypatch):
 
     assert len(batch["requests"]) == 64
     assert [item["request_id"] for item in batch["requests"]] == list(range(64))
-    assert batch["max_active"] == 16
-    assert len(observed_batches) == 4
-    assert all(len(body["prompt"]) == 16 for body in observed_batches)
+    assert batch["max_active"] == 32
+    assert batch["wave_count"] == 2
+    assert len(observed_batches) == 2
+    assert all(len(body["prompt"]) == 32 for body in observed_batches)
     assert batch["generated_tokens"] == 64 * 32
     assert batch["aggregate_generated_tokens_per_second"] > 0
-    assert batch["wave_slot_erase_evidence"] == [[287] * 16 for _ in range(3)]
+    assert batch["wave_slot_erase_evidence"] == [[287] * 32]
 
 
 def test_continuous_batch_pins_recurrent_outputs_to_stable_slots(monkeypatch):
@@ -74,17 +156,128 @@ def test_continuous_batch_pins_recurrent_outputs_to_stable_slots(monkeypatch):
         } for slot in range(batch_size)]
 
     monkeypatch.setattr(evaluator, "stream_completion_batch", fake_stream_batch)
-    monkeypatch.setattr(evaluator, "erase_all_slots", lambda *_args: [287] * 16)
+    monkeypatch.setattr(evaluator, "erase_all_slots", lambda *_args: [287] * 32)
     batch = evaluator.run_continuous_batch(
         "http://127.0.0.1:1",
         evaluator.completion_request(list(range(256))),
         timeout=10,
     )
 
-    assert [item["id_slot"] for item in batch["requests"]] == list(range(16)) * 4
+    assert [item["id_slot"] for item in batch["requests"]] == list(range(32)) * 2
     assert [item["token_ids"] for item in batch["requests"]] == [
-        [request_id % 16] * 32 for request_id in range(64)
+        [request_id % 32] * 32 for request_id in range(64)
     ]
+
+
+def test_enforce_aggregate_target_requires_every_fixed_workload_measurement():
+    evaluator = load_evaluator()
+    measurements = [
+        {
+            "generation_tokens_per_second": tps,
+            "generated_tokens": 2048,
+            "wave_count": 2,
+            "measured_wall_seconds": 2048.0 / tps,
+        }
+        for tps in (28.1, 29.0, 30.0)
+    ]
+
+    summary = evaluator.enforce_aggregate_target(measurements)
+    assert summary == {
+        "target_tps": 28.0,
+        "max_wall_seconds": 2048.0 / 28.0,
+        "minimum_tps": 28.1,
+        "median_tps": 29.0,
+        "maximum_tps": 30.0,
+        "measurement_tps": [28.1, 29.0, 30.0],
+    }
+
+    mutations = [
+        ("generation_tokens_per_second", 27.9),
+        ("generated_tokens", 2047),
+        ("wave_count", 3),
+        ("measured_wall_seconds", 73.144),
+        ("generation_tokens_per_second", 1000.0),
+    ]
+    for field, value in mutations:
+        rejected = [dict(item) for item in measurements]
+        rejected[0][field] = value
+        with pytest.raises(evaluator.EvaluationError):
+            evaluator.enforce_aggregate_target(rejected)
+
+    refill = [dict(item, scheduler="slot-refill", wave_count=0) for item in measurements]
+    assert evaluator.enforce_aggregate_target(refill)["minimum_tps"] == 28.1
+
+
+def test_slot_refill_reuses_fast_slot_before_slow_slot_finishes(monkeypatch):
+    evaluator = load_evaluator()
+    refilled = threading.Event()
+    calls = [0, 0]
+    erases = []
+
+    def complete(_url, body, _timeout, events_path=None):
+        slot = body["id_slot"]
+        generation = calls[slot]
+        calls[slot] += 1
+        if slot == 1 and generation == 0:
+            assert refilled.wait(2), "refill waited for a whole-wave barrier"
+        if slot == 0 and generation == 1:
+            refilled.set()
+        return {
+            "token_ids": [slot], "tokens_predicted": 1, "tokens_evaluated": 2,
+            "ttft_ms": 0.1, "end_to_end_ms": 0.2, "timings": {},
+            "id_slot": slot,
+        }
+
+    def erase(_url, path, _body, _timeout):
+        slot = int(path.split("/")[2].split("?")[0])
+        erases.append(slot)
+        return {"id_slot": slot, "n_erased": 2}
+
+    monkeypatch.setattr(evaluator, "stream_completion", complete)
+    monkeypatch.setattr(evaluator, "post_json", erase)
+    batch = evaluator.run_continuous_batch(
+        "http://fake", evaluator.completion_request([1, 2], 1), 3,
+        profile={"request_count": 4, "max_active": 2, "tokens_per_request": 1},
+        scheduler="slot-refill",
+    )
+    assert refilled.is_set()
+    assert calls == [2, 2]
+    assert sorted(erases) == [0, 1]
+    assert batch["wave_count"] == 0
+    assert batch["wave_slot_erase_evidence"] == []
+    assert batch["scheduler"] == "slot-refill"
+    assert [r["id_slot"] for r in batch["requests"]] == [0, 1, 0, 1]
+    assert [r["request_id"] for r in batch["requests"]] == list(range(4))
+    assert len(batch["slot_reuse_evidence"]) == 2
+    assert len(batch["admission_events"]) == 8
+    assert max(e["active"] for e in batch["admission_events"]) <= 2
+
+
+@pytest.mark.parametrize("corruption", ["slot", "tokens", "erase"])
+def test_slot_refill_fails_before_reusing_invalid_slot(monkeypatch, corruption):
+    evaluator = load_evaluator()
+    calls = []
+
+    def complete(_url, body, _timeout, events_path=None):
+        calls.append(body["id_slot"])
+        return {
+            "token_ids": [] if corruption == "tokens" else [7],
+            "tokens_predicted": 1, "tokens_evaluated": 2,
+            "ttft_ms": 0.1, "end_to_end_ms": 0.2, "timings": {},
+            "id_slot": 9 if corruption == "slot" else 0,
+        }
+
+    monkeypatch.setattr(evaluator, "stream_completion", complete)
+    monkeypatch.setattr(evaluator, "post_json", lambda *_args: {
+        "id_slot": 9 if corruption == "erase" else 0, "n_erased": 2,
+    })
+    with pytest.raises(evaluator.EvaluationError):
+        evaluator.run_continuous_batch(
+            "http://fake", evaluator.completion_request([1, 2], 1), 3,
+            profile={"request_count": 2, "max_active": 1, "tokens_per_request": 1},
+            scheduler="slot-refill",
+        )
+    assert calls == [0]
 
 
 FAKE_SERVER = r'''#!/usr/bin/env python3
@@ -131,18 +324,22 @@ class Handler(BaseHTTPRequestHandler):
             content = body["content"]
             if content.startswith("seed "):
                 tokens = list(range(300))
-            elif content == "roundtrip-256":
-                tokens = list(range(256))
+            elif content.startswith("roundtrip-"):
+                tokens = list(range(int(content.removeprefix("roundtrip-"))))
             else:
                 tokens = [701, 702]
             self.send_json({"tokens": tokens})
             return
         if self.path == "/detokenize":
-            assert body["tokens"] == list(range(256))
-            self.send_json({"content": "roundtrip-256"})
+            count = len(body["tokens"])
+            assert body["tokens"] == list(range(count))
+            self.send_json({"content": f"roundtrip-{count}"})
             return
         if self.path == "/apply-template":
-            assert body["messages"] == [{"role": "user", "content": "Reply with exactly OK and no other text."}]
+            assert body["messages"] in (
+                [{"role": "user", "content": "Reply with exactly OK and no other text."}],
+                [{"role": "user", "content": "Reply OK."}],
+            )
             assert body["chat_template_kwargs"] == {"enable_thinking": False}
             self.send_json({"prompt": "templated semantic prompt"})
             return
@@ -158,6 +355,7 @@ class Handler(BaseHTTPRequestHandler):
         batched = isinstance(body["prompt"], list) and body["prompt"] and isinstance(body["prompt"][0], list)
         semantic = isinstance(body["prompt"], str)
         hardware_probe = semantic and body["n_predict"] == 2
+        tokens_evaluated = 2 if semantic else len(body["prompt"][0] if batched else body["prompt"])
         if hardware_probe and mode != "cuda" and not comparison_emitted:
             comparison_emitted = True
             comparison = {
@@ -281,37 +479,38 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         result_indices = range(len(body["prompt"])) if batched else range(1)
         for result_index in result_indices:
+            result_slot = result_index if batched else body.get("id_slot", 0)
             for processed in (0, 128, 256):
                 progress = {
                     "index": result_index,
-                    "id_slot": result_index,
+                    "id_slot": result_slot,
                     "content": "",
                     "tokens": [0],
                     "stop": False,
                     "tokens_predicted": 0,
-                    "tokens_evaluated": 2 if semantic else 256,
-                    "prompt_progress": {"total": 256, "cache": 0, "processed": processed, "time_ms": processed},
+                    "tokens_evaluated": tokens_evaluated,
+                    "prompt_progress": {"total": tokens_evaluated, "cache": 0, "processed": processed, "time_ms": processed},
                 }
                 self.wfile.write(("data: " + json.dumps(progress) + "\n\n").encode())
             for token_index, (token, piece) in enumerate(zip(tokens, pieces)):
                 payload = {
                     "index": result_index,
-                    "id_slot": result_index,
+                    "id_slot": result_slot,
                     "content": piece,
                     "tokens": [token],
                     "stop": False,
                     "tokens_predicted": token_index + 1,
-                    "tokens_evaluated": 2 if semantic else 256,
+                    "tokens_evaluated": tokens_evaluated,
                 }
                 self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
             final = {
                 "index": result_index,
-                "id_slot": result_index,
+                "id_slot": result_slot,
                 "content": "",
                 "tokens": [],
                 "stop": True,
                 "tokens_predicted": len(tokens),
-                "tokens_evaluated": 2 if semantic else 256,
+                "tokens_evaluated": tokens_evaluated,
                 "timings": {
                     "prompt_ms": 1280.0,
                     "prompt_per_second": 200.0,
@@ -323,7 +522,10 @@ class Handler(BaseHTTPRequestHandler):
 
 print("llama_model_load_tensors: offloaded 65/65 layers to GPU", file=sys.stderr, flush=True)
 print("llama_perf_context_print:        load time =    1234.00 ms", file=sys.stderr, flush=True)
-ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+class TestHTTPServer(ThreadingHTTPServer):
+    request_queue_size = 128
+
+TestHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
 '''
 
 
@@ -338,7 +540,7 @@ def make_executable(path, content):
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def run_mode(tmp_path, mode, server, requests, profile="full"):
+def run_mode(tmp_path, mode, server, requests, profile="full", scheduler="waves"):
     proof = tmp_path / mode
     model = tmp_path / "model.gguf"
     model.write_bytes(b"model")
@@ -350,6 +552,7 @@ def run_mode(tmp_path, mode, server, requests, profile="full"):
             str(EVALUATOR),
             "--mode", mode,
             "--profile", profile,
+            "--scheduler", scheduler,
             "--server", str(server),
             "--model", str(model),
             "--prompt-seed", str(tmp_path / "seed.txt"),
@@ -385,12 +588,39 @@ def test_evaluator_profiles_are_explicit_and_fixed():
         },
         "full": {
             "request_count": 64,
-            "max_active": 16,
+            "max_active": 32,
             "tokens_per_request": 32,
             "measurements": 3,
             "warmups": 1,
         },
     }
+    assert evaluator.PROMPT_TOKENS_BY_PROFILE == {"one-token": 16, "full": 256}
+    assert evaluator.SEMANTIC_PROMPTS_BY_PROFILE["one-token"] == "Reply OK."
+
+
+def test_slot_refill_full_http_roundtrip_retains_every_request(tmp_path):
+    server = tmp_path / "fake-server.py"
+    make_executable(server, FAKE_SERVER)
+    (tmp_path / "seed.txt").write_text("seed " * 300, encoding="utf-8")
+    (tmp_path / "health.txt").write_text("Level 0 : 0x0 (GOOD)\n", encoding="utf-8")
+    record = run_mode(tmp_path, "cuda", server, tmp_path / "requests.jsonl",
+                      scheduler="slot-refill")
+    assert record["scheduler"] == "slot-refill"
+    assert record["slot_ids_by_request"] == list(range(32)) * 2
+    assert record["wave_slot_erase_evidence"] == [[], [], [], []]
+    assert all(item["generated_tokens"] == 2048 and item["wave_count"] == 0
+               for item in record["measurements"])
+    assert len(record["scheduler_evidence"]) == 4
+    for evidence in record["scheduler_evidence"]:
+        assert len(evidence["admission_events"]) == 128
+        assert len(evidence["slot_reuse_evidence"]) == 32
+        assert evidence["admission_events"][-1]["active"] == 0
+        spec = importlib.util.spec_from_file_location(
+            "refill_validator", Path(__file__).with_name("validate_qwen35_iq1s_au250_proof.py")
+        )
+        validator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(validator)
+        validator._validate_refill_round(evidence, 64, 32, "http-roundtrip")
 
 
 def test_fake_server_preserves_identical_requests_and_fixed_counts(tmp_path):
@@ -407,15 +637,16 @@ def test_fake_server_preserves_identical_requests_and_fixed_counts(tmp_path):
     modes = (cuda, handwritten, compiler)
     assert all(len(record["measurements"]) == 3 for record in modes)
     assert all(record["request_count"] == 64 for record in modes)
-    assert all(record["max_active_requests"] == 16 for record in modes)
+    assert all(record["max_active_requests"] == 32 for record in modes)
+    assert all(all(item["wave_count"] == 2 for item in record["measurements"]) for record in modes)
     assert all(record["generated_tokens_per_request"] == 32 for record in modes)
     assert all(record["prompt_token_ids"] == list(range(256)) for record in modes)
     assert all(record["generated_token_ids"] == list(range(1000, 1032)) for record in modes)
     assert all(len(record["generated_token_ids_by_request"]) == 64 for record in modes)
     assert all(record["token_equivalence_measurement"] == 0 for record in modes)
-    assert all(record["slot_ids_by_request"] == list(range(16)) * 4 for record in modes)
-    assert all(record["slot_erase_evidence"] == [[0] * 16 for _ in range(4)] for record in modes)
-    assert all(record["wave_slot_erase_evidence"] == [[[0] * 16] * 3] * 4 for record in modes)
+    assert all(record["slot_ids_by_request"] == list(range(32)) * 2 for record in modes)
+    assert all(record["slot_erase_evidence"] == [[0] * 32 for _ in range(4)] for record in modes)
+    assert all(record["wave_slot_erase_evidence"] == [[[0] * 32]] * 4 for record in modes)
     assert all(record["semantic"] == {"text": "OK", "token_ids": [777]} for record in modes)
     assert all(record["hardware_probe"]["token_ids"] == [777, 778] for record in modes)
     assert cuda["sampled_ffn_comparison"] is None
@@ -425,17 +656,19 @@ def test_fake_server_preserves_identical_requests_and_fixed_counts(tmp_path):
     for mode, record in zip(("cuda", "handwritten", "compiler"), modes):
         command = json.loads((tmp_path / mode / "command.json").read_text(encoding="utf-8"))
         assert "--no-warmup" in command
-        assert command[command.index("--parallel") + 1] == "16"
-        assert command[command.index("--ctx-size") + 1] == "8192"
+        assert command[command.index("--parallel") + 1] == "32"
+        assert command[command.index("--ctx-size") + 1] == "16384"
+        assert command[command.index("--batch-size") + 1] == "32"
+        assert command[command.index("--ubatch-size") + 1] == "32"
         assert command[command.index("--cache-ram") + 1] == "0"
         assert command[command.index("--flash-attn") + 1] == "on"
         assert "--no-cache-prompt" in command
         assert command[command.index("--slot-save-path") + 1].endswith(f"/{mode}/slot-state")
         assert record["context_tokens_per_request"] == 512
-        assert record["server_context_tokens"] == 8192
+        assert record["server_context_tokens"] == 16384
 
     records = [json.loads(line) for line in requests.read_text().splitlines()]
-    assert len(records) == 3 * (2 + 4 * 4)
+    assert len(records) == 3 * (2 + 4 * 2)
     cuda_bodies = [item["body"] for item in records if item["mode"] == "cuda"]
     handwritten_bodies = [item["body"] for item in records if item["mode"] == "handwritten"]
     compiler_bodies = [item["body"] for item in records if item["mode"] == "compiler"]
@@ -449,8 +682,8 @@ def test_fake_server_preserves_identical_requests_and_fixed_counts(tmp_path):
     assert probe["prompt"] == "templated semantic prompt"
     assert probe["n_predict"] == 2
     timed = cuda_bodies[2:]
-    assert len(timed) == 4 * 4
-    assert all(body["prompt"] == [list(range(256))] * 16 for body in timed)
+    assert len(timed) == 4 * 2
+    assert all(body["prompt"] == [list(range(256))] * 32 for body in timed)
     assert all(body["n_predict"] == 32 for body in timed)
     assert all(body["temperature"] == 0.0 and body["seed"] == 42 for body in timed)
     assert all(body["ignore_eos"] is True for body in timed)
@@ -475,15 +708,33 @@ def test_one_token_profile_records_exact_token_without_e2e_tps_label(tmp_path):
     }
     assert record["generated_token_ids"] == [1000]
     assert record["generated_token_ids_by_request"] == [[1000]]
+    assert record["prompt_tokens"] == 16
+    assert record["prompt_token_ids"] == list(range(16))
+    assert record["request_contract"]["prompt"] == list(range(16))
     assert record["measurements"][0]["generated_tokens"] == 1
     assert "aggregate_generated_tokens_per_second" not in record["measurements"][0]
     assert "e2e_tps" not in json.dumps(record).lower()
+    command = json.loads((tmp_path / "cuda" / "command.json").read_text(encoding="utf-8"))
+    assert command[command.index("--batch-size") + 1] == "16"
+    assert command[command.index("--ubatch-size") + 1] == "16"
+    for name in (
+        "semantic-stream-events.json",
+        "hardware-probe-stream-events.json",
+        "measurement-0-wave-0-stream-events.json",
+    ):
+        artifact = json.loads((tmp_path / "cuda" / name).read_text(encoding="utf-8"))
+        assert artifact["status"] == "pass"
+        assert artifact["events"]
+    bodies = [json.loads(line)["body"] for line in requests.read_text().splitlines()]
+    assert bodies[0]["prompt"] == "templated semantic prompt"
+    assert bodies[2]["prompt"] == [list(range(16))]
 
 
 def test_rejects_non_roundtripping_prompt(tmp_path):
     evaluator_source = EVALUATOR.read_text(encoding="utf-8")
     assert "retoken" in evaluator_source.lower()
-    assert "exactly 256" in evaluator_source.lower()
+    assert "prompt_tokens" in evaluator_source
+    assert "retokenized prompt does not exactly match" in evaluator_source
 
 
 def test_parse_load_ms_uses_verbose_server_timestamps():
@@ -952,7 +1203,7 @@ def test_iq1s_semantic_hardware_gate_passes_before_timed_requests(tmp_path):
     assert record["model_audit_sha256"] == hashlib.sha256(
         (tmp_path / "model-tensor-audit.json").read_bytes()
     ).hexdigest()
-    assert len(requests.read_text(encoding="utf-8").splitlines()) == 2 + 4 * 4
+    assert len(requests.read_text(encoding="utf-8").splitlines()) == 2 + 4 * 2
 
 
 def test_iq1s_semantic_hardware_gate_rejects_inactive_cu_before_warmup(tmp_path):

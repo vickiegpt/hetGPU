@@ -139,10 +139,15 @@ pub struct HetgpuSifiveSharedDdrSync {
 
 pub type HetgpuSifiveShardDdrInfo = HetgpuSifiveSharedDdrInfo;
 
-pub const SIFIVE_IOC_GET_INFO_SIZE: u64 =
-    _iowr(SIFIVE_MAGIC, 0, std::mem::size_of::<sifive_info_size>() as u64);
-pub const SIFIVE_IOC_GET_INFO: u64 = _iowr(SIFIVE_MAGIC, 1, std::mem::size_of::<sifive_info>() as u64);
-pub const SIFIVE_IOC_SUBMIT_OP: u64 = _iow(SIFIVE_MAGIC, 3, std::mem::size_of::<sifive_op>() as u64);
+pub const SIFIVE_IOC_GET_INFO_SIZE: u64 = _iowr(
+    SIFIVE_MAGIC,
+    0,
+    std::mem::size_of::<sifive_info_size>() as u64,
+);
+pub const SIFIVE_IOC_GET_INFO: u64 =
+    _iowr(SIFIVE_MAGIC, 1, std::mem::size_of::<sifive_info>() as u64);
+pub const SIFIVE_IOC_SUBMIT_OP: u64 =
+    _iow(SIFIVE_MAGIC, 3, std::mem::size_of::<sifive_op>() as u64);
 pub const SIFIVE_IOC_FREE_BO: u64 = _iow(SIFIVE_MAGIC, 4, std::mem::size_of::<sifive_bo>() as u64);
 pub const SIFIVE_IOC_ZLUDA_IRQ_LEGACY: u64 = _iow(
     SIFIVE_MAGIC,
@@ -1151,7 +1156,9 @@ impl SifiveDevice {
                 Some(libc::ENOTTY | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
             ) {
                 let sifive_path = format!("/dev/sifive{}", self.id);
-                if let Ok(sifive_file) = OpenOptions::new().read(true).write(true).open(&sifive_path) {
+                if let Ok(sifive_file) =
+                    OpenOptions::new().read(true).write(true).open(&sifive_path)
+                {
                     let sifive_fd = sifive_file.as_raw_fd();
                     irq_cmd = IOC_ZLUDA_IRQ;
                     std::sync::atomic::fence(Ordering::SeqCst);
@@ -1363,7 +1370,11 @@ impl SifiveDevice {
         if use_shared_ddr_control_window() && !zluda_irq_mock_enabled() {
             let mut shared_file = open_shared_ddr_window_file(self.id as usize);
             let mut mailbox_file = open_sifive_mailbox_file(self.id as usize);
-            clear_sifive_kernel_status_cached(&mut shared_file, &mut mailbox_file, self.id as usize)?;
+            clear_sifive_kernel_status_cached(
+                &mut shared_file,
+                &mut mailbox_file,
+                self.id as usize,
+            )?;
         }
 
         if std::env::var("HETGPU_SIFIVE_USE_DRIVER_JOB_IOCTL")
@@ -1418,7 +1429,11 @@ impl SifiveDevice {
         if use_shared_ddr_control_window() && !zluda_irq_mock_enabled() {
             let mut shared_file = open_shared_ddr_window_file(self.id as usize);
             let mut mailbox_file = open_sifive_mailbox_file(self.id as usize);
-            clear_sifive_kernel_status_cached(&mut shared_file, &mut mailbox_file, self.id as usize)?;
+            clear_sifive_kernel_status_cached(
+                &mut shared_file,
+                &mut mailbox_file,
+                self.id as usize,
+            )?;
         }
 
         if std::env::var("HETGPU_SIFIVE_USE_DRIVER_JOB_IOCTL")
@@ -1782,7 +1797,10 @@ impl SifiveDevice {
                 _ => {
                     return Err(Error::new(
                         ErrorKind::InvalidInput,
-                        format!("SIFIVE job_id {} has no firmware runtime table entry", job_id),
+                        format!(
+                            "SIFIVE job_id {} has no firmware runtime table entry",
+                            job_id
+                        ),
                     ));
                 }
             }
@@ -2549,7 +2567,8 @@ fn ensure_sifive_jobd_bootstrapped(dev: &SifiveDevice) -> std::io::Result<()> {
 }
 
 fn preloaded_arg_slot(job_id: u32) -> Option<usize> {
-    if job_id == hetgpu_sifive_job_id::GEMM && env_flag_enabled("HETGPU_SIFIVE_RUNTIME_TABLE_ONLY_GEMM")
+    if job_id == hetgpu_sifive_job_id::GEMM
+        && env_flag_enabled("HETGPU_SIFIVE_RUNTIME_TABLE_ONLY_GEMM")
     {
         return None;
     }
@@ -2602,7 +2621,10 @@ fn zluda_irq_mock_enabled() -> bool {
 }
 
 fn zluda_irq_trace_enabled() -> bool {
-    std::env::var("HETGPU_SIFIVE_ZLUDA_IRQ_TRACE").ok().as_deref() == Some("1")
+    std::env::var("HETGPU_SIFIVE_ZLUDA_IRQ_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 fn use_shared_ddr_control_window() -> bool {
@@ -2622,8 +2644,11 @@ fn use_shared_ddr_control_window() -> bool {
 }
 
 fn shared_ddr_control_reserved_bytes() -> usize {
-    parse_env_usize("HETGPU_SIFIVE_SHARED_DDR_PAYLOAD_BASE_OFF", 0x0020_0000usize)
-        .max(SIFIVE_CORE_NUM.max(1) * MBOX_SRAM_SIZE)
+    parse_env_usize(
+        "HETGPU_SIFIVE_SHARED_DDR_PAYLOAD_BASE_OFF",
+        0x0020_0000usize,
+    )
+    .max(SIFIVE_CORE_NUM.max(1) * MBOX_SRAM_SIZE)
 }
 
 fn shared_ddr_payload_base_off() -> u64 {
@@ -2736,8 +2761,12 @@ fn wait_shared_ddr_job_status_grace(
     while grace_start.elapsed() < grace_deadline {
         *shared_file = None;
         std::sync::atomic::fence(Ordering::SeqCst);
-        match read_shared_ddr_status_window_cached(shared_file, dev.id, sifive_completion_off(), buf)
-        {
+        match read_shared_ddr_status_window_cached(
+            shared_file,
+            dev.id,
+            sifive_completion_off(),
+            buf,
+        ) {
             Ok(()) => {
                 std::sync::atomic::fence(Ordering::SeqCst);
                 if let Some(result) = decode_sifive_host_status(buf, expected_job_id, seq) {
@@ -2917,7 +2946,8 @@ fn wait_shared_ddr_job_status(
                             .is_ok()
                     {
                         std::sync::atomic::fence(Ordering::SeqCst);
-                        if let Some(result) = decode_sifive_host_status(&buf, expected_job_id, seq) {
+                        if let Some(result) = decode_sifive_host_status(&buf, expected_job_id, seq)
+                        {
                             if zluda_irq_trace_enabled() {
                                 eprintln!(
                                     "SIFIVE ZLUDA IRQ: dev={} accepted base completion job_id={} seq={}",
@@ -3391,7 +3421,11 @@ fn write_ap2sifive_mailbox(sifive_id: usize, offset: u64, bytes: &[u8]) -> std::
     Ok(false)
 }
 
-fn read_sifive2ap_mailbox(sifive_id: usize, offset: u64, bytes: &mut [u8]) -> std::io::Result<bool> {
+fn read_sifive2ap_mailbox(
+    sifive_id: usize,
+    offset: u64,
+    bytes: &mut [u8],
+) -> std::io::Result<bool> {
     if prefer_mailbox_helper() || std::env::var("HETGPU_SIFIVE_MAILBOX_DEVICE").is_ok() {
         let dev = mailbox_helper_path_for_sifive(sifive_id);
         if std::path::Path::new(&dev).exists() {
@@ -3454,7 +3488,11 @@ fn validate_mbox_access(offset: u64, len: usize, label: &str) -> std::io::Result
     Ok(())
 }
 
-fn write_ap2sifive_mailbox_phys(sifive_id: usize, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+fn write_ap2sifive_mailbox_phys(
+    sifive_id: usize,
+    offset: u64,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     if !mailbox_sram_enabled() {
         return Err(Error::new(
             ErrorKind::Unsupported,
@@ -3473,7 +3511,11 @@ fn write_ap2sifive_mailbox_phys(sifive_id: usize, offset: u64, bytes: &[u8]) -> 
     map.flush()
 }
 
-fn read_sifive2ap_mailbox_phys(sifive_id: usize, offset: u64, bytes: &mut [u8]) -> std::io::Result<()> {
+fn read_sifive2ap_mailbox_phys(
+    sifive_id: usize,
+    offset: u64,
+    bytes: &mut [u8],
+) -> std::io::Result<()> {
     if !mailbox_sram_enabled() {
         return Err(Error::new(
             ErrorKind::Unsupported,
@@ -3497,8 +3539,11 @@ fn shared_ddr_reduce_lock() -> &'static Mutex<()> {
 }
 
 fn sifive_control_lock(sifive_id: usize) -> &'static Mutex<()> {
-    let locks = SIFIVE_CONTROL_LOCKS
-        .get_or_init(|| (0..SIFIVE_CORE_NUM.max(1)).map(|_| Mutex::new(())).collect());
+    let locks = SIFIVE_CONTROL_LOCKS.get_or_init(|| {
+        (0..SIFIVE_CORE_NUM.max(1))
+            .map(|_| Mutex::new(()))
+            .collect()
+    });
     &locks[sifive_id % locks.len()]
 }
 
@@ -3558,7 +3603,8 @@ struct SifiveMmvfAStageCacheEntry {
     a_bytes: usize,
 }
 
-fn sifive_mmvf_a_stage_cache() -> &'static Mutex<BTreeMap<(usize, usize), SifiveMmvfAStageCacheEntry>> {
+fn sifive_mmvf_a_stage_cache(
+) -> &'static Mutex<BTreeMap<(usize, usize), SifiveMmvfAStageCacheEntry>> {
     SIFIVE_MMVF_A_STAGE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
@@ -4164,7 +4210,9 @@ fn shared_ddr_base() -> u64 {
         .ok()
         .and_then(|v| parse_u64_text(&v))
         .filter(|&base| base != 0)
-        .or_else(|| read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_ddr_coh/shared_ddr_base"))
+        .or_else(|| {
+            read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_ddr_coh/shared_ddr_base")
+        })
         .or_else(|| read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_ddr/shared_ddr_base"))
         .or_else(|| read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_full/shared_ddr_base"))
         .or_else(|| read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox/shared_ddr_base"))
@@ -4235,7 +4283,9 @@ fn force_shared_ddr_mmap() -> bool {
         shared_ddr_backend().as_deref(),
         Some("mmap" | "helper-mmap" | "helper_mmap" | "mbox-mmap" | "mbox_mmap")
     ) || matches!(
-        std::env::var("HETGPU_SIFIVE_SHARED_DDR_MMAP").ok().as_deref(),
+        std::env::var("HETGPU_SIFIVE_SHARED_DDR_MMAP")
+            .ok()
+            .as_deref(),
         Some("force" | "FORCE")
     )
 }
@@ -4245,7 +4295,9 @@ fn use_shared_ddr_mmap() -> bool {
         return true;
     }
     if matches!(
-        std::env::var("HETGPU_SIFIVE_SHARED_DDR_MMAP").ok().as_deref(),
+        std::env::var("HETGPU_SIFIVE_SHARED_DDR_MMAP")
+            .ok()
+            .as_deref(),
         Some("0" | "false" | "FALSE" | "no" | "NO")
     ) {
         return false;
@@ -4418,8 +4470,12 @@ fn shared_ddr_bytes() -> usize {
     std::env::var("HETGPU_SIFIVE_SHARED_DDR_BYTES")
         .ok()
         .and_then(|v| parse_u64_text(&v))
-        .or_else(|| read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_ddr_coh/shared_ddr_bytes"))
-        .or_else(|| read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_ddr_coh/shared_ddr_size"))
+        .or_else(|| {
+            read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_ddr_coh/shared_ddr_bytes")
+        })
+        .or_else(|| {
+            read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_ddr_coh/shared_ddr_size")
+        })
         .or_else(|| read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_ddr/shared_ddr_bytes"))
         .or_else(|| read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_ddr/shared_ddr_size"))
         .or_else(|| read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_full/shared_ddr_bytes"))
@@ -4523,7 +4579,10 @@ fn prefer_mailbox_helper() -> bool {
             .ok()
             .map(|v| v.trim().to_ascii_lowercase()),
         Some(v) if v == "helper" || v == "mbox" || v == "mailbox"
-    ) || std::env::var("HETGPU_SIFIVE_USE_MBOX_HELPER").ok().as_deref() == Some("1")
+    ) || std::env::var("HETGPU_SIFIVE_USE_MBOX_HELPER")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 fn helper_io_chunk_bytes() -> usize {
@@ -4570,8 +4629,12 @@ fn prefer_physmap_shared_ddr() -> bool {
         .filter(|&base| base != 0)
         .is_some()
         || read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_ddr_coh/shared_ddr_base")
-            .or_else(|| read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_ddr/shared_ddr_base"))
-            .or_else(|| read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_full/shared_ddr_base"))
+            .or_else(|| {
+                read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_ddr/shared_ddr_base")
+            })
+            .or_else(|| {
+                read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox_full/shared_ddr_base")
+            })
             .or_else(|| read_debugfs_u64("/sys/kernel/debug/hetgpu_sifive_mbox/shared_ddr_base"))
             .filter(|&base| base != 0)
             .is_some()
@@ -4831,7 +4894,11 @@ fn write_shared_ddr_window(offset: u64, bytes: &[u8]) -> std::io::Result<()> {
             if shared_ddr_helper_rw_disabled() {
                 return Err(shared_ddr_mmap_required_failed("write", &dev));
             }
-            helper_write_all(&mut file, HETGPU_SIFIVE_SHARED_DDR_HELPER_OFF + offset, bytes)
+            helper_write_all(
+                &mut file,
+                HETGPU_SIFIVE_SHARED_DDR_HELPER_OFF + offset,
+                bytes,
+            )
         })();
         match helper_result {
             Ok(()) => return Ok(()),
@@ -4867,7 +4934,11 @@ fn read_shared_ddr_window(offset: u64, bytes: &mut [u8]) -> std::io::Result<()> 
             if shared_ddr_helper_rw_disabled() {
                 return Err(shared_ddr_mmap_required_failed("read", &dev));
             }
-            helper_read_exact(&mut file, HETGPU_SIFIVE_SHARED_DDR_HELPER_OFF + offset, bytes)
+            helper_read_exact(
+                &mut file,
+                HETGPU_SIFIVE_SHARED_DDR_HELPER_OFF + offset,
+                bytes,
+            )
         })();
         match helper_result {
             Ok(()) => return Ok(()),
@@ -4924,8 +4995,12 @@ fn read_shared_ddr_window_for_sifive_fresh(
         if shared_ddr_helper_rw_disabled() {
             return Err(shared_ddr_mmap_required_failed("fresh read", &dev));
         }
-        helper_read_exact(&mut file, HETGPU_SIFIVE_SHARED_DDR_HELPER_OFF + offset, bytes)
-            .map_err(|err| shared_ddr_helper_failed("fresh read", &dev, err))
+        helper_read_exact(
+            &mut file,
+            HETGPU_SIFIVE_SHARED_DDR_HELPER_OFF + offset,
+            bytes,
+        )
+        .map_err(|err| shared_ddr_helper_failed("fresh read", &dev, err))
     } else {
         Err(shared_ddr_helper_unavailable("fresh read", &dev))
     }
@@ -5049,7 +5124,11 @@ fn write_shared_ddr_control_window(
         let dev = helper_path_for_sifive(sifive_id);
         if std::path::Path::new(&dev).exists() {
             let mut file = open_sync_rw(&dev)?;
-            helper_write_all(&mut file, HETGPU_SIFIVE_SHARED_DDR_HELPER_OFF + offset, bytes)?;
+            helper_write_all(
+                &mut file,
+                HETGPU_SIFIVE_SHARED_DDR_HELPER_OFF + offset,
+                bytes,
+            )?;
             return Ok(());
         }
     }
@@ -5215,7 +5294,8 @@ fn read_shared_ddr_status_window_cached(
         let requested_mirror_base = parse_optional_env_usize("HETGPU_SIFIVE_COMPLETION_MIRROR_OFF")
             .map(|v| v as u64)
             .unwrap_or(0);
-        if requested_mirror_base == 0 && std::env::var("HETGPU_SIFIVE_COMPLETION_MIRROR_OFF").is_ok()
+        if requested_mirror_base == 0
+            && std::env::var("HETGPU_SIFIVE_COMPLETION_MIRROR_OFF").is_ok()
         {
             return Ok(false);
         }
@@ -5803,7 +5883,13 @@ fn submit_rmsnorm_runtime_job_cached(
         }
         dev.zluda_irq(shared_ddr_info())?;
     }
-    nvtop_record_submit(dev.id, hetgpu_sifive_job_id::RMSNORM, seq, None, staged_bytes);
+    nvtop_record_submit(
+        dev.id,
+        hetgpu_sifive_job_id::RMSNORM,
+        seq,
+        None,
+        staged_bytes,
+    );
     *mailbox_file = None;
     shared_file = None;
     let result = wait_mailbox_job_status_cached(
@@ -6066,7 +6152,11 @@ impl SifiveComm {
             SifiveError::Io(Error::new(ErrorKind::Other, "SIFIVE device mutex poisoned"))
         })?;
 
-        if std::env::var("HETGPU_SIFIVE_REDUCE_MAILBOX").ok().as_deref() == Some("1") {
+        if std::env::var("HETGPU_SIFIVE_REDUCE_MAILBOX")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             return Err(SifiveError::Io(Error::new(
                 ErrorKind::Unsupported,
                 "HETGPU_SIFIVE_REDUCE_MAILBOX uses mailbox SRAM and is disabled; use shared DDR reduce",
@@ -6160,7 +6250,10 @@ pub unsafe extern "C" fn sifive_close_device(dev: *mut SifiveDevice) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sifive_get_info_ffi(dev: *mut SifiveDevice, out: *mut sifive_info_size) -> i32 {
+pub unsafe extern "C" fn sifive_get_info_ffi(
+    dev: *mut SifiveDevice,
+    out: *mut sifive_info_size,
+) -> i32 {
     if dev.is_null() || out.is_null() {
         return -1;
     }
@@ -8805,7 +8898,8 @@ unsafe fn submit_gemm_staged_c_tile_on_device(
         }
         let bf16_skinny_cpu_fill = atype as u32 == SifiveDataType::Bfloat16 as u32
             && btype as u32 == SifiveDataType::Bfloat16 as u32
-            && chunk_n <= parse_env_usize("HETGPU_SIFIVE_GEMM_CPU_FILL_BF16_SKINNY_MAX_N", 4).max(1);
+            && chunk_n
+                <= parse_env_usize("HETGPU_SIFIVE_GEMM_CPU_FILL_BF16_SKINNY_MAX_N", 4).max(1);
         let cpu_fill_missing =
             env_flag_enabled("HETGPU_SIFIVE_GEMM_CPU_FILL_MISSING") || bf16_skinny_cpu_fill;
         let trusted_sifive_rows =
@@ -8941,12 +9035,12 @@ unsafe fn submit_gemm_staged_tiled_shared_ddr(
     let lda = lda as usize;
     let ldb = ldb as usize;
     let ldc = ldc as usize;
-    let a_dtype_size =
-        sifive_dtype_size(atype).ok_or_else(|| Error::new(ErrorKind::Unsupported, "bad A dtype"))?;
-    let b_dtype_size =
-        sifive_dtype_size(btype).ok_or_else(|| Error::new(ErrorKind::Unsupported, "bad B dtype"))?;
-    let c_dtype_size =
-        sifive_dtype_size(ctype).ok_or_else(|| Error::new(ErrorKind::Unsupported, "bad C dtype"))?;
+    let a_dtype_size = sifive_dtype_size(atype)
+        .ok_or_else(|| Error::new(ErrorKind::Unsupported, "bad A dtype"))?;
+    let b_dtype_size = sifive_dtype_size(btype)
+        .ok_or_else(|| Error::new(ErrorKind::Unsupported, "bad B dtype"))?;
+    let c_dtype_size = sifive_dtype_size(ctype)
+        .ok_or_else(|| Error::new(ErrorKind::Unsupported, "bad C dtype"))?;
     let shared_base = shared_ddr_base();
     let shared_bytes = shared_ddr_bytes();
     let payload_base = shared_ddr_payload_base_off();
@@ -9101,8 +9195,10 @@ unsafe fn submit_gemm_staged_tiled_shared_ddr(
                         let dev_id =
                             gemm_devices_for_worker[tile_idx % gemm_devices_for_worker.len()];
                         let dev = SifiveDevice::open(dev_id)?;
-                        let _slot_guard =
-                            lock_shared_ddr_stage(slot_id, "hetgpu_sifive_submit_gemm_staged_tiled")?;
+                        let _slot_guard = lock_shared_ddr_stage(
+                            slot_id,
+                            "hetgpu_sifive_submit_gemm_staged_tiled",
+                        )?;
                         let col_tile = tile_idx / row_tiles;
                         let row_tile = tile_idx % row_tiles;
                         let row0 = row_tile * max_m;
@@ -10364,7 +10460,10 @@ pub unsafe extern "C" fn hetgpu_sifive_submit_gemm(
     {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("hetgpu_sifive_submit_gemm: SIFIVE GEMM submit failed: {}", e);
+            eprintln!(
+                "hetgpu_sifive_submit_gemm: SIFIVE GEMM submit failed: {}",
+                e
+            );
             -1
         }
     }
@@ -10415,9 +10514,13 @@ unsafe fn submit_softmax_typed_impl(
                 "softmax requires shared DDR staging",
             ));
         }
-        let slot_count = parse_env_usize("HETGPU_SIFIVE_SOFTMAX_SHARED_SLOTS", SIFIVE_CORE_NUM).max(1);
-        let slot_bytes =
-            parse_env_usize("HETGPU_SIFIVE_SOFTMAX_SLOT_BYTES", payload_bytes / slot_count).max(1);
+        let slot_count =
+            parse_env_usize("HETGPU_SIFIVE_SOFTMAX_SHARED_SLOTS", SIFIVE_CORE_NUM).max(1);
+        let slot_bytes = parse_env_usize(
+            "HETGPU_SIFIVE_SOFTMAX_SLOT_BYTES",
+            payload_bytes / slot_count,
+        )
+        .max(1);
         let slot_id = std::env::var("HETGPU_SIFIVE_SOFTMAX_SLOT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -10569,7 +10672,14 @@ pub unsafe extern "C" fn hetgpu_sifive_submit_softmax_bf16(
     cols: u64,
     stride: u64,
 ) -> i32 {
-    hetgpu_sifive_submit_softmax(src, dst, rows, cols, stride, SifiveDataType::Bfloat16 as i32)
+    hetgpu_sifive_submit_softmax(
+        src,
+        dst,
+        rows,
+        cols,
+        stride,
+        SifiveDataType::Bfloat16 as i32,
+    )
 }
 
 unsafe fn submit_rmsnorm_typed_impl(
@@ -11321,8 +11431,11 @@ unsafe fn submit_rmsnorm_staged_shared_ddr(
     let payload_base = shared_ddr_payload_base_off() as usize;
     let payload_bytes = shared_ddr_payload_bytes();
     let slot_count = parse_env_usize("HETGPU_SIFIVE_RMSNORM_SHARED_SLOTS", SIFIVE_CORE_NUM).max(1);
-    let slot_bytes =
-        parse_env_usize("HETGPU_SIFIVE_RMSNORM_SLOT_BYTES", payload_bytes / slot_count).max(1);
+    let slot_bytes = parse_env_usize(
+        "HETGPU_SIFIVE_RMSNORM_SLOT_BYTES",
+        payload_bytes / slot_count,
+    )
+    .max(1);
     let slot_id = std::env::var("HETGPU_SIFIVE_RMSNORM_SLOT")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -11817,7 +11930,11 @@ pub unsafe extern "C" fn hetgpu_sifive_submit_rmsnorm_on(
     eps: f32,
     dtype: i32,
 ) -> i32 {
-    if x.is_null() || y.is_null() || rows == 0 || hidden == 0 || !sifive_tensor_dtype_supported(dtype)
+    if x.is_null()
+        || y.is_null()
+        || rows == 0
+        || hidden == 0
+        || !sifive_tensor_dtype_supported(dtype)
     {
         eprintln!("hetgpu_sifive_submit_rmsnorm: invalid argument");
         return -1;
@@ -12032,7 +12149,9 @@ pub unsafe extern "C" fn hetgpu_sifive_nccl_all_reduce_f32(
         rank, nranks, count
     );
 
-    match SifiveComm::init_all().and_then(|comm| comm.all_reduce(src, &mut dst, SifiveReduceOp::Sum)) {
+    match SifiveComm::init_all()
+        .and_then(|comm| comm.all_reduce(src, &mut dst, SifiveReduceOp::Sum))
+    {
         Ok(()) => {
             std::ptr::copy_nonoverlapping(dst.as_ptr(), recvbuff, count);
             0
@@ -12085,7 +12204,10 @@ pub unsafe extern "C" fn hetgpu_sifive_nccl_reduce_sum_f32(
     let comm = match SifiveComm::init_all() {
         Ok(comm) => comm,
         Err(e) => {
-            eprintln!("hetgpu_sifive_nccl_reduce_sum_f32: SIFIVE init failed: {}", e);
+            eprintln!(
+                "hetgpu_sifive_nccl_reduce_sum_f32: SIFIVE init failed: {}",
+                e
+            );
             return -1;
         }
     };
@@ -12189,7 +12311,10 @@ unsafe fn slice_or_empty<'a>(ptr: *const u8, len: u64) -> &'a [u8] {
     }
 }
 
-unsafe fn load_program_elf_bytes(program: *mut sifive_Program, elf_bytes: Vec<u8>) -> sifive_Result {
+unsafe fn load_program_elf_bytes(
+    program: *mut sifive_Program,
+    elf_bytes: Vec<u8>,
+) -> sifive_Result {
     if program.is_null() || elf_bytes.is_empty() {
         return sifive_Result_Error;
     }
@@ -12514,7 +12639,11 @@ pub unsafe extern "C" fn sifive_LoadProgramPtx(
         return load_program_elf_bytes(program, elf_bytes);
     }
 
-    if std::env::var("HETGPU_SIFIVE_ELF_CACHE_ONLY").ok().as_deref() == Some("1") {
+    if std::env::var("HETGPU_SIFIVE_ELF_CACHE_ONLY")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         let cache_dir = sifive_elf_cache_dir();
         let cache_key = compute_sifive_elf_cache_key(target_arch, ptx_bytes, external_linked);
         let cache_path = sifive_elf_cache_path(&cache_dir, &cache_key);
@@ -12747,7 +12876,9 @@ pub unsafe extern "C" fn sifive_DestroyKernel(kernel: *mut sifive_Kernel) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sifive_KernelClearLaunchState(kernel: *mut sifive_Kernel) -> sifive_Result {
+pub unsafe extern "C" fn sifive_KernelClearLaunchState(
+    kernel: *mut sifive_Kernel,
+) -> sifive_Result {
     if kernel.is_null() {
         return sifive_Result_Error;
     }
@@ -12791,7 +12922,8 @@ pub unsafe extern "C" fn sifive_KernelPushArgRecord(
     if record.size > 4096 {
         return sifive_Result_Error;
     }
-    if record.kind != SIFIVE_KERNEL_ARG_KIND_SCALAR && record.kind != SIFIVE_KERNEL_ARG_KIND_POINTER {
+    if record.kind != SIFIVE_KERNEL_ARG_KIND_SCALAR && record.kind != SIFIVE_KERNEL_ARG_KIND_POINTER
+    {
         return sifive_Result_Error;
     }
     (*kernel).launch_state.arg_records.push(record);
@@ -12810,7 +12942,11 @@ pub unsafe extern "C" fn sifive_KernelAddBufferBinding(
     if binding.arg_index as usize >= (*kernel).launch_state.arg_records.len() {
         return sifive_Result_Error;
     }
-    if std::env::var("HETGPU_SIFIVE_LOG_KERNEL_ARGS").ok().as_deref() == Some("1") {
+    if std::env::var("HETGPU_SIFIVE_LOG_KERNEL_ARGS")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         let kernel_name = &(*kernel).name;
         if kernel_name.contains("k_bin_bcast")
             || std::env::var("HETGPU_SIFIVE_LOG_ALL_KERNEL_BINDINGS")
@@ -13118,9 +13254,12 @@ fn lock_sifive_noop_submit_context(
 ) -> std::io::Result<MutexGuard<'static, Option<SifiveNoopSubmitContext>>> {
     let contexts = sifive_noop_submit_contexts();
     let slot = device_id % contexts.len();
-    let mut guard = contexts[slot]
-        .lock()
-        .map_err(|_| Error::new(ErrorKind::Other, "SIFIVE noop submit context mutex poisoned"))?;
+    let mut guard = contexts[slot].lock().map_err(|_| {
+        Error::new(
+            ErrorKind::Other,
+            "SIFIVE noop submit context mutex poisoned",
+        )
+    })?;
     if guard.is_none() {
         let dev = SifiveDevice::open(device_id)?;
         let shared_file = open_shared_ddr_window_file(device_id);
@@ -13185,9 +13324,9 @@ fn sifive_launch_kernel_noop_fast(
         ));
     }
     {
-        let _slot_guard = shared_ddr_kernel_lock(slot_id)
-            .lock()
-            .map_err(|_| Error::new(ErrorKind::Other, "SIFIVE kernel helper slot mutex poisoned"))?;
+        let _slot_guard = shared_ddr_kernel_lock(slot_id).lock().map_err(|_| {
+            Error::new(ErrorKind::Other, "SIFIVE kernel helper slot mutex poisoned")
+        })?;
         write_shared_ddr_window_cached(&mut ctx.shared_file, slot_off, &buf[..submit_len])?;
     }
 
@@ -13373,9 +13512,9 @@ fn compute_sifive_kernel_image_layout(
     } else {
         let offset = cursor;
         cursor = align_up(
-            cursor
-                .checked_add(arg_record_bytes)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "SIFIVE arg section too large"))?,
+            cursor.checked_add(arg_record_bytes).ok_or_else(|| {
+                Error::new(ErrorKind::InvalidInput, "SIFIVE arg section too large")
+            })?,
             8,
         );
         offset
@@ -13402,7 +13541,10 @@ fn compute_sifive_kernel_image_layout(
             cursor
                 .checked_add(launch_state.raw_param_blob.len())
                 .ok_or_else(|| {
-                    Error::new(ErrorKind::InvalidInput, "SIFIVE raw param section too large")
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "SIFIVE raw param section too large",
+                    )
                 })?,
             8,
         );
@@ -13418,7 +13560,9 @@ fn compute_sifive_kernel_image_layout(
             cursor
                 .checked_add(kernel_name_bytes.len())
                 .and_then(|v| v.checked_add(1))
-                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "SIFIVE kernel name too large"))?,
+                .ok_or_else(|| {
+                    Error::new(ErrorKind::InvalidInput, "SIFIVE kernel name too large")
+                })?,
             8,
         );
         offset
@@ -13605,8 +13749,9 @@ fn kernel_submit_slot_layout(
     let slot_bytes = if let Some(slot_bytes) = explicit_slot_bytes {
         slot_bytes
     } else if shared_device_mem {
-        let default_slot_bytes = parse_optional_env_usize("HETGPU_SIFIVE_KERNEL_DEFAULT_SLOT_BYTES")
-            .unwrap_or(64 * 1024 * 1024);
+        let default_slot_bytes =
+            parse_optional_env_usize("HETGPU_SIFIVE_KERNEL_DEFAULT_SLOT_BYTES")
+                .unwrap_or(64 * 1024 * 1024);
         let max_slot_bytes = align_down(usable_bytes / total_slot_count, 64);
         align_up(min_slot_bytes.max(default_slot_bytes), 64).min(max_slot_bytes)
     } else {
@@ -14036,9 +14181,12 @@ fn submit_sifive_kernel_image_via_helper(
     )?;
     let staging_bytes =
         sifive_kernel_staging_payload_bytes(shared_base, shared_ddr_bytes(), launch_state)?;
-    let required_bytes = submit_len
-        .checked_add(staging_bytes)
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "SIFIVE helper submit size overflow"))?;
+    let required_bytes = submit_len.checked_add(staging_bytes).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "SIFIVE helper submit size overflow",
+        )
+    })?;
     let (slot_off, slot_bytes, slot_id) = kernel_submit_slot_layout(dev.id, required_bytes)?;
     let _slot_guard = shared_ddr_kernel_lock(slot_id)
         .lock()
@@ -14248,7 +14396,9 @@ fn submit_sifive_kernel_image_via_helper(
                 );
             }
         }
-        if env_flag_enabled("HETGPU_SIFIVE_KERNEL_TIMING") || env_flag_enabled("HETGPU_SIFIVE_TIMING") {
+        if env_flag_enabled("HETGPU_SIFIVE_KERNEL_TIMING")
+            || env_flag_enabled("HETGPU_SIFIVE_TIMING")
+        {
             eprintln!(
                 "SIFIVE timing: kernel='{}' sifive{} seq={} status={} wait_us={} submit={} staging={} grid=({}, {}, {}) block=({}, {}, {}) slot={}",
                 kernel_name,

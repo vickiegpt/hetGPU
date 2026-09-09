@@ -54,6 +54,7 @@ pub(crate) struct ActivationRange {
     pub(crate) slab_offset: u64,
     pub(crate) bytes: u32,
     pub(crate) stream: usize,
+    pub(crate) source_identity_sha256: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,26 +170,32 @@ fn validate_activation_ranges(ranges: &[ActivationRange]) -> Result<(), String> 
     if ranges.is_empty() {
         return Err("Qwen IQ1_S layer phase has no activation ranges".to_string());
     }
-    let mut device_pointers = BTreeSet::new();
-    let mut slab_ranges = Vec::new();
+    let mut source_bindings = HashMap::new();
+    let mut slab_ranges = BTreeSet::new();
     for range in ranges {
         if range.cuda_ptr < 0x1000
             || range.stream == 0
             || range.bytes == 0
+            || range.source_identity_sha256 == [0; 32]
             || range.slab_offset % ARENA_ALIGNMENT != 0
         {
             return Err("Qwen IQ1_S activation range is invalid or unaligned".to_string());
         }
-        if !device_pointers.insert(range.cuda_ptr) {
-            return Err("Qwen IQ1_S activation range repeats a CUDA pointer".to_string());
+        let binding = (range.slab_offset, range.bytes, range.stream);
+        if let Some(previous) = source_bindings.insert(range.source_identity_sha256, binding) {
+            if previous != binding {
+                return Err(
+                    "Qwen IQ1_S activation identity maps to inconsistent ranges".to_string(),
+                );
+            }
         }
         let end = range
             .slab_offset
             .checked_add(u64::from(range.bytes))
             .ok_or("Qwen IQ1_S activation slab range overflow")?;
-        slab_ranges.push((range.slab_offset, end));
+        slab_ranges.insert((range.slab_offset, end));
     }
-    slab_ranges.sort_unstable();
+    let slab_ranges = slab_ranges.into_iter().collect::<Vec<_>>();
     if slab_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
         return Err("Qwen IQ1_S activation slab ranges overlap".to_string());
     }
@@ -303,8 +310,7 @@ fn validate_semantic_buffer_bindings(plan: &LayerPhasePlan) -> Result<(), String
             .any(|range| input.0 >= range.0 && input.1 <= range.1)
         {
             return Err(
-                "Qwen IQ1_S command input is not contained in the activation manifest"
-                    .to_string(),
+                "Qwen IQ1_S command input is not contained in the activation manifest".to_string(),
             );
         }
         by_bank[usize::from(command.row_shard.bank)].push((command, input, output, token));
@@ -330,8 +336,7 @@ fn validate_semantic_buffer_bindings(plan: &LayerPhasePlan) -> Result<(), String
                         || left_command.token_ids != right_command.token_ids)
                 {
                     return Err(
-                        "Qwen IQ1_S token-map ranges overlap for different token lanes"
-                            .to_string(),
+                        "Qwen IQ1_S token-map ranges overlap for different token lanes".to_string(),
                     );
                 }
             }
@@ -463,7 +468,7 @@ fn phase_semantic_sha256(
     activations: &[ActivationRange],
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"hetgpu-qwen-iq1s-layer-phase-v1\0");
+    hash.update(b"hetgpu-qwen-iq1s-layer-phase-v2\0");
     hash.update(transaction_id.to_le_bytes());
     hash.update(phase.abi().to_le_bytes());
     for program in programs {
@@ -471,6 +476,7 @@ fn phase_semantic_sha256(
     }
     for activation in activations {
         hash.update((activation.cuda_ptr as u64).to_le_bytes());
+        hash.update(activation.source_identity_sha256);
         hash.update(activation.slab_offset.to_le_bytes());
         hash.update(activation.bytes.to_le_bytes());
         hash.update((activation.stream as u64).to_le_bytes());
@@ -587,6 +593,7 @@ pub(crate) fn compile_layer_phase(
             command.role,
             command.expert_id,
             command.lane_mask,
+            command.token_map_offset,
         );
         if !coordinates.insert(key) {
             return Err("Qwen IQ1_S layer phase repeats a semantic command".to_string());
@@ -903,15 +910,34 @@ mod tests {
                     slab_offset: 0,
                     bytes: 1024 * 1024,
                     stream: 0xabc0,
+                    source_identity_sha256: [0x51; 32],
                 },
                 ActivationRange {
                     cuda_ptr: 0x20_0000,
                     slab_offset: 1024 * 1024,
                     bytes: 1024 * 1024,
                     stream: 0xabc0,
+                    source_identity_sha256: [0x52; 32],
                 },
             ],
         }
+    }
+
+    #[test]
+    fn iq1s_layer_trace_accepts_shared_cuda_pointer_with_distinct_source_identities() {
+        let mut shared = plan(Iq1sExpertRole::Gate, 1, true);
+        shared.activations[1].cuda_ptr = shared.activations[0].cuda_ptr;
+        compile_layer_phase(&shared, "compiler", QWEN_MODEL_CONTEXT_LIMIT).unwrap();
+    }
+
+    #[test]
+    fn iq1s_layer_trace_rejects_one_source_identity_mapped_to_two_slab_ranges() {
+        let mut ambiguous = plan(Iq1sExpertRole::Gate, 1, true);
+        ambiguous.activations[1].source_identity_sha256 =
+            ambiguous.activations[0].source_identity_sha256;
+        assert!(compile_layer_phase(&ambiguous, "compiler", QWEN_MODEL_CONTEXT_LIMIT)
+            .unwrap_err()
+            .contains("activation identity maps to inconsistent ranges"));
     }
 
     #[test]
@@ -965,8 +991,14 @@ mod tests {
         )
         .unwrap();
         for bank in 0..ARENA_BANK_COUNT {
-            assert_ne!(compiled.commands[bank][0].output_offset, compiled.commands[bank][1].output_offset);
-            assert_ne!(compiled.commands[bank][0].token_map_offset, compiled.commands[bank][1].token_map_offset);
+            assert_ne!(
+                compiled.commands[bank][0].output_offset,
+                compiled.commands[bank][1].output_offset
+            );
+            assert_ne!(
+                compiled.commands[bank][0].token_map_offset,
+                compiled.commands[bank][1].token_map_offset
+            );
         }
     }
 
@@ -974,21 +1006,27 @@ mod tests {
     fn iq1s_layer_trace_rejects_ambiguous_or_out_of_range_slab_bindings() {
         let mut overlap = plan(Iq1sExpertRole::Gate, 2, false);
         overlap.commands[4].output_offset = overlap.commands[0].output_offset;
-        assert!(compile_layer_phase(&overlap, "compiler", QWEN_MODEL_CONTEXT_LIMIT)
-            .unwrap_err()
-            .contains("output ranges overlap"));
+        assert!(
+            compile_layer_phase(&overlap, "compiler", QWEN_MODEL_CONTEXT_LIMIT)
+                .unwrap_err()
+                .contains("output ranges overlap")
+        );
 
         let mut outside = plan(Iq1sExpertRole::Gate, 1, true);
         outside.commands[0].input_offset = 8 * 1024 * 1024;
-        assert!(compile_layer_phase(&outside, "compiler", QWEN_MODEL_CONTEXT_LIMIT)
-            .unwrap_err()
-            .contains("activation manifest"));
+        assert!(
+            compile_layer_phase(&outside, "compiler", QWEN_MODEL_CONTEXT_LIMIT)
+                .unwrap_err()
+                .contains("activation manifest")
+        );
 
         let mut token_overlap = plan(Iq1sExpertRole::Gate, 2, false);
         token_overlap.commands[4].token_map_offset = token_overlap.commands[0].token_map_offset;
-        assert!(compile_layer_phase(&token_overlap, "compiler", QWEN_MODEL_CONTEXT_LIMIT)
-            .unwrap_err()
-            .contains("token-map ranges overlap"));
+        assert!(
+            compile_layer_phase(&token_overlap, "compiler", QWEN_MODEL_CONTEXT_LIMIT)
+                .unwrap_err()
+                .contains("token-map ranges overlap")
+        );
     }
 
     #[test]

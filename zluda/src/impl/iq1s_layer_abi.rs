@@ -1,7 +1,8 @@
 // Generated from tools/qwen35-iq1s-layer-abi.json; do not edit.
 // Canonical schema SHA-256: 0e88b8acb51968aaf847b17cb34fc7e5c703a4834ebcf764b0a84443247ee619
 
-pub const IQ1S_SCHEMA_SHA256: &str = "0e88b8acb51968aaf847b17cb34fc7e5c703a4834ebcf764b0a84443247ee619";
+pub const IQ1S_SCHEMA_SHA256: &str =
+    "0e88b8acb51968aaf847b17cb34fc7e5c703a4834ebcf764b0a84443247ee619";
 pub const IQ1S_ABI_VERSION: u32 = 2;
 pub const IQ1S_REGISTER_MAGIC: u32 = 0x324c5149;
 pub const IQ1S_COMMAND_MAGIC: u32 = 0x32435149;
@@ -131,31 +132,46 @@ pub struct Iq1sCommand {
 
 const _: [(); IQ1S_COMMAND_BYTES] = [(); core::mem::size_of::<Iq1sCommand>()];
 const _: [(); IQ1S_COMMAND_MAGIC_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, magic)];
-const _: [(); IQ1S_COMMAND_ABI_VERSION_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, abi_version)];
-const _: [(); IQ1S_COMMAND_DESCRIPTOR_BYTES_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, descriptor_bytes)];
+const _: [(); IQ1S_COMMAND_ABI_VERSION_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, abi_version)];
+const _: [(); IQ1S_COMMAND_DESCRIPTOR_BYTES_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, descriptor_bytes)];
 const _: [(); IQ1S_COMMAND_CRC32_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, crc32)];
 const _: [(); IQ1S_COMMAND_FLAGS_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, flags)];
-const _: [(); IQ1S_COMMAND_SESSION_GENERATION_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, session_generation)];
-const _: [(); IQ1S_COMMAND_TRANSACTION_ID_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, transaction_id)];
-const _: [(); IQ1S_COMMAND_PROGRAM_ID_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, program_id)];
+const _: [(); IQ1S_COMMAND_SESSION_GENERATION_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, session_generation)];
+const _: [(); IQ1S_COMMAND_TRANSACTION_ID_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, transaction_id)];
+const _: [(); IQ1S_COMMAND_PROGRAM_ID_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, program_id)];
 const _: [(); IQ1S_COMMAND_TRACE_ID_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, trace_id)];
 const _: [(); IQ1S_COMMAND_LAYER_ID_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, layer_id)];
 const _: [(); IQ1S_COMMAND_PHASE_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, phase)];
 const _: [(); IQ1S_COMMAND_ROLE_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, role)];
 const _: [(); IQ1S_COMMAND_EXPERT_ID_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, expert_id)];
 const _: [(); IQ1S_COMMAND_LANE_MASK_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, lane_mask)];
-const _: [(); IQ1S_COMMAND_LANE_COUNT_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, lane_count)];
-const _: [(); IQ1S_COMMAND_WEIGHT_FORMAT_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, weight_format)];
-const _: [(); IQ1S_COMMAND_ARENA_OFFSET_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, arena_offset)];
-const _: [(); IQ1S_COMMAND_INPUT_OFFSET_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, input_offset)];
-const _: [(); IQ1S_COMMAND_OUTPUT_OFFSET_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, output_offset)];
+const _: [(); IQ1S_COMMAND_LANE_COUNT_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, lane_count)];
+const _: [(); IQ1S_COMMAND_WEIGHT_FORMAT_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, weight_format)];
+const _: [(); IQ1S_COMMAND_ARENA_OFFSET_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, arena_offset)];
+const _: [(); IQ1S_COMMAND_INPUT_OFFSET_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, input_offset)];
+const _: [(); IQ1S_COMMAND_OUTPUT_OFFSET_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, output_offset)];
 const _: [(); IQ1S_COMMAND_ROW_START_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, row_start)];
 const _: [(); IQ1S_COMMAND_ROW_COUNT_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, row_count)];
-const _: [(); IQ1S_COMMAND_INPUT_BYTES_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, input_bytes)];
-const _: [(); IQ1S_COMMAND_OUTPUT_BYTES_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, output_bytes)];
-const _: [(); IQ1S_COMMAND_TOKEN_MAP_OFFSET_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, token_map_offset)];
-const _: [(); IQ1S_COMMAND_DEPENDENCY_FENCE_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, dependency_fence)];
-const _: [(); IQ1S_COMMAND_COMPLETION_SLOT_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, completion_slot)];
+const _: [(); IQ1S_COMMAND_INPUT_BYTES_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, input_bytes)];
+const _: [(); IQ1S_COMMAND_OUTPUT_BYTES_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, output_bytes)];
+const _: [(); IQ1S_COMMAND_TOKEN_MAP_OFFSET_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, token_map_offset)];
+const _: [(); IQ1S_COMMAND_DEPENDENCY_FENCE_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, dependency_fence)];
+const _: [(); IQ1S_COMMAND_COMPLETION_SLOT_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCommand, completion_slot)];
 const _: [(); IQ1S_COMMAND_RESERVED_OFFSET] = [(); core::mem::offset_of!(Iq1sCommand, reserved)];
 
 pub const IQ1S_COMPLETION_BYTES: usize = 128;
@@ -219,31 +235,51 @@ pub struct Iq1sCompletion {
 
 const _: [(); IQ1S_COMPLETION_BYTES] = [(); core::mem::size_of::<Iq1sCompletion>()];
 const _: [(); IQ1S_COMPLETION_MAGIC_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, magic)];
-const _: [(); IQ1S_COMPLETION_ABI_VERSION_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, abi_version)];
-const _: [(); IQ1S_COMPLETION_COMPLETION_BYTES_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, completion_bytes)];
+const _: [(); IQ1S_COMPLETION_ABI_VERSION_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, abi_version)];
+const _: [(); IQ1S_COMPLETION_COMPLETION_BYTES_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, completion_bytes)];
 const _: [(); IQ1S_COMPLETION_STATUS_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, status)];
-const _: [(); IQ1S_COMPLETION_FAULT_CODE_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, fault_code)];
-const _: [(); IQ1S_COMPLETION_SESSION_GENERATION_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, session_generation)];
-const _: [(); IQ1S_COMPLETION_TRANSACTION_ID_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, transaction_id)];
-const _: [(); IQ1S_COMPLETION_PROGRAM_ID_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, program_id)];
-const _: [(); IQ1S_COMPLETION_TRACE_ID_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, trace_id)];
-const _: [(); IQ1S_COMPLETION_LAYER_ID_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, layer_id)];
+const _: [(); IQ1S_COMPLETION_FAULT_CODE_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, fault_code)];
+const _: [(); IQ1S_COMPLETION_SESSION_GENERATION_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, session_generation)];
+const _: [(); IQ1S_COMPLETION_TRANSACTION_ID_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, transaction_id)];
+const _: [(); IQ1S_COMPLETION_PROGRAM_ID_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, program_id)];
+const _: [(); IQ1S_COMPLETION_TRACE_ID_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, trace_id)];
+const _: [(); IQ1S_COMPLETION_LAYER_ID_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, layer_id)];
 const _: [(); IQ1S_COMPLETION_PHASE_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, phase)];
 const _: [(); IQ1S_COMPLETION_ROLE_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, role)];
 const _: [(); IQ1S_COMPLETION_CU_ID_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, cu_id)];
-const _: [(); IQ1S_COMPLETION_EXPERT_ID_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, expert_id)];
-const _: [(); IQ1S_COMPLETION_LANE_MASK_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, lane_mask)];
-const _: [(); IQ1S_COMPLETION_ROWS_COMPLETED_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, rows_completed)];
-const _: [(); IQ1S_COMPLETION_DESCRIPTOR_CRC32_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, descriptor_crc32)];
-const _: [(); IQ1S_COMPLETION_COMMAND_INDEX_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, command_index)];
+const _: [(); IQ1S_COMPLETION_EXPERT_ID_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, expert_id)];
+const _: [(); IQ1S_COMPLETION_LANE_MASK_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, lane_mask)];
+const _: [(); IQ1S_COMPLETION_ROWS_COMPLETED_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, rows_completed)];
+const _: [(); IQ1S_COMPLETION_DESCRIPTOR_CRC32_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, descriptor_crc32)];
+const _: [(); IQ1S_COMPLETION_COMMAND_INDEX_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, command_index)];
 const _: [(); IQ1S_COMPLETION_CYCLES_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, cycles)];
-const _: [(); IQ1S_COMPLETION_DDR_READ_BYTES_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, ddr_read_bytes)];
-const _: [(); IQ1S_COMPLETION_DDR_WRITE_BYTES_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, ddr_write_bytes)];
-const _: [(); IQ1S_COMPLETION_IQ1S_BLOCKS_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, iq1s_blocks)];
-const _: [(); IQ1S_COMPLETION_GRID_PASSES_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, grid_passes)];
-const _: [(); IQ1S_COMPLETION_DELTA_PASSES_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, delta_passes)];
-const _: [(); IQ1S_COMPLETION_RESULT_FENCE_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, result_fence)];
-const _: [(); IQ1S_COMPLETION_FAULT_DETAIL_OFFSET] = [(); core::mem::offset_of!(Iq1sCompletion, fault_detail)];
+const _: [(); IQ1S_COMPLETION_DDR_READ_BYTES_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, ddr_read_bytes)];
+const _: [(); IQ1S_COMPLETION_DDR_WRITE_BYTES_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, ddr_write_bytes)];
+const _: [(); IQ1S_COMPLETION_IQ1S_BLOCKS_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, iq1s_blocks)];
+const _: [(); IQ1S_COMPLETION_GRID_PASSES_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, grid_passes)];
+const _: [(); IQ1S_COMPLETION_DELTA_PASSES_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, delta_passes)];
+const _: [(); IQ1S_COMPLETION_RESULT_FENCE_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, result_fence)];
+const _: [(); IQ1S_COMPLETION_FAULT_DETAIL_OFFSET] =
+    [(); core::mem::offset_of!(Iq1sCompletion, fault_detail)];
 
 /// command CRC32 is IEEE CRC32 with bytes 8..11 zeroed.
 pub fn iq1s_command_crc32(record: &[u8; IQ1S_COMMAND_BYTES]) -> u32 {

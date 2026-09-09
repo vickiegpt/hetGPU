@@ -11,7 +11,7 @@ pub(crate) const HETGPU_IQ1S_PHASE_A: u32 = 1;
 pub(crate) const QWEN35_EXPERT_COUNT: u32 = 512;
 pub(crate) const QWEN35_EXPERTS_PER_TOKEN: u32 = 10;
 pub(crate) const QWEN35_LAYER_COUNT: u32 = 60;
-const MAX_LAYER_BATCH: u16 = 16;
+const MAX_LAYER_BATCH: u16 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LayerState {
@@ -104,12 +104,47 @@ pub(crate) trait RouteDma: Send + Sync {
 
 type CuMemAllocHostFn = unsafe extern "C" fn(*mut *mut c_void, usize) -> i32;
 type CuMemFreeHostFn = unsafe extern "C" fn(*mut c_void) -> i32;
+
+const CU_MEMCPY_SRC_ACCESS_ORDER_STREAM: i32 = 1;
+const CU_MEM_LOCATION_TYPE_INVALID: i32 = 0;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CuMemLocation {
+    location_type: i32,
+    id: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CuMemcpyAttributes {
+    src_access_order: i32,
+    src_loc_hint: CuMemLocation,
+    dst_loc_hint: CuMemLocation,
+    flags: u32,
+}
+
+fn cuda_stream_ordered_copy_attributes() -> CuMemcpyAttributes {
+    CuMemcpyAttributes {
+        src_access_order: CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+        src_loc_hint: CuMemLocation {
+            location_type: CU_MEM_LOCATION_TYPE_INVALID,
+            id: 0,
+        },
+        dst_loc_hint: CuMemLocation {
+            location_type: CU_MEM_LOCATION_TYPE_INVALID,
+            id: 0,
+        },
+        flags: 0,
+    }
+}
+
 type CuMemcpyBatchAsyncFn = unsafe extern "C" fn(
     *mut *mut c_void,
     *mut *mut c_void,
     *mut usize,
     usize,
-    *mut c_void,
+    *mut CuMemcpyAttributes,
     *mut usize,
     usize,
     *mut c_void,
@@ -319,14 +354,16 @@ impl RouteDma for NativeCudaRouteDma {
             request.route_weights.cast_mut().cast(),
         ];
         let mut sizes = [component_bytes; 3];
+        let mut attributes = [cuda_stream_ordered_copy_attributes()];
+        let mut attribute_indices = [0usize];
         let batch = (api.memcpy_batch_async)(
             destinations.as_mut_ptr(),
             sources.as_mut_ptr(),
             sizes.as_mut_ptr(),
             destinations.len(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            0,
+            attributes.as_mut_ptr(),
+            attribute_indices.as_mut_ptr(),
+            attributes.len(),
             stream,
         );
         if batch != 0 {
@@ -350,6 +387,234 @@ impl RouteDma for NativeCudaRouteDma {
             released: false,
         }))
     }
+}
+
+pub(crate) struct PendingCudaOutputBatch {
+    api: &'static CudaRouteApi,
+    staging: usize,
+    event: usize,
+    released: bool,
+}
+
+unsafe impl Send for PendingCudaOutputBatch {}
+
+impl PendingCudaOutputBatch {
+    pub(crate) fn finish(mut self) -> Result<(), String> {
+        unsafe { self.synchronize_and_release() }
+    }
+
+    unsafe fn synchronize_and_release(&mut self) -> Result<(), String> {
+        let wait = (self.api.event_synchronize)(self.event as *mut c_void);
+        if wait != 0 {
+            self.released = true;
+            return Err(format!(
+                "cuEventSynchronize output batch failed with code {wait}"
+            ));
+        }
+        let destroy = (self.api.event_destroy)(self.event as *mut c_void);
+        let free = (self.api.mem_free_host)(self.staging as *mut c_void);
+        self.released = true;
+        if destroy != 0 {
+            return Err(format!(
+                "cuEventDestroy_v2 output batch failed with code {destroy}"
+            ));
+        }
+        if free != 0 {
+            return Err(format!(
+                "cuMemFreeHost output batch failed with code {free}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PendingCudaOutputBatch {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = unsafe { self.synchronize_and_release() };
+        }
+    }
+}
+
+pub(crate) unsafe fn enqueue_cuda_output_batch(
+    stream: usize,
+    outputs: &[(usize, &[u8])],
+) -> Result<PendingCudaOutputBatch, String> {
+    if stream == 0 || outputs.is_empty() {
+        return Err("CUDA output batch requires a nonzero stream and outputs".to_string());
+    }
+    let total_bytes = outputs.iter().try_fold(0usize, |total, (dst, bytes)| {
+        if *dst == 0 || bytes.is_empty() {
+            return Err(
+                "CUDA output batch contains a null destination or empty result".to_string(),
+            );
+        }
+        total
+            .checked_add(bytes.len())
+            .ok_or_else(|| "CUDA output batch staging size overflow".to_string())
+    })?;
+    let api = cuda_route_api()?;
+    let mut staging = std::ptr::null_mut();
+    let alloc = (api.mem_alloc_host)(&mut staging, total_bytes);
+    if alloc != 0 || staging.is_null() {
+        return Err(format!(
+            "cuMemAllocHost_v2 output batch failed with code {alloc}"
+        ));
+    }
+    let mut event = std::ptr::null_mut();
+    let create = (api.event_create)(&mut event, 2);
+    if create != 0 || event.is_null() {
+        let _ = (api.mem_free_host)(staging);
+        return Err(format!(
+            "cuEventCreate output batch failed with code {create}"
+        ));
+    }
+    let mut destinations = Vec::with_capacity(outputs.len());
+    let mut sources = Vec::with_capacity(outputs.len());
+    let mut sizes = Vec::with_capacity(outputs.len());
+    let mut cursor = 0usize;
+    for (dst, bytes) in outputs {
+        let source = staging.byte_add(cursor);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), source.cast::<u8>(), bytes.len());
+        destinations.push(*dst as *mut c_void);
+        sources.push(source);
+        sizes.push(bytes.len());
+        cursor += bytes.len();
+    }
+    let mut attributes = [cuda_stream_ordered_copy_attributes()];
+    let mut attribute_indices = [0usize];
+    let stream_ptr = stream as *mut c_void;
+    let batch = (api.memcpy_batch_async)(
+        destinations.as_mut_ptr(),
+        sources.as_mut_ptr(),
+        sizes.as_mut_ptr(),
+        outputs.len(),
+        attributes.as_mut_ptr(),
+        attribute_indices.as_mut_ptr(),
+        attributes.len(),
+        stream_ptr,
+    );
+    if batch != 0 {
+        let record = (api.event_record)(event, stream_ptr);
+        if record == 0 && (api.event_synchronize)(event) == 0 {
+            let _ = (api.event_destroy)(event);
+            let _ = (api.mem_free_host)(staging);
+        }
+        return Err(format!(
+            "cuMemcpyBatchAsync_v2 output batch failed with code {batch}"
+        ));
+    }
+    let record = (api.event_record)(event, stream_ptr);
+    if record != 0 {
+        return Err(format!(
+            "cuEventRecord output batch failed with code {record}"
+        ));
+    }
+    Ok(PendingCudaOutputBatch {
+        api,
+        staging: staging as usize,
+        event: event as usize,
+        released: false,
+    })
+}
+
+pub(crate) unsafe fn copy_cuda_to_host_batch(
+    stream: usize,
+    sources_and_sizes: &[(usize, usize)],
+) -> Result<Vec<Vec<u8>>, String> {
+    if stream == 0 || sources_and_sizes.is_empty() {
+        return Err("CUDA input batch requires a nonzero stream and sources".to_string());
+    }
+    let total_bytes = sources_and_sizes
+        .iter()
+        .try_fold(0usize, |total, (src, bytes)| {
+            if *src == 0 || *bytes == 0 {
+                return Err("CUDA input batch contains a null source or empty extent".to_string());
+            }
+            total
+                .checked_add(*bytes)
+                .ok_or_else(|| "CUDA input batch staging size overflow".to_string())
+        })?;
+    let api = cuda_route_api()?;
+    let mut staging = std::ptr::null_mut();
+    let alloc = (api.mem_alloc_host)(&mut staging, total_bytes);
+    if alloc != 0 || staging.is_null() {
+        return Err(format!(
+            "cuMemAllocHost_v2 input batch failed with code {alloc}"
+        ));
+    }
+    let mut event = std::ptr::null_mut();
+    let create = (api.event_create)(&mut event, 2);
+    if create != 0 || event.is_null() {
+        let _ = (api.mem_free_host)(staging);
+        return Err(format!(
+            "cuEventCreate input batch failed with code {create}"
+        ));
+    }
+    let mut destinations = Vec::with_capacity(sources_and_sizes.len());
+    let mut sources = Vec::with_capacity(sources_and_sizes.len());
+    let mut sizes = Vec::with_capacity(sources_and_sizes.len());
+    let mut cursor = 0usize;
+    for (src, bytes) in sources_and_sizes {
+        destinations.push(staging.byte_add(cursor));
+        sources.push(*src as *mut c_void);
+        sizes.push(*bytes);
+        cursor += *bytes;
+    }
+    let mut attributes = [cuda_stream_ordered_copy_attributes()];
+    let mut attribute_indices = [0usize];
+    let stream_ptr = stream as *mut c_void;
+    let batch = (api.memcpy_batch_async)(
+        destinations.as_mut_ptr(),
+        sources.as_mut_ptr(),
+        sizes.as_mut_ptr(),
+        sources_and_sizes.len(),
+        attributes.as_mut_ptr(),
+        attribute_indices.as_mut_ptr(),
+        attributes.len(),
+        stream_ptr,
+    );
+    if batch != 0 {
+        let record = (api.event_record)(event, stream_ptr);
+        if record == 0 && (api.event_synchronize)(event) == 0 {
+            let _ = (api.event_destroy)(event);
+            let _ = (api.mem_free_host)(staging);
+        }
+        return Err(format!(
+            "cuMemcpyBatchAsync_v2 input batch failed with code {batch}"
+        ));
+    }
+    let record = (api.event_record)(event, stream_ptr);
+    if record != 0 {
+        return Err(format!(
+            "cuEventRecord input batch failed with code {record}"
+        ));
+    }
+    let wait = (api.event_synchronize)(event);
+    if wait != 0 {
+        return Err(format!(
+            "cuEventSynchronize input batch failed with code {wait}"
+        ));
+    }
+    let mut copied = Vec::with_capacity(sources_and_sizes.len());
+    cursor = 0;
+    for (_, bytes) in sources_and_sizes {
+        copied.push(
+            std::slice::from_raw_parts(staging.byte_add(cursor).cast::<u8>(), *bytes).to_vec(),
+        );
+        cursor += *bytes;
+    }
+    let destroy = (api.event_destroy)(event);
+    let free = (api.mem_free_host)(staging);
+    if destroy != 0 {
+        return Err(format!(
+            "cuEventDestroy_v2 input batch failed with code {destroy}"
+        ));
+    }
+    if free != 0 {
+        return Err(format!("cuMemFreeHost input batch failed with code {free}"));
+    }
+    Ok(copied)
 }
 
 pub(crate) struct LayerCoordinator {
@@ -996,9 +1261,7 @@ impl Iq1sLayerPhaseExecutor for GlobalPersistentPhaseExecutor {
         &mut self,
         snapshot: super::iq1s_persistent_runtime::PhaseSnapshot,
     ) -> Result<(), String> {
-        super::iq1s_persistent_runtime::with_global_persistent_runtime(|runtime| {
-            runtime.execute_phase(snapshot).map(|_| ())
-        })
+        super::iq1s_persistent_runtime::execute_global_persistent_phase(snapshot)
     }
 
     fn poison(&mut self, error: &str) {
@@ -1080,6 +1343,12 @@ pub(crate) fn has_open_transaction(stream: usize) -> Result<bool, String> {
     Ok(global_coordinator()
         .open_transaction_for_stream(stream)?
         .is_some())
+}
+
+pub(crate) fn open_layer_key(stream: usize) -> Result<Option<LayerKey>, String> {
+    Ok(global_coordinator()
+        .open_transaction_for_stream(stream)?
+        .map(|open| open.key))
 }
 
 pub(crate) fn resolve_captured_role(
@@ -1745,7 +2014,8 @@ mod tests {
         let coordinator = LayerCoordinator::new(1, QWEN35_EXPERTS_PER_TOKEN).unwrap();
         let expected = roles(&[Iq1sExpertRole::Gate, Iq1sExpertRole::Up]);
         assert!(coordinator.begin(0, 1, 0, 1, expected.clone()).is_err());
-        assert!(coordinator.begin(0, 2, 17, 1, expected.clone()).is_err());
+        coordinator.begin(0, 2, 32, 1, expected.clone()).unwrap();
+        assert!(coordinator.begin(0, 4, 33, 1, expected.clone()).is_err());
         assert!(coordinator
             .begin(QWEN35_LAYER_COUNT, 4, 1, 1, expected.clone())
             .is_err());
@@ -1908,5 +2178,17 @@ mod tests {
         assert_ne!(api.memcpy_batch_async as usize, 0);
         assert_ne!(api.event_record as usize, 0);
         assert_ne!(api.event_synchronize as usize, 0);
+    }
+
+    #[test]
+    fn cuda13_route_dma_attributes_are_stream_ordered() {
+        let attributes = cuda_stream_ordered_copy_attributes();
+        assert_eq!(std::mem::size_of::<CuMemcpyAttributes>(), 24);
+        assert_eq!(attributes.src_access_order, 1);
+        assert_eq!(attributes.src_loc_hint.location_type, 0);
+        assert_eq!(attributes.src_loc_hint.id, 0);
+        assert_eq!(attributes.dst_loc_hint.location_type, 0);
+        assert_eq!(attributes.dst_loc_hint.id, 0);
+        assert_eq!(attributes.flags, 0);
     }
 }

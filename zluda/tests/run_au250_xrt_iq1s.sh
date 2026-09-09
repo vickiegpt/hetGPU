@@ -22,7 +22,7 @@ if [[ ${1:-} == "--inside" ]]; then
     export CARGO_INCREMENTAL=0
     export CARGO_BUILD_JOBS=32
 
-    xclbin=${HETGPU_XRT_XCLBIN:?HETGPU_XRT_XCLBIN must name the persistent IQ1_S xclbin}
+    xclbin=${HETGPU_XRT_XCLBIN:?HETGPU_XRT_XCLBIN must name the qualified legacy IQ1_S xclbin}
     xclbin_info=$(xclbinutil --info --input "$xclbin" 2>&1)
     printf "%s\n" "$xclbin_info"
     require_instance_bank() {
@@ -33,20 +33,20 @@ if [[ ${1:-} == "--inside" ]]; then
             active && $1 == "Memory:" && $2 == bank { found = 1 }
             END { exit !found }
         ' <<<"$xclbin_info" || {
-            echo "MaxCores topology missing ${instance}->${bank}" >&2
+            echo "qualified legacy topology missing ${instance}->${bank}" >&2
             exit 1
         }
     }
-    require_instance_bank iq1s_layer_big_1 bank0
-    require_instance_bank iq1s_layer_big_2 bank3
-    require_instance_bank iq1s_layer_big_3 bank2
-    require_instance_bank iq1s_layer_small_1 bank1
+    require_instance_bank ternip_big_1 bank0
+    require_instance_bank ternip_big_2 bank3
+    require_instance_bank ternip_big_3 bank2
+    require_instance_bank ternip_small_1 bank1
 
     export HETGPU_XRT_AU250_IQ1S_TEST=1
     export HETGPU_XRT_XCLBIN="$xclbin"
     export HETGPU_XRT_NUM_VECTOR_REGISTERS=4
     export HETGPU_XRT_TIMEOUT_MS=10000
-    export HETGPU_XRT_CU_CONFIG='{"version":1,"cus":[{"ip_name":"iq1s_layer_big:iq1s_layer_big_1","memory_group":0,"lanes":9},{"ip_name":"iq1s_layer_big:iq1s_layer_big_2","memory_group":3,"lanes":9},{"ip_name":"iq1s_layer_big:iq1s_layer_big_3","memory_group":2,"lanes":9},{"ip_name":"iq1s_layer_small:iq1s_layer_small_1","memory_group":1,"lanes":6}]}'
+    export HETGPU_XRT_CU_CONFIG='{"version":1,"cus":[{"ip_name":"ternip_big:ternip_big_1","memory_group":0,"lanes":9},{"ip_name":"ternip_big:ternip_big_2","memory_group":3,"lanes":9},{"ip_name":"ternip_big:ternip_big_3","memory_group":2,"lanes":9},{"ip_name":"ternip_small:ternip_small_1","memory_group":1,"lanes":6}]}'
     export HETGPU_XRT_BAR0_RESOURCE=/sys/bus/pci/devices/0000:64:00.1/resource0
     export HETGPU_QWEN_IQ1S_STRICT=1
     export HETGPU_IQ1S_TRACE_MODE="$trace_mode"
@@ -88,7 +88,7 @@ PY
         echo "AU250 health gate failed: firewall is not GOOD" >&2
         exit 1
     }
-    for cu in iq1s_layer_big_1 iq1s_layer_big_2 iq1s_layer_big_3 iq1s_layer_small_1; do
+    for cu in ternip_big_1 ternip_big_2 ternip_big_3 ternip_small_1; do
         grep -Eq "${cu}.*\(DONE\)" <<<"$health_report" || {
             echo "AU250 health gate failed: ${cu} is not DONE" >&2
             exit 1

@@ -63,13 +63,8 @@ type CuLibraryLoadDataFn = unsafe extern "C" fn(
 type CuLibraryGetKernelFn =
     unsafe extern "C" fn(*mut CUkernel, CUlibrary, *const c_char) -> CUresult;
 type CuKernelGetFunctionFn = unsafe extern "C" fn(*mut CUfunction, CUkernel) -> CUresult;
-type CuOccupancyMaxActiveBlocksPerMultiprocessorWithFlagsFn = unsafe extern "C" fn(
-    *mut c_int,
-    CUfunction,
-    c_int,
-    size_t,
-    c_uint,
-) -> CUresult;
+type CuOccupancyMaxActiveBlocksPerMultiprocessorWithFlagsFn =
+    unsafe extern "C" fn(*mut c_int, CUfunction, c_int, size_t, c_uint) -> CUresult;
 type CuLaunchKernelFn = unsafe extern "C" fn(
     CUfunction,
     c_uint,
@@ -791,11 +786,7 @@ pub fn cuMemFreeHost(p: *mut c_void) -> i32 {
     999
 }
 
-pub fn cuMemHostGetDevicePointer_v2(
-    pdptr: *mut CUdeviceptr,
-    p: *mut c_void,
-    flags: c_uint,
-) -> i32 {
+pub fn cuMemHostGetDevicePointer_v2(pdptr: *mut CUdeviceptr, p: *mut c_void, flags: c_uint) -> i32 {
     if let Some(funcs) = get_cuda_funcs() {
         if let Some(f) = funcs.cuMemHostGetDevicePointer_v2 {
             let result = unsafe { f(pdptr, p, flags) };
@@ -916,11 +907,7 @@ pub fn cuLibraryLoadData(
     999
 }
 
-pub fn cuLibraryGetKernel(
-    kernel: *mut CUkernel,
-    library: CUlibrary,
-    name: *const c_char,
-) -> i32 {
+pub fn cuLibraryGetKernel(kernel: *mut CUkernel, library: CUlibrary, name: *const c_char) -> i32 {
     if let Some(funcs) = get_cuda_funcs() {
         if let Some(f) = funcs.cuLibraryGetKernel {
             let result = unsafe { f(kernel, library, name) };
@@ -949,15 +936,7 @@ pub fn cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
 ) -> i32 {
     if let Some(funcs) = get_cuda_funcs() {
         if let Some(f) = funcs.cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags {
-            let result = unsafe {
-                f(
-                    num_blocks,
-                    function,
-                    block_size,
-                    dynamic_smem_size,
-                    flags,
-                )
-            };
+            let result = unsafe { f(num_blocks, function, block_size, dynamic_smem_size, flags) };
             return cuda_result_to_int(result);
         }
     }
@@ -968,6 +947,16 @@ pub fn cuFuncGetAttribute(pi: *mut c_int, attrib: CUfunction_attribute, hfunc: C
     if let Some(funcs) = get_cuda_funcs() {
         if let Some(f) = funcs.cuFuncGetAttribute {
             let result = unsafe { f(pi, attrib, hfunc) };
+            return cuda_result_to_int(result);
+        }
+    }
+    999
+}
+
+pub fn cuFuncSetAttribute(hfunc: CUfunction, attrib: CUfunction_attribute, value: c_int) -> i32 {
+    if let Some(funcs) = get_cuda_funcs() {
+        if let Some(f) = funcs.cuFuncSetAttribute {
+            let result = unsafe { f(hfunc, attrib, value) };
             return cuda_result_to_int(result);
         }
     }

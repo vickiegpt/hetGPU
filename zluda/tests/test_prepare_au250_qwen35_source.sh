@@ -64,6 +64,8 @@ grep -Fq 'bool down_seen =' "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
 grep -Fq 'state.gate_seen && state.up_seen && !state.phase_a_committed' \
     "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
 grep -Fq 'hetgpu_iq1s_commit_after_down' "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
+grep -Fq 'hetgpu_iq1s_try_close_gpu_down' "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
+grep -Fq '!hetgpu_iq1s_try_close_gpu_down(state)' "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
 grep -Fq 'hetgpu_iq1s_note_route_weights' "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
 grep -Fq 'static std::atomic<uint64_t> hetgpu_iq1s_next_transaction{1}' \
     "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
@@ -71,6 +73,9 @@ grep -Fq 'hetgpu_iq1s_graph_boundary("begin")' "${overlay}/ggml/src/ggml-cuda/gg
 grep -Fq 'hetgpu_iq1s_graph_boundary("end")' "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
 grep -Fq 'hetgpu_iq1s_graph_boundary("exception")' "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
 grep -Fq 'hetgpu_iq1s_abort_active_for_cuda_error();' "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
+grep -Fq 'constexpr uint32_t max_batch = 32;' "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
+grep -Fq 'ids->ne[1] > max_batch' "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
+grep -Fq 'max_batch * top_k' "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu"
 python3 - "${overlay}/ggml/src/ggml-cuda/ggml-cuda.cu" <<'PY'
 import pathlib
 import re

@@ -6,8 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SUMMARY_HEADER: &str =
-    "experiment,status,exit_code,duration_ms,artifact,log,message";
+const SUMMARY_HEADER: &str = "experiment,status,exit_code,duration_ms,artifact,log,message";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -209,7 +208,9 @@ fn build_experiments(repo: &Path, config: &Config, mpi_hostfile: Option<&Path>) 
                 "run".into(),
                 "--release".into(),
                 "--manifest-path".into(),
-                repo.join("bench/concordia_oob/Cargo.toml").display().to_string(),
+                repo.join("bench/concordia_oob/Cargo.toml")
+                    .display()
+                    .to_string(),
             ],
             envs: Vec::new(),
             artifact: out.join("logs/concordia_oob.log"),
@@ -218,7 +219,10 @@ fn build_experiments(repo: &Path, config: &Config, mpi_hostfile: Option<&Path>) 
     if config.experiments.claim_audit {
         experiments.push(Experiment {
             name: "claim_audit",
-            command: vec!["bash".into(), "bench/concordia_claim_audit/test_claim_audit.sh".into()],
+            command: vec![
+                "bash".into(),
+                "bench/concordia_claim_audit/test_claim_audit.sh".into(),
+            ],
             envs: Vec::new(),
             artifact: out.join("logs/claim_audit.log"),
         });
@@ -240,12 +244,19 @@ fn build_experiments(repo: &Path, config: &Config, mpi_hostfile: Option<&Path>) 
                 "--csv".into(),
                 out.join("artifacts/eval_claims.csv").display().to_string(),
                 "--jsonl".into(),
-                out.join("artifacts/eval_claims.jsonl").display().to_string(),
+                out.join("artifacts/eval_claims.jsonl")
+                    .display()
+                    .to_string(),
                 "--markdown".into(),
                 out.join("artifacts/eval_claims.md").display().to_string(),
             ]
             .into_iter()
-            .chain(config.run.static_only.then_some("--static-only".to_string()))
+            .chain(
+                config
+                    .run
+                    .static_only
+                    .then_some("--static-only".to_string()),
+            )
             .collect(),
             envs: Vec::new(),
             artifact: out.join("artifacts/eval_claims.csv"),
@@ -254,7 +265,10 @@ fn build_experiments(repo: &Path, config: &Config, mpi_hostfile: Option<&Path>) 
     if config.experiments.delta_static {
         experiments.push(Experiment {
             name: "delta_static",
-            command: vec!["bash".into(), "bench/concordia_delta_checkpoint/test_smoke.sh".into()],
+            command: vec![
+                "bash".into(),
+                "bench/concordia_delta_checkpoint/test_smoke.sh".into(),
+            ],
             envs: vec![
                 ("CONCORDIA_BENCH_STATIC_ONLY".into(), "1".into()),
                 ("CUDA_OXIDE_ARCH".into(), config.run.cuda_arch.clone()),
@@ -265,7 +279,10 @@ fn build_experiments(repo: &Path, config: &Config, mpi_hostfile: Option<&Path>) 
     if config.experiments.delta_live && !config.run.static_only {
         experiments.push(Experiment {
             name: "delta_live",
-            command: vec!["bash".into(), "bench/concordia_delta_checkpoint/test_smoke.sh".into()],
+            command: vec![
+                "bash".into(),
+                "bench/concordia_delta_checkpoint/test_smoke.sh".into(),
+            ],
             envs: vec![("CUDA_OXIDE_ARCH".into(), config.run.cuda_arch.clone())],
             artifact: out.join("logs/delta_live.log"),
         });
@@ -278,13 +295,19 @@ fn build_experiments(repo: &Path, config: &Config, mpi_hostfile: Option<&Path>) 
                 "bench/concordia_persistent_overhead/test_persistent_overhead.sh".into(),
             ],
             envs: vec![
-                ("CONCORDIA_PERSISTENT_OVERHEAD_STATIC_ONLY".into(), "1".into()),
+                (
+                    "CONCORDIA_PERSISTENT_OVERHEAD_STATIC_ONLY".into(),
+                    "1".into(),
+                ),
                 (
                     "CONCORDIA_PERSISTENT_OVERHEAD_TEST_WORKDIR".into(),
-                    out.join("artifacts/persistent_static").display().to_string(),
+                    out.join("artifacts/persistent_static")
+                        .display()
+                        .to_string(),
                 ),
             ],
-            artifact: out.join("artifacts/persistent_static/concordia_persistent_overhead_ablation.pdf"),
+            artifact: out
+                .join("artifacts/persistent_static/concordia_persistent_overhead_ablation.pdf"),
         });
     }
     if config.experiments.persistent_live && !config.run.static_only {
@@ -301,15 +324,22 @@ fn build_experiments(repo: &Path, config: &Config, mpi_hostfile: Option<&Path>) 
                     out.join("artifacts/persistent_live").display().to_string(),
                 ),
             ],
-            artifact: out.join("artifacts/persistent_live/concordia_persistent_overhead_ablation.pdf"),
+            artifact: out
+                .join("artifacts/persistent_live/concordia_persistent_overhead_ablation.pdf"),
         });
     }
     if config.experiments.kimi_tps {
         experiments.push(Experiment {
             name: "kimi_tps",
-            command: vec!["bash".into(), "bench/kimi_k26_tps/run_kimi_k26_tps.sh".into()],
+            command: vec![
+                "bash".into(),
+                "bench/kimi_k26_tps/run_kimi_k26_tps.sh".into(),
+            ],
             envs: vec![
-                ("KIMI_TPS_WORKDIR".into(), out.join("artifacts/kimi_tps").display().to_string()),
+                (
+                    "KIMI_TPS_WORKDIR".into(),
+                    out.join("artifacts/kimi_tps").display().to_string(),
+                ),
                 ("KIMI_TPS_KEEP".into(), "1".into()),
                 ("KIMI_TPS_BUILD_ZLUDA".into(), "0".into()),
                 ("KIMI_TPS_TIMEOUT".into(), "15".into()),
@@ -317,8 +347,14 @@ fn build_experiments(repo: &Path, config: &Config, mpi_hostfile: Option<&Path>) 
                 ("N_PREDICT".into(), "1".into()),
                 ("CTX_SIZE".into(), "128".into()),
                 ("THREADS".into(), "8".into()),
-                ("BITNET_LLAMA_CLI".into(), config.paths.kimi_runner.display().to_string()),
-                ("MODEL_DIR".into(), config.paths.kimi_model_dir.display().to_string()),
+                (
+                    "BITNET_LLAMA_CLI".into(),
+                    config.paths.kimi_runner.display().to_string(),
+                ),
+                (
+                    "MODEL_DIR".into(),
+                    config.paths.kimi_model_dir.display().to_string(),
+                ),
             ],
             artifact: out.join("artifacts/kimi_tps/kimi_k26_tps.csv"),
         });
@@ -341,7 +377,10 @@ fn build_experiments(repo: &Path, config: &Config, mpi_hostfile: Option<&Path>) 
             ]);
             command
         } else {
-            vec!["bash".into(), "bench/concordia_mpi_nccl_recovery/test_recovered_allreduce.sh".into()]
+            vec![
+                "bash".into(),
+                "bench/concordia_mpi_nccl_recovery/test_recovered_allreduce.sh".into(),
+            ]
         };
         if !config.mpi.enabled {
             command.shrink_to_fit();
@@ -351,7 +390,9 @@ fn build_experiments(repo: &Path, config: &Config, mpi_hostfile: Option<&Path>) 
             command,
             envs: vec![(
                 "HETGPU_NCCL_RECOVERY_ARTIFACT_DIR".into(),
-                out.join("artifacts/mpi_nccl_recovery").display().to_string(),
+                out.join("artifacts/mpi_nccl_recovery")
+                    .display()
+                    .to_string(),
             )],
             artifact: out.join("artifacts/mpi_nccl_recovery/evidence"),
         });
@@ -379,7 +420,11 @@ fn run_experiment(repo: &Path, config: &Config, experiment: &Experiment) -> io::
         Ok(output) => {
             let mut text = String::from_utf8_lossy(&output.stdout).to_string();
             text.push_str(&String::from_utf8_lossy(&output.stderr));
-            (output.status.code().unwrap_or(-1), text, output.status.success())
+            (
+                output.status.code().unwrap_or(-1),
+                text,
+                output.status.success(),
+            )
         }
         Err(err) => (-1, format!("failed to spawn: {err}\n"), false),
     };
@@ -612,7 +657,11 @@ fn parse_limited_toml(text: &str) -> io::Result<TomlDoc> {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
-            return Err(invalid(format!("invalid TOML line {}: {}", line_no + 1, raw)));
+            return Err(invalid(format!(
+                "invalid TOML line {}: {}",
+                line_no + 1,
+                raw
+            )));
         };
         doc.entry(section.clone())
             .or_default()
@@ -811,11 +860,7 @@ mod tests {
         let dir = unique_temp_dir("concordia-all-eval");
         fs::create_dir_all(&dir).unwrap();
         let csv = dir.join("eval.csv");
-        fs::write(
-            &csv,
-            "claim_id,status\nx,pass\ny,partial\nz,blocked\n",
-        )
-        .unwrap();
+        fs::write(&csv, "claim_id,status\nx,pass\ny,partial\nz,blocked\n").unwrap();
         assert_eq!(classify_eval_claims_csv(&csv), "partial");
         let _ = fs::remove_dir_all(dir);
     }

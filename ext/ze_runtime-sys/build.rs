@@ -55,7 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::symlink;
-                symlink(&loader, &link_name).or_else(|_| fs::copy(&loader, &link_name).map(|_| ()))?;
+                symlink(&loader, &link_name)
+                    .or_else(|_| fs::copy(&loader, &link_name).map(|_| ()))?;
             }
             #[cfg(not(unix))]
             {

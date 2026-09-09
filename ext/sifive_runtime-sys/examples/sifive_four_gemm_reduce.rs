@@ -11,7 +11,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !real_io {
         std::env::set_var("HETGPU_SIFIVE_DRY_RUN", "1");
         std::env::set_var("HETGPU_SIFIVE_SKIP_HW_REDUCE", "1");
-        println!("SIFIVE smoke using dry-run io; set HETGPU_SIFIVE_REAL_IO=1 for driver submission");
+        println!(
+            "SIFIVE smoke using dry-run io; set HETGPU_SIFIVE_REAL_IO=1 for driver submission"
+        );
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -68,7 +70,8 @@ fn compile_kernel(source: &Path, elf: &Path) -> Result<(), Box<dyn std::error::E
         std::fs::create_dir_all(parent)?;
     }
 
-    let compiler = std::env::var("SIFIVE_CC").unwrap_or_else(|_| "riscv64-linux-gnu-gcc".to_string());
+    let compiler =
+        std::env::var("SIFIVE_CC").unwrap_or_else(|_| "riscv64-linux-gnu-gcc".to_string());
     let status = Command::new(&compiler)
         .arg("-nostdlib")
         .arg("-static")

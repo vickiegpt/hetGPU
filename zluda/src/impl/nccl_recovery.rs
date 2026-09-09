@@ -175,7 +175,12 @@ pub unsafe extern "C" fn hetgpu_concordia_nccl_classify_failure(
     consecutive_errors: u32,
     health_degraded: i32,
 ) -> i32 {
-    let decision = classify_nccl_failure(result, async_error, consecutive_errors, health_degraded != 0);
+    let decision = classify_nccl_failure(
+        result,
+        async_error,
+        consecutive_errors,
+        health_degraded != 0,
+    );
     match decision.action {
         RecoveryAction::Retry => 0,
         RecoveryAction::Migrate => 1,

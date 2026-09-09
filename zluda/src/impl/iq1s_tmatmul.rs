@@ -3091,12 +3091,8 @@ mod tests {
             Arc::new(grid()),
         )
         .unwrap();
-        let second = MatrixSource::new(
-            signature,
-            Arc::from(block(3, true, 1)),
-            Arc::new(grid()),
-        )
-        .unwrap();
+        let second =
+            MatrixSource::new(signature, Arc::from(block(3, true, 1)), Arc::new(grid())).unwrap();
 
         let mut cache = ComponentCache::default();
         cache.insert(first_identity.clone(), first.clone());

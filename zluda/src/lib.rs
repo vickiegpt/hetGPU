@@ -180,10 +180,7 @@ pub extern "C" fn hetgpu_iq1s_layer_phase_commit_v2(
     not(feature = "tenstorrent")
 ))]
 #[no_mangle]
-pub extern "C" fn hetgpu_iq1s_layer_commit_v2(
-    abi_version: u32,
-    transaction_id: u64,
-) -> i32 {
+pub extern "C" fn hetgpu_iq1s_layer_commit_v2(abi_version: u32, transaction_id: u64) -> i32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::r#impl::iq1s_layer::layer_commit(abi_version, transaction_id)
     }))

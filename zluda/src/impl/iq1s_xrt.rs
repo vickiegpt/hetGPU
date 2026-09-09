@@ -148,8 +148,7 @@ fn scalar_reference_outputs(captured: &CapturedLaunch) -> Result<Vec<f32>, Strin
                 let q8 = captured.q8_group(batch_index, global_group)?;
                 let (d, group) = captured.matrix.group(row, global_group)?;
                 let (grid, delta) = raw_component_dots(&group, &q8);
-                let contribution =
-                    reconstruct_from_raw(&group, d, &q8, grid << 8, delta << 8)?;
+                let contribution = reconstruct_from_raw(&group, d, &q8, grid << 8, delta << 8)?;
                 let output = &mut outputs[batch_index * rows + row];
                 *output = (*output + contribution) as f32;
             }
@@ -177,11 +176,7 @@ pub(crate) fn compare_outputs_with_reference(
     }
     let mut max_absolute_error = 0.0_f32;
     let mut max_relative_error = 0.0_f32;
-    for (index, (&reference, &actual)) in reference_outputs
-        .iter()
-        .zip(actual_outputs)
-        .enumerate()
-    {
+    for (index, (&reference, &actual)) in reference_outputs.iter().zip(actual_outputs).enumerate() {
         if !reference.is_finite() || !actual.is_finite() {
             return Err(format!("IQ1_S sampled output {index} is non-finite"));
         }
@@ -1466,13 +1461,8 @@ mod tests {
     fn sampled_output_comparison_retains_vectors_and_rejects_drift() {
         let captured = small_fixture();
         let reference = software_reference(&captured).unwrap();
-        let comparison = compare_outputs_with_reference(
-            &captured,
-            &reference,
-            1.0e-4,
-            1.0e-3,
-        )
-        .unwrap();
+        let comparison =
+            compare_outputs_with_reference(&captured, &reference, 1.0e-4, 1.0e-3).unwrap();
         assert_eq!(comparison.status, "pass");
         assert_eq!(comparison.reference_outputs, reference);
         assert_eq!(comparison.actual_outputs, reference);
@@ -1480,13 +1470,8 @@ mod tests {
 
         let mut drifted = comparison.actual_outputs.clone();
         drifted[0] += 1.0;
-        let error = compare_outputs_with_reference(
-            &captured,
-            &drifted,
-            1.0e-4,
-            1.0e-3,
-        )
-        .unwrap_err();
+        let error =
+            compare_outputs_with_reference(&captured, &drifted, 1.0e-4, 1.0e-3).unwrap_err();
         assert!(error.contains("outside tolerance"), "{error}");
     }
 

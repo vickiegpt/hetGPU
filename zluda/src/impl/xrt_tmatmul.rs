@@ -22,6 +22,7 @@ const DMASR_IDLE: u32 = 1 << 1;
 const INSTRUCTION_BYTES: usize = 16;
 pub(crate) const XRT_BO_SYNC_TO_DEVICE: i32 = 0;
 pub(crate) const XRT_BO_SYNC_FROM_DEVICE: i32 = 1;
+pub(crate) const XRT_BO_FLAGS_DEVICE_ONLY: u64 = 1 << 28;
 const AU250_DIM: usize = 1024;
 const AU250_MATRIX_BYTES: usize = AU250_DIM * AU250_DIM / 4;
 const AU250_TMATMUL_ASSEMBLY: &str = "ldv v0, PARAM_INPUT\ntmatmul_import v0\ntmatmul_go PARAM_MATRIX\ntmatmul_export v1\nsv v1, PARAM_OUTPUT\nstall\n";
@@ -44,6 +45,7 @@ type BoFreeFn = unsafe extern "C" fn(Handle) -> i32;
 type BoAddressFn = unsafe extern "C" fn(Handle) -> u64;
 type BoWriteFn = unsafe extern "C" fn(Handle, *const libc::c_void, usize, usize) -> i32;
 type BoReadFn = unsafe extern "C" fn(Handle, *mut libc::c_void, usize, usize) -> i32;
+type BoCopyFn = unsafe extern "C" fn(Handle, Handle, usize, usize, usize) -> i32;
 type BoSyncFn = unsafe extern "C" fn(Handle, i32, usize, usize) -> i32;
 type XclOpenFn = unsafe extern "C" fn(u32, *const libc::c_char, i32) -> Handle;
 type XclCloseFn = unsafe extern "C" fn(Handle);
@@ -196,6 +198,14 @@ pub(crate) trait XrtOps {
     fn bo_read(&self, bo: Handle, bytes: &mut [u8]) -> i32 {
         self.bo_read_range(bo, bytes, 0)
     }
+    fn bo_copy(
+        &self,
+        destination: Handle,
+        source: Handle,
+        size: usize,
+        destination_offset: usize,
+        source_offset: usize,
+    ) -> i32;
     fn bo_sync(&self, bo: Handle, direction: i32, size: usize, offset: usize) -> i32;
 }
 
@@ -265,6 +275,7 @@ pub(crate) struct RealXrt {
     bo_address: BoAddressFn,
     bo_write: BoWriteFn,
     bo_read: BoReadFn,
+    bo_copy: BoCopyFn,
     bo_sync: BoSyncFn,
 }
 
@@ -299,6 +310,7 @@ impl RealXrt {
                 bo_address: load_symbol(library, c"xrtBOAddress")?,
                 bo_write: load_symbol(library, c"xrtBOWrite")?,
                 bo_read: load_symbol(library, c"xrtBORead")?,
+                bo_copy: load_symbol(library, c"xrtBOCopy")?,
                 bo_sync: load_symbol(library, c"xrtBOSync")?,
             })
         };
@@ -410,6 +422,17 @@ impl XrtOps for RealXrt {
 
     fn bo_read_range(&self, bo: Handle, bytes: &mut [u8], offset: usize) -> i32 {
         unsafe { (self.bo_read)(bo, bytes.as_mut_ptr().cast(), bytes.len(), offset) }
+    }
+
+    fn bo_copy(
+        &self,
+        destination: Handle,
+        source: Handle,
+        size: usize,
+        destination_offset: usize,
+        source_offset: usize,
+    ) -> i32 {
+        unsafe { (self.bo_copy)(destination, source, size, destination_offset, source_offset) }
     }
 
     fn bo_sync(&self, bo: Handle, direction: i32, size: usize, offset: usize) -> i32 {
@@ -2580,6 +2603,30 @@ mod tests {
                 size: bytes.len(),
             });
             0
+        }
+
+        fn bo_copy(
+            &self,
+            destination: Handle,
+            source: Handle,
+            size: usize,
+            destination_offset: usize,
+            source_offset: usize,
+        ) -> i32 {
+            let state = self.state.borrow();
+            let destination_size = state.bo_sizes.get(&(destination as usize)).copied();
+            let source_size = state.bo_sizes.get(&(source as usize)).copied();
+            if destination_offset
+                .checked_add(size)
+                .is_none_or(|end| destination_size.is_none_or(|bytes| end > bytes))
+                || source_offset
+                    .checked_add(size)
+                    .is_none_or(|end| source_size.is_none_or(|bytes| end > bytes))
+            {
+                -1
+            } else {
+                0
+            }
         }
 
         fn bo_sync(&self, bo: Handle, direction: i32, size: usize, offset: usize) -> i32 {
