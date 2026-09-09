@@ -979,7 +979,8 @@ PERSISTENT_PHASE_FIELDS = {
     "trace_mode", "session_generation", "program_sha256", "semantic_sha256",
     "commands_per_cu", "completions_per_cu", "weight_dma_bytes",
     "eligible_direct_routes", "comparison_sampled", "reference_backend",
-    "checked_elements", "max_abs_error", "max_rel_error", "nonfinite",
+    "checked_elements", "absolute_tolerance", "relative_tolerance",
+    "max_abs_error", "max_rel_error", "max_tolerance_ratio", "nonfinite",
     "comparison_status", "timing_us",
 }
 
@@ -1022,7 +1023,7 @@ def parse_persistent_iq1s_routing(route_records, phase_records, mode):
         label = f"persistent phase[{index}]"
         if set(record) != PERSISTENT_PHASE_FIELDS:
             raise EvaluationError(f"{label} fields differ from schema")
-        if record["schema_version"] != 2 or record["kind"] != "iq1s_persistent_phase":
+        if record["schema_version"] != 3 or record["kind"] != "iq1s_persistent_phase":
             raise EvaluationError(f"{label} schema identity is invalid")
         transaction = record["transaction_id"]
         layer = record["layer_id"]
@@ -1063,27 +1064,38 @@ def parse_persistent_iq1s_routing(route_records, phase_records, mode):
         if not _is_integer(checked) or checked <= 0:
             raise EvaluationError(f"{label} checked element count is invalid")
         try:
+            absolute_tolerance = float(record["absolute_tolerance"])
+            relative_tolerance = float(record["relative_tolerance"])
             max_abs = float(record["max_abs_error"])
             max_rel = float(record["max_rel_error"])
+            max_tolerance_ratio = float(record["max_tolerance_ratio"])
         except (TypeError, ValueError) as error:
             raise EvaluationError(f"{label} comparison errors are invalid") from error
-        if not math.isfinite(max_abs) or not math.isfinite(max_rel) or max_abs < 0 or max_rel < 0:
+        comparison_numbers = (
+            absolute_tolerance, relative_tolerance, max_abs, max_rel,
+            max_tolerance_ratio,
+        )
+        if not all(math.isfinite(value) and value >= 0 for value in comparison_numbers):
             raise EvaluationError(f"{label} comparison errors are invalid")
         if record["comparison_sampled"] is True:
             if (
-                record["reference_backend"] != "libggml_dequantize_row_iq1_s"
+                record["reference_backend"] != "llama_cuda_mmq_iq1_s_sm120_half2"
                 or record["comparison_status"] != "pass"
-                or max_abs > 1.0e-4
-                or max_rel > 1.0e-3
+                or absolute_tolerance != 5.0e-4
+                or relative_tolerance != 1.0e-3
+                or max_tolerance_ratio > 1.0
             ):
-                raise EvaluationError(f"{label} sampled libggml comparison did not pass")
+                raise EvaluationError(f"{label} sampled CUDA-MMQ comparison did not pass")
             sampled.append(record)
         elif record["comparison_sampled"] is False:
             if (
                 record["reference_backend"] is not None
                 or record["comparison_status"] != "finite_only"
+                or absolute_tolerance != 0.0
+                or relative_tolerance != 0.0
                 or max_abs != 0.0
                 or max_rel != 0.0
+                or max_tolerance_ratio != 0.0
             ):
                 raise EvaluationError(f"{label} finite-only validation is invalid")
         else:
@@ -1097,7 +1109,7 @@ def parse_persistent_iq1s_routing(route_records, phase_records, mode):
         per_cu_completions = [left + right for left, right in zip(per_cu_completions, completions)]
 
     if len(sampled) != 1:
-        raise EvaluationError("persistent IQ1_S ledger requires exactly one libggml sample")
+        raise EvaluationError("persistent IQ1_S ledger requires exactly one CUDA-MMQ sample")
     sample = sampled[0]
     xrt = zero_xrt_evidence()
     xrt.update({
@@ -1121,10 +1133,11 @@ def parse_persistent_iq1s_routing(route_records, phase_records, mode):
         "status": "pass",
         "reference_backend": sample["reference_backend"],
         "checked_elements": sample["checked_elements"],
-        "atol": 1.0e-4,
-        "rtol": 1.0e-3,
+        "atol": float(sample["absolute_tolerance"]),
+        "rtol": float(sample["relative_tolerance"]),
         "max_absolute_error": float(sample["max_abs_error"]),
         "max_relative_error": float(sample["max_rel_error"]),
+        "max_tolerance_ratio": float(sample["max_tolerance_ratio"]),
         "phase": "pre_timed",
         "kernel": "iq1s_layer_persistent",
     }

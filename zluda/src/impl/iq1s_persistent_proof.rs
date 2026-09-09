@@ -5,15 +5,20 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const PHASE_KIND: &str = "iq1s_persistent_phase";
-pub(crate) const LIBGGML_REFERENCE_BACKEND: &str = "libggml_dequantize_row_iq1_s";
+pub(crate) const CUDA_MMQ_REFERENCE_BACKEND: &str = "llama_cuda_mmq_iq1_s_sm120_half2";
+pub(crate) const CUDA_MMQ_ABSOLUTE_TOLERANCE: f32 = 5.0e-4;
+pub(crate) const CUDA_MMQ_RELATIVE_TOLERANCE: f32 = 1.0e-3;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub(crate) struct PhaseComparison {
     pub(crate) sampled: bool,
     pub(crate) reference_backend: Option<&'static str>,
     pub(crate) checked_elements: usize,
+    pub(crate) absolute_tolerance: f32,
+    pub(crate) relative_tolerance: f32,
     pub(crate) max_abs_error: f32,
     pub(crate) max_rel_error: f32,
+    pub(crate) max_tolerance_ratio: f32,
     pub(crate) nonfinite: u64,
     pub(crate) status: &'static str,
 }
@@ -24,13 +29,17 @@ impl PhaseComparison {
         checked_elements: usize,
         max_abs_error: f32,
         max_rel_error: f32,
+        max_tolerance_ratio: f32,
     ) -> Result<Self, String> {
         let comparison = Self {
             sampled: true,
             reference_backend: Some(reference_backend),
             checked_elements,
+            absolute_tolerance: CUDA_MMQ_ABSOLUTE_TOLERANCE,
+            relative_tolerance: CUDA_MMQ_RELATIVE_TOLERANCE,
             max_abs_error,
             max_rel_error,
+            max_tolerance_ratio,
             nonfinite: 0,
             status: "pass",
         };
@@ -43,8 +52,11 @@ impl PhaseComparison {
             sampled: false,
             reference_backend: None,
             checked_elements,
+            absolute_tolerance: 0.0,
+            relative_tolerance: 0.0,
             max_abs_error: 0.0,
             max_rel_error: 0.0,
+            max_tolerance_ratio: 0.0,
             nonfinite: 0,
             status: "finite_only",
         };
@@ -54,23 +66,29 @@ impl PhaseComparison {
 
     fn validate(&self) -> Result<(), String> {
         let valid_sampled = self.sampled
-            && self.reference_backend == Some(LIBGGML_REFERENCE_BACKEND)
+            && self.reference_backend == Some(CUDA_MMQ_REFERENCE_BACKEND)
             && self.checked_elements > 0
+            && self.absolute_tolerance == CUDA_MMQ_ABSOLUTE_TOLERANCE
+            && self.relative_tolerance == CUDA_MMQ_RELATIVE_TOLERANCE
+            && self.max_tolerance_ratio <= 1.0
             && self.status == "pass";
         let valid_finite_only = !self.sampled
             && self.reference_backend.is_none()
             && self.checked_elements > 0
             && self.status == "finite_only"
+            && self.absolute_tolerance == 0.0
+            && self.relative_tolerance == 0.0
             && self.max_abs_error == 0.0
-            && self.max_rel_error == 0.0;
+            && self.max_rel_error == 0.0
+            && self.max_tolerance_ratio == 0.0;
         if (!valid_sampled && !valid_finite_only)
             || self.nonfinite != 0
             || !self.max_abs_error.is_finite()
             || !self.max_rel_error.is_finite()
+            || !self.max_tolerance_ratio.is_finite()
             || self.max_abs_error < 0.0
             || self.max_rel_error < 0.0
-            || self.max_abs_error > 1.0e-4
-            || self.max_rel_error > 1.0e-3
+            || self.max_tolerance_ratio < 0.0
         {
             return Err("persistent IQ1_S comparison violates its fail-closed schema".to_string());
         }
@@ -114,8 +132,11 @@ pub(crate) struct PersistentPhaseRecord {
     pub(crate) comparison_sampled: bool,
     pub(crate) reference_backend: Option<&'static str>,
     pub(crate) checked_elements: usize,
+    pub(crate) absolute_tolerance: f32,
+    pub(crate) relative_tolerance: f32,
     pub(crate) max_abs_error: f32,
     pub(crate) max_rel_error: f32,
+    pub(crate) max_tolerance_ratio: f32,
     pub(crate) nonfinite: u64,
     pub(crate) comparison_status: &'static str,
     pub(crate) timing_us: PhaseTimingsUs,
@@ -138,7 +159,7 @@ impl PersistentPhaseRecord {
     ) -> Result<Self, String> {
         comparison.validate()?;
         let record = Self {
-            schema_version: 2,
+            schema_version: 3,
             kind: PHASE_KIND,
             transaction_id,
             layer_id,
@@ -154,8 +175,11 @@ impl PersistentPhaseRecord {
             comparison_sampled: comparison.sampled,
             reference_backend: comparison.reference_backend,
             checked_elements: comparison.checked_elements,
+            absolute_tolerance: comparison.absolute_tolerance,
+            relative_tolerance: comparison.relative_tolerance,
             max_abs_error: comparison.max_abs_error,
             max_rel_error: comparison.max_rel_error,
+            max_tolerance_ratio: comparison.max_tolerance_ratio,
             nonfinite: comparison.nonfinite,
             comparison_status: comparison.status,
             timing_us,
@@ -169,12 +193,15 @@ impl PersistentPhaseRecord {
             sampled: self.comparison_sampled,
             reference_backend: self.reference_backend,
             checked_elements: self.checked_elements,
+            absolute_tolerance: self.absolute_tolerance,
+            relative_tolerance: self.relative_tolerance,
             max_abs_error: self.max_abs_error,
             max_rel_error: self.max_rel_error,
+            max_tolerance_ratio: self.max_tolerance_ratio,
             nonfinite: self.nonfinite,
             status: self.comparison_status,
         };
-        if self.schema_version != 2
+        if self.schema_version != 3
             || self.transaction_id == 0
             || self.layer_id >= 60
             || !matches!(self.phase, "A" | "B")
@@ -311,7 +338,7 @@ mod tests {
             [3; 4],
             [3; 4],
             0,
-            PhaseComparison::sampled_pass("libggml_dequantize_row_iq1_s", 1024, 2.5e-5, 4.0e-4)
+            PhaseComparison::sampled_pass(CUDA_MMQ_REFERENCE_BACKEND, 1024, 4.96e-4, 4.2e-2, 0.999)
                 .unwrap(),
             PhaseTimingsUs::default(),
         )
@@ -332,13 +359,16 @@ mod tests {
         assert_eq!(bytes.split(|byte| *byte == b'\n').count(), 2);
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["kind"], PHASE_KIND);
-        assert_eq!(parsed["schema_version"], 2);
+        assert_eq!(parsed["schema_version"], 3);
         assert_eq!(parsed["commands_per_cu"], serde_json::json!([3, 3, 3, 3]));
         assert_eq!(parsed["comparison_sampled"], true);
-        assert_eq!(parsed["reference_backend"], "libggml_dequantize_row_iq1_s");
+        assert_eq!(parsed["reference_backend"], CUDA_MMQ_REFERENCE_BACKEND);
         assert_eq!(parsed["checked_elements"], 1024);
-        assert_eq!(parsed["max_abs_error"], 2.5e-5);
-        assert_eq!(parsed["max_rel_error"], 4.0e-4);
+        assert_eq!(parsed["absolute_tolerance"], 5.0e-4);
+        assert_eq!(parsed["relative_tolerance"], 1.0e-3);
+        assert_eq!(parsed["max_abs_error"], 4.96e-4);
+        assert_eq!(parsed["max_rel_error"], 4.2e-2);
+        assert_eq!(parsed["max_tolerance_ratio"], 0.999);
         assert!(parsed.get("outputs").is_none());
     }
 
@@ -361,11 +391,12 @@ mod tests {
         assert_eq!(finite.status, "finite_only");
 
         assert!(
-            PhaseComparison::sampled_pass("libggml_dequantize_row_iq1_s", 0, 0.0, 0.0,).is_err()
+            PhaseComparison::sampled_pass(CUDA_MMQ_REFERENCE_BACKEND, 0, 0.0, 0.0, 0.0,).is_err()
         );
-        assert!(PhaseComparison::sampled_pass("scalar_iq1s", 1, 0.0, 0.0).is_err());
+        assert!(PhaseComparison::sampled_pass("scalar_iq1s", 1, 0.0, 0.0, 0.0).is_err());
         assert!(
-            PhaseComparison::sampled_pass("libggml_dequantize_row_iq1_s", 1, 1.1e-4, 0.0,).is_err()
+            PhaseComparison::sampled_pass(CUDA_MMQ_REFERENCE_BACKEND, 1, 4.9e-4, 0.05, 1.001,)
+                .is_err()
         );
     }
 }

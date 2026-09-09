@@ -44,8 +44,11 @@ PHASE_FIELDS = {
     "comparison_sampled",
     "reference_backend",
     "checked_elements",
+    "absolute_tolerance",
+    "relative_tolerance",
     "max_abs_error",
     "max_rel_error",
+    "max_tolerance_ratio",
     "nonfinite",
     "comparison_status",
     "timing_us",
@@ -188,7 +191,7 @@ def read_text(path, label):
 def validate_phase(record, index, mode):
     label = f"phase[{index}]"
     exact_fields(record, PHASE_FIELDS, label)
-    if record["schema_version"] != 2 or record["kind"] != "iq1s_persistent_phase":
+    if record["schema_version"] != 3 or record["kind"] != "iq1s_persistent_phase":
         fail(f"{label} schema identity is invalid")
     integer(record["transaction_id"], f"{label}.transaction_id", 1)
     layer = integer(record["layer_id"], f"{label}.layer_id")
@@ -216,12 +219,17 @@ def validate_phase(record, index, mode):
     if integer(record["eligible_direct_routes"], f"{label}.eligible_direct_routes") != 0:
         fail(f"{label} eligible direct routes must be zero")
     checked_elements = integer(record["checked_elements"], f"{label}.checked_elements", 1)
+    absolute_tolerance = finite_number(
+        record["absolute_tolerance"], f"{label}.absolute_tolerance"
+    )
+    relative_tolerance = finite_number(
+        record["relative_tolerance"], f"{label}.relative_tolerance"
+    )
     max_abs_error = finite_number(record["max_abs_error"], f"{label}.max_abs_error")
     max_rel_error = finite_number(record["max_rel_error"], f"{label}.max_rel_error")
-    if max_abs_error > 1.0e-4:
-        fail(f"{label} absolute error exceeds tolerance")
-    if max_rel_error > 1.0e-3:
-        fail(f"{label} relative error exceeds tolerance")
+    max_tolerance_ratio = finite_number(
+        record["max_tolerance_ratio"], f"{label}.max_tolerance_ratio"
+    )
     if integer(record["nonfinite"], f"{label}.nonfinite") != 0:
         fail(f"{label} contains nonfinite outputs")
     sampled = record["comparison_sampled"]
@@ -229,15 +237,21 @@ def validate_phase(record, index, mode):
         fail(f"{label}.comparison_sampled must be boolean")
     if sampled:
         if (
-            record["reference_backend"] != "libggml_dequantize_row_iq1_s"
+            record["reference_backend"] != "llama_cuda_mmq_iq1_s_sm120_half2"
             or record["comparison_status"] != "pass"
+            or absolute_tolerance != 5.0e-4
+            or relative_tolerance != 1.0e-3
+            or max_tolerance_ratio > 1.0
         ):
-            fail(f"{label} sampled libggml comparison did not pass")
+            fail(f"{label} sampled CUDA-MMQ comparison did not pass")
     elif (
         record["reference_backend"] is not None
         or record["comparison_status"] != "finite_only"
+        or absolute_tolerance != 0.0
+        or relative_tolerance != 0.0
         or max_abs_error != 0.0
         or max_rel_error != 0.0
+        or max_tolerance_ratio != 0.0
     ):
         fail(f"{label} finite-only validation metadata is invalid")
     _ = checked_elements
@@ -263,7 +277,7 @@ def validate_summary(summary):
     )
     expected_profiles = {
         "one-token": (1, 1, 1, 1, 0),
-        "full": (64, 16, 32, 3, 1),
+        "full": (64, 32, 32, 3, 1),
     }
     name = profile["name"]
     observed = tuple(
@@ -328,7 +342,7 @@ def validate_ledger(root):
         elif record["session_generation"] != generation:
             fail("phase ledger spans multiple session generations")
     if sampled_comparisons != 1:
-        fail("phase ledger must contain exactly one sampled libggml comparison")
+        fail("phase ledger must contain exactly one sampled CUDA-MMQ comparison")
     return {
         "gate": "ledger",
         "mode": mode,

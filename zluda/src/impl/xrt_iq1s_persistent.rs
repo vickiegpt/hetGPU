@@ -11,12 +11,10 @@ use super::iq1s_layer_abi::{
     IQ1S_REG_COMPLETION_BASE_LO_OFFSET, IQ1S_REG_COMPLETION_CAPACITY_OFFSET,
     IQ1S_REG_COMPLETION_CONSUMER_OFFSET, IQ1S_REG_COMPLETION_PRODUCER_OFFSET,
     IQ1S_REG_CONTROL_OFFSET, IQ1S_REG_CU_ID_OFFSET, IQ1S_REG_DOORBELL_OFFSET,
-    IQ1S_REG_FAULT_CODE_OFFSET, IQ1S_REG_FAULT_DETAIL_HI_OFFSET,
-    IQ1S_REG_FAULT_DETAIL_LO_OFFSET, IQ1S_REG_MODEL_TAG_HI_OFFSET,
-    IQ1S_REG_MODEL_TAG_LO_OFFSET, IQ1S_REG_PROGRAM_BASE_HI_OFFSET,
-    IQ1S_REG_PROGRAM_BASE_LO_OFFSET,
-    IQ1S_REG_PROGRAM_BYTES_OFFSET, IQ1S_REG_QUIESCENT_OFFSET, IQ1S_REG_RESULT_BASE_HI_OFFSET,
-    IQ1S_REG_RESULT_BASE_LO_OFFSET, IQ1S_REG_RESULT_BYTES_OFFSET,
+    IQ1S_REG_FAULT_CODE_OFFSET, IQ1S_REG_FAULT_DETAIL_HI_OFFSET, IQ1S_REG_FAULT_DETAIL_LO_OFFSET,
+    IQ1S_REG_MODEL_TAG_HI_OFFSET, IQ1S_REG_MODEL_TAG_LO_OFFSET, IQ1S_REG_PROGRAM_BASE_HI_OFFSET,
+    IQ1S_REG_PROGRAM_BASE_LO_OFFSET, IQ1S_REG_PROGRAM_BYTES_OFFSET, IQ1S_REG_QUIESCENT_OFFSET,
+    IQ1S_REG_RESULT_BASE_HI_OFFSET, IQ1S_REG_RESULT_BASE_LO_OFFSET, IQ1S_REG_RESULT_BYTES_OFFSET,
     IQ1S_REG_SESSION_GENERATION_HI_OFFSET, IQ1S_REG_SESSION_GENERATION_LO_OFFSET,
     IQ1S_REG_TOKEN_MAP_BASE_HI_OFFSET, IQ1S_REG_TOKEN_MAP_BASE_LO_OFFSET,
     IQ1S_REG_TOKEN_MAP_BYTES_OFFSET, IQ1S_ROLE_DOWN, IQ1S_ROLE_GATE, IQ1S_ROLE_UP,
@@ -840,8 +838,7 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
                 ),
             )?;
         }
-        let rebind_deadline =
-            Instant::now() + Duration::from_millis(u64::from(config.timeout_ms));
+        let rebind_deadline = Instant::now() + Duration::from_millis(u64::from(config.timeout_ms));
         for cu in 0..ARENA_BANK_COUNT {
             loop {
                 let mut command_consumer = 0u32;
@@ -1796,11 +1793,7 @@ impl<O: XrtOps> PersistentIq1sPool<O> {
         }
         let publish_start = Instant::now();
         for cu in 0..ARENA_BANK_COUNT {
-            self.reg_write(
-                cu,
-                IQ1S_REG_COMMAND_PRODUCER_OFFSET,
-                ticket.command_end[cu],
-            )?;
+            self.reg_write(cu, IQ1S_REG_COMMAND_PRODUCER_OFFSET, ticket.command_end[cu])?;
             self.reg_write(cu, IQ1S_REG_DOORBELL_OFFSET, 1)?;
             self.cus[cu].command_published = ticket.command_end[cu];
         }
@@ -2602,7 +2595,11 @@ mod tests {
         expected_bits: u32,
         bytes: &[u8],
     ) -> SmokeResultComparison {
-        assert_eq!(bytes.len() % 4, 0, "smoke result must contain whole f32 rows");
+        assert_eq!(
+            bytes.len() % 4,
+            0,
+            "smoke result must contain whole f32 rows"
+        );
         let mut comparison = SmokeResultComparison {
             rows_checked: 0,
             mismatch_count: 0,
@@ -2812,13 +2809,10 @@ mod tests {
                 (cu as u32, IQ1S_REG_COMPLETION_PRODUCER_OFFSET as u32),
                 completion_producer,
             );
-            state.registers.insert(
-                (cu as u32, IQ1S_REG_FAULT_CODE_OFFSET as u32),
-                fault_code,
-            );
             state
-                .doorbell_consumer
-                .insert(cu as u32, command_consumer);
+                .registers
+                .insert((cu as u32, IQ1S_REG_FAULT_CODE_OFFSET as u32), fault_code);
+            state.doorbell_consumer.insert(cu as u32, command_consumer);
         }
 
         fn ring_doorbell(state: &mut FakeState, cu: u32) {
@@ -2899,9 +2893,7 @@ mod tests {
                     iq1s_blocks: 1,
                     grid_passes: 8,
                     delta_passes: 8,
-                    result_fence: completion_start
-                        .wrapping_add(completion_index as u32) as u64
-                        + 1,
+                    result_fence: completion_start.wrapping_add(completion_index as u32) as u64 + 1,
                     fault_detail: 0,
                 };
                 if let Some(mutation) = state.completion_mutation.take() {
@@ -2914,8 +2906,7 @@ mod tests {
                         CompletionMutation::Crc => completion.descriptor_crc32 ^= 1,
                     }
                 }
-                let completion_counter =
-                    completion_start.wrapping_add(completion_index as u32);
+                let completion_counter = completion_start.wrapping_add(completion_index as u32);
                 let completion_slot = completion_counter & (capacity - 1);
                 let completion_offset = completion_slot as usize * IQ1S_COMPLETION_BYTES;
                 state.memories.get_mut(&completion_bo).unwrap()
@@ -3395,10 +3386,7 @@ mod tests {
         pool.ops.set_fault(2, 7);
         let error = pool.poll_ticket(&first).unwrap_err().to_string();
         assert!(error.contains("fault_code=7"), "{error}");
-        assert!(
-            error.contains("fault_detail=0x1122334455667788"),
-            "{error}"
-        );
+        assert!(error.contains("fault_detail=0x1122334455667788"), "{error}");
         assert!(error.contains("command="), "{error}");
         assert!(error.contains("completion="), "{error}");
         assert!(matches!(
@@ -3565,9 +3553,11 @@ mod tests {
 
             let start = events
                 .iter()
-                .position(|event| matches!(event,
+                .position(|event| {
+                    matches!(event,
                     Event::RegisterWrite { cu: actual, offset, value: CONTROL_START }
-                        if *actual == cu as u32 && *offset == IQ1S_REG_CONTROL_OFFSET as u32))
+                        if *actual == cu as u32 && *offset == IQ1S_REG_CONTROL_OFFSET as u32)
+                })
                 .unwrap();
             assert!(events[..start].iter().any(|event| matches!(event,
                 Event::RegisterWrite { cu: actual, offset, value: CONTROL_SHUTDOWN }
@@ -3999,13 +3989,22 @@ mod tests {
 
         assert_eq!(comparison.rows_checked, 2);
         assert_eq!(comparison.mismatch_count, 1);
-        assert_eq!(comparison.actual_bits_histogram.get(&1.0f32.to_bits()), Some(&1));
-        assert_eq!(comparison.actual_bits_histogram.get(&2.0f32.to_bits()), Some(&1));
+        assert_eq!(
+            comparison.actual_bits_histogram.get(&1.0f32.to_bits()),
+            Some(&1)
+        );
+        assert_eq!(
+            comparison.actual_bits_histogram.get(&2.0f32.to_bits()),
+            Some(&1)
+        );
         assert_eq!(comparison.first_mismatches.len(), 1);
         assert_eq!(comparison.first_mismatches[0].cu, 2);
         assert_eq!(comparison.first_mismatches[0].generation, 1);
         assert_eq!(comparison.first_mismatches[0].row, 1);
-        assert_eq!(comparison.first_mismatches[0].expected_bits, 1.0f32.to_bits());
+        assert_eq!(
+            comparison.first_mismatches[0].expected_bits,
+            1.0f32.to_bits()
+        );
         assert_eq!(comparison.first_mismatches[0].actual_bits, 2.0f32.to_bits());
     }
 
@@ -4146,7 +4145,10 @@ mod tests {
 
         assert_eq!(fixture.chunks.len(), ARENA_BANK_COUNT);
         assert_eq!(fixture.phase.transaction_id, 17);
-        assert_eq!(fixture.phase.commands.iter().map(Vec::len).sum::<usize>(), 4);
+        assert_eq!(
+            fixture.phase.commands.iter().map(Vec::len).sum::<usize>(),
+            4
+        );
         assert_eq!(fixture.buffers.activations[0].bytes, activation);
         for bank in 0..ARENA_BANK_COUNT {
             assert_eq!(fixture.chunks[bank].bank, bank as u8);
@@ -4155,6 +4157,181 @@ mod tests {
             assert_eq!(fixture.phase.commands[bank][0].row_start, bank as u32 * 256);
             assert_eq!(fixture.phase.commands[bank][0].lane_count, 1);
         }
+    }
+
+    fn f32_from_le_bytes(bytes: &[u8]) -> Vec<f32> {
+        assert_eq!(bytes.len() % 4, 0, "captured f32 file is truncated");
+        bytes
+            .chunks_exact(4)
+            .map(|value| f32::from_le_bytes(value.try_into().expect("four-byte f32")))
+            .collect()
+    }
+
+    fn replay_comparison(actual: &[f32], reference: &[f32]) -> serde_json::Value {
+        assert_eq!(actual.len(), reference.len());
+        let mut mismatch_count = 0usize;
+        let mut max_abs_error = 0.0f32;
+        let mut first_mismatches = Vec::new();
+        for (index, (&actual_value, &reference_value)) in actual.iter().zip(reference).enumerate() {
+            let absolute_error = (actual_value - reference_value).abs();
+            let limit = 1.0e-4 + 1.0e-3 * reference_value.abs();
+            max_abs_error = max_abs_error.max(absolute_error);
+            if !actual_value.is_finite() || !reference_value.is_finite() || absolute_error > limit {
+                mismatch_count += 1;
+                if first_mismatches.len() < MAX_SMOKE_MISMATCH_SAMPLES {
+                    first_mismatches.push(serde_json::json!({
+                        "index": index,
+                        "actual": actual_value,
+                        "reference": reference_value,
+                        "absolute_error": absolute_error,
+                        "limit": limit,
+                    }));
+                }
+            }
+        }
+        serde_json::json!({
+            "rows_checked": actual.len(),
+            "mismatch_count": mismatch_count,
+            "max_abs_error": max_abs_error,
+            "sample_42": {
+                "actual": actual[42],
+                "reference": reference[42],
+                "actual_bits": actual[42].to_bits(),
+                "reference_bits": reference[42].to_bits(),
+            },
+            "first_mismatches": first_mismatches,
+        })
+    }
+
+    #[test]
+    #[ignore = "replays an immutable Qwen numerical capture on the real AU250 only under an explicit guard"]
+    fn au250_iq1s_captured_qwen_replay() {
+        if std::env::var("HETGPU_XRT_AU250_IQ1S_CAPTURE_REPLAY").as_deref() != Ok("1") {
+            return;
+        }
+        let capture_dir = PathBuf::from(
+            std::env::var_os("HETGPU_XRT_CAPTURE_DIR")
+                .expect("HETGPU_XRT_CAPTURE_DIR must name an immutable failure capture"),
+        );
+        let xclbin = PathBuf::from(
+            std::env::var_os("HETGPU_XRT_XCLBIN")
+                .expect("HETGPU_XRT_XCLBIN must name the qualified persistent image"),
+        );
+        let expected_uuid = std::env::var("HETGPU_XRT_EXPECTED_UUID")
+            .expect("HETGPU_XRT_EXPECTED_UUID is required");
+        let summary_path = PathBuf::from(
+            std::env::var_os("HETGPU_XRT_CAPTURE_REPLAY_SUMMARY")
+                .expect("HETGPU_XRT_CAPTURE_REPLAY_SUMMARY is required"),
+        );
+        let timeout_ms = std::env::var("HETGPU_XRT_TIMEOUT_MS")
+            .unwrap_or_else(|_| "10000".to_string())
+            .parse::<u32>()
+            .expect("HETGPU_XRT_TIMEOUT_MS must be u32");
+        let matrix =
+            std::fs::read(capture_dir.join("matrix.iq1s.bin")).expect("read captured IQ1_S matrix");
+        let activation = std::fs::read(capture_dir.join("activation.q8_1.bin"))
+            .expect("read captured Q8_1 activation");
+        let reference = f32_from_le_bytes(
+            &std::fs::read(capture_dir.join("reference.f32.bin"))
+                .expect("read captured libggml reference"),
+        );
+        let captured_actual = f32_from_le_bytes(
+            &std::fs::read(capture_dir.join("actual.f32.bin"))
+                .expect("read captured hardware output"),
+        );
+        assert_eq!(reference.len(), 1024);
+        assert_eq!(captured_actual.len(), reference.len());
+
+        let first = captured_qwen_replay_fixture(&matrix, &activation, "handwritten", 201)
+            .expect("build first captured replay fixture");
+        let matrix_by_bank: [Vec<u8>; ARENA_BANK_COUNT] =
+            std::array::from_fn(|bank| matrix[bank * 204_800..(bank + 1) * 204_800].to_vec());
+        let ops = RealXrt::load(true).expect("load XRT with native-IP API");
+        let mut pool = PersistentIq1sPool::open(
+            ops,
+            PersistentIq1sConfig::checked(xclbin, 0, Some(4), timeout_ms)
+                .expect("validate captured replay config"),
+            1,
+            &first.chunks,
+            |chunk| Ok(matrix_by_bank[usize::from(chunk.bank)].clone()),
+            |_| Ok(()),
+        )
+        .expect("open four-CU captured Qwen replay pool");
+        let actual_uuid = format_xuid(pool.xclbin_uuid);
+        assert_eq!(actual_uuid, expected_uuid);
+
+        pool.measurement_begin()
+            .expect("begin captured replay DMA window");
+        let mut mode_results = Vec::new();
+        let mut total_mismatches = 0u64;
+        for (transaction_id, mode) in [(201u64, "handwritten"), (202, "compiler")] {
+            let fixture = captured_qwen_replay_fixture(&matrix, &activation, mode, transaction_id)
+                .expect("build captured replay phase");
+            let completed = pool
+                .submit_phase(&fixture.phase, &fixture.buffers)
+                .expect("submit captured Qwen replay phase");
+            let mut actual_bytes = Vec::with_capacity(reference.len() * 4);
+            for bank in 0..ARENA_BANK_COUNT {
+                assert_eq!(completed.results[bank].len(), 1);
+                assert_eq!(completed.results[bank][0].offset, 0);
+                actual_bytes.extend_from_slice(&completed.results[bank][0].bytes);
+            }
+            let actual = f32_from_le_bytes(&actual_bytes);
+            let comparison = replay_comparison(&actual, &reference);
+            total_mismatches += comparison["mismatch_count"]
+                .as_u64()
+                .expect("mismatch count is u64");
+            let semantic_sha256 = fixture
+                .phase
+                .semantic_sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            mode_results.push(serde_json::json!({
+                "mode": mode,
+                "transaction_id": transaction_id,
+                "semantic_sha256": semantic_sha256,
+                "comparison": comparison,
+                "matches_original_capture_bits": actual.iter().zip(&captured_actual)
+                    .filter(|(left, right)| left.to_bits() == right.to_bits()).count(),
+            }));
+        }
+        let measured = pool
+            .measurement_end()
+            .expect("end captured replay DMA window");
+        pool.shutdown()
+            .expect("gracefully shut down captured replay CUs");
+
+        let summary = serde_json::json!({
+            "schema_version": 1,
+            "status": if total_mismatches == 0 { "pass" } else { "numerical_mismatch" },
+            "capture_dir": capture_dir,
+            "xclbin_uuid": actual_uuid,
+            "modes": mode_results,
+            "captured_original": replay_comparison(&captured_actual, &reference),
+            "measured_dma": {
+                "command_ranges": measured.command_ranges,
+                "activation_ranges": measured.activation_ranges,
+                "result_ranges": measured.result_ranges,
+                "program_ranges": measured.program_ranges,
+                "weight_ranges": measured.weight_ranges,
+                "weight_bytes": measured.weight_bytes,
+            },
+        });
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&summary_path)
+            .expect("create captured replay summary without overwriting evidence");
+        serde_json::to_writer_pretty(&mut output, &summary).expect("write captured replay summary");
+        writeln!(output).expect("terminate captured replay summary");
+        output.sync_all().expect("sync captured replay summary");
+        assert_eq!(
+            total_mismatches,
+            0,
+            "captured Qwen hardware replay numerical mismatch; evidence: {}",
+            summary_path.display()
+        );
     }
 
     fn persistent_smoke_chunks(bytes: &[u8], sha256: [u8; 32]) -> Vec<ArenaChunkSpec> {
@@ -4339,12 +4516,8 @@ mod tests {
                 let result = &completed.results[cu][0];
                 assert_eq!(result.offset, 0x8000);
                 assert_eq!(result.bytes.len(), 256 * 4);
-                let comparison = compare_smoke_result_bytes(
-                    cu,
-                    generation,
-                    expected.to_bits(),
-                    &result.bytes,
-                );
+                let comparison =
+                    compare_smoke_result_bytes(cu, generation, expected.to_bits(), &result.bytes);
                 result_rows_checked += comparison.rows_checked;
                 result_mismatch_count += comparison.mismatch_count;
                 for (actual_bits, count) in comparison.actual_bits_histogram {

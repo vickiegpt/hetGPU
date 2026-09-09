@@ -2254,6 +2254,94 @@ pub(crate) fn libggml_iq1s_reference_outputs(
     Ok(outputs)
 }
 
+fn cuda_mmq_iq1s_reference_outputs_with_grid(
+    signature: &GgmlType19Signature,
+    packed_matrix: &[u8],
+    packed_activations: &[u8],
+    grid: &GridTable,
+) -> Result<Vec<f32>, String> {
+    signature.validate()?;
+    if signature.ne11 != 1 || signature.stride11 != 1 {
+        return Err("CUDA MMQ IQ1_S reference requires one tightly packed activation lane".into());
+    }
+    if packed_matrix.len() != signature.matrix_storage_bytes()? {
+        return Err("CUDA MMQ IQ1_S reference matrix extent mismatch".into());
+    }
+    if packed_activations.len() != signature.activation_storage_bytes()? {
+        return Err("CUDA MMQ IQ1_S reference activation extent mismatch".into());
+    }
+    let columns = usize::try_from(signature.ne00)
+        .map_err(|_| "CUDA MMQ IQ1_S column count does not fit usize")?;
+    let rows = usize::try_from(signature.ne01)
+        .map_err(|_| "CUDA MMQ IQ1_S row count does not fit usize")?;
+    let row_stride = usize::try_from(signature.stride01)
+        .ok()
+        .and_then(|blocks| blocks.checked_mul(IQ1S_BLOCK_BYTES))
+        .ok_or("CUDA MMQ IQ1_S row stride overflow")?;
+    let blocks_per_row = columns / IQ1S_BLOCK_VALUES;
+    if row_stride != blocks_per_row * IQ1S_BLOCK_BYTES {
+        return Err("CUDA MMQ IQ1_S reference does not allow padded matrix rows".into());
+    }
+    let mut q8_blocks = Vec::with_capacity(columns / GROUP_VALUES);
+    for record in iter_q8_1_mmq(signature, packed_activations)? {
+        q8_blocks.extend(record?.subblocks);
+    }
+    if q8_blocks.len() != columns / GROUP_VALUES {
+        return Err("CUDA MMQ IQ1_S activation group count mismatch".into());
+    }
+
+    let mut outputs = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let row_offset = row
+            .checked_mul(row_stride)
+            .ok_or("CUDA MMQ IQ1_S row offset overflow")?;
+        let row_bytes = &packed_matrix[row_offset..row_offset + row_stride];
+        let mut sum = 0.0f32;
+        for block_index in 0..blocks_per_row {
+            let block_offset = block_index * IQ1S_BLOCK_BYTES;
+            let block = Iq1sBlock::parse(
+                &row_bytes[block_offset..block_offset + IQ1S_BLOCK_BYTES],
+                grid,
+            )?;
+            for (group_index, group) in block.groups.iter().enumerate() {
+                let q8 = q8_blocks
+                    .get(block_index * block.groups.len() + group_index)
+                    .ok_or("CUDA MMQ IQ1_S Q8 group is missing")?;
+                let (grid_dot, _) = raw_component_dots(group, q8);
+                let q8_sum = q8.qs.iter().map(|&value| i64::from(value)).sum::<i64>();
+                let encoded_grid_dot = grid_dot
+                    .checked_add(q8_sum)
+                    .ok_or("CUDA MMQ IQ1_S encoded grid dot overflow")?;
+                let d1q = (block.d * f32::from(group.odd_scale)) as f32;
+                let weight_d = round_to_half(d1q)?;
+                let delta = (-1.0f32 + f32::from(group.delta_sign) * 0.125) as f32;
+                let weight_m = round_to_half((d1q * delta) as f32)?;
+                let product_d = round_to_half((weight_d * q8.d) as f32)?;
+                let product_m = round_to_half((weight_m * q8.s) as f32)?;
+                let contribution = (encoded_grid_dot as f32).mul_add(product_d, product_m);
+                sum = (sum + contribution) as f32;
+            }
+        }
+        if !sum.is_finite() {
+            return Err(format!(
+                "CUDA MMQ IQ1_S reference produced a nonfinite output in row {row}"
+            ));
+        }
+        outputs.push(sum);
+    }
+    Ok(outputs)
+}
+
+pub(crate) fn cuda_mmq_iq1s_reference_outputs(
+    signature: &GgmlType19Signature,
+    packed_matrix: &[u8],
+    packed_activations: &[u8],
+    path: Option<&Path>,
+) -> Result<Vec<f32>, String> {
+    let grid = validated_grid(path)?;
+    cuda_mmq_iq1s_reference_outputs_with_grid(signature, packed_matrix, packed_activations, &grid)
+}
+
 impl OracleLibrary {
     unsafe fn open(path: &Path) -> Result<Self, String> {
         let c_path = CString::new(path.as_os_str().as_encoded_bytes())
@@ -2418,6 +2506,34 @@ mod tests {
             libggml_iq1s_reference_outputs(&signature, &matrix, &activations, Some(qwen_libggml))
                 .unwrap();
         assert_eq!(outputs, vec![0.0]);
+    }
+
+    #[test]
+    fn cuda_mmq_reference_uses_blackwell_half2_product_rounding() {
+        let signature = GgmlType19Signature {
+            kernel: "mul_mat_q".to_string(),
+            ne00: 256,
+            ne01: 1,
+            stride01: 1,
+            ne10: 256,
+            ne11: 1,
+            stride11: 1,
+            ne0: 1,
+        };
+        let mut matrix = vec![0u8; IQ1S_BLOCK_BYTES];
+        matrix[..2].copy_from_slice(&0x3555u16.to_le_bytes());
+        matrix[34..36].copy_from_slice(&(7u16 << 12).to_le_bytes());
+        let mut activation = vec![0u8; 2 * Q8_1_MMQ_BYTES];
+        activation[2..4].copy_from_slice(&0x3555u16.to_le_bytes());
+
+        let output =
+            cuda_mmq_iq1s_reference_outputs_with_grid(&signature, &matrix, &activation, &grid())
+                .expect("evaluate CUDA MMQ reference");
+        let d1q = half_to_f32(0x3555) * 15.0;
+        let delta_weight = round_to_half(d1q * -0.875).unwrap();
+        let expected = round_to_half(delta_weight * half_to_f32(0x3555)).unwrap();
+        assert_eq!(output, vec![expected]);
+        assert_ne!(expected, delta_weight * half_to_f32(0x3555));
     }
 
     fn grid() -> GridTable {

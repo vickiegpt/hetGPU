@@ -29,7 +29,7 @@ TIMING_FIELDS = (
 
 def phase(phase_name="A", sampled=True, transaction_id=17, layer_id=7, mode="handwritten"):
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "iq1s_persistent_phase",
         "transaction_id": transaction_id,
         "layer_id": layer_id,
@@ -43,10 +43,13 @@ def phase(phase_name="A", sampled=True, transaction_id=17, layer_id=7, mode="han
         "weight_dma_bytes": 0,
         "eligible_direct_routes": 0,
         "comparison_sampled": sampled,
-        "reference_backend": "libggml_dequantize_row_iq1_s" if sampled else None,
+        "reference_backend": "llama_cuda_mmq_iq1_s_sm120_half2" if sampled else None,
         "checked_elements": 1024,
-        "max_abs_error": 2.5e-5 if sampled else 0.0,
-        "max_rel_error": 4.0e-4 if sampled else 0.0,
+        "absolute_tolerance": 5.0e-4 if sampled else 0.0,
+        "relative_tolerance": 1.0e-3 if sampled else 0.0,
+        "max_abs_error": 4.96387482e-4 if sampled else 0.0,
+        "max_rel_error": 4.0e-3 if sampled else 0.0,
+        "max_tolerance_ratio": 0.999 if sampled else 0.0,
         "nonfinite": 0,
         "comparison_status": "pass" if sampled else "finite_only",
         "timing_us": {name: 1 for name in TIMING_FIELDS},
@@ -361,6 +364,22 @@ def test_compact_persistent_ledger_accepts_exact_one_token_bundle(tmp_path):
     assert "tps" not in result.stdout.lower()
 
 
+def test_compact_persistent_ledger_accepts_fixed_full_64x32_profile(tmp_path):
+    root = tmp_path / "full"
+    mode = summary()
+    mode["profile"] = {
+        "name": "full",
+        "request_count": 64,
+        "max_active": 32,
+        "tokens_per_request": 32,
+        "measurements": 3,
+        "warmups": 1,
+    }
+    write_bundle(root, mode_summary=mode)
+    result = validate(root)
+    assert result.returncode == 0, result.stderr
+
+
 def test_compact_persistent_ledger_accepts_one_sample_and_finite_only_phases(tmp_path):
     first = phase("A", sampled=True)
     second = phase("B", sampled=False)
@@ -377,7 +396,7 @@ def test_compact_persistent_ledger_accepts_one_sample_and_finite_only_phases(tmp
         [phase("A", sampled=True), {**phase("A", sampled=True), "transaction_id": 18}],
     ),
 )
-def test_compact_persistent_ledger_requires_exactly_one_libggml_sample(tmp_path, records):
+def test_compact_persistent_ledger_requires_exactly_one_cuda_mmq_sample(tmp_path, records):
     root = tmp_path / "bad-sample-count"
     write_bundle(root, records)
     result = validate(root)
@@ -425,8 +444,9 @@ def test_compact_persistent_ledger_rejects_progress_records(tmp_path):
         lambda phases, mode: phases[0].__setitem__("completions_per_cu", [3, 3, 3, 0]),
         lambda phases, mode: phases[0].__setitem__("weight_dma_bytes", 1),
         lambda phases, mode: phases[0].__setitem__("eligible_direct_routes", 1),
-        lambda phases, mode: phases[0].__setitem__("max_abs_error", 1.1e-4),
-        lambda phases, mode: phases[0].__setitem__("max_rel_error", 1.1e-3),
+        lambda phases, mode: phases[0].__setitem__("absolute_tolerance", 1.0e-4),
+        lambda phases, mode: phases[0].__setitem__("relative_tolerance", 2.0e-3),
+        lambda phases, mode: phases[0].__setitem__("max_tolerance_ratio", 1.001),
         lambda phases, mode: phases[0].__setitem__("nonfinite", 1),
         lambda phases, mode: phases[0].__setitem__("comparison_status", "fail"),
         lambda phases, mode: phases[0].__setitem__("reference_backend", "scalar_iq1s"),

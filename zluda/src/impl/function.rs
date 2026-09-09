@@ -10344,11 +10344,11 @@ unsafe fn nvidia_capture_iq1s_xrt_mmvq(
     not(feature = "intel"),
     not(feature = "tenstorrent")
 ))]
-unsafe fn nvidia_capture_modern_iq1s_xrt_mmvq(
+unsafe fn nvidia_plan_modern_iq1s_xrt_mmvq_launch(
     kernel_name: &str,
     kernel_params: *mut *mut ::core::ffi::c_void,
     grid: (u32, u32, u32),
-) -> Result<Vec<super::iq1s_tmatmul::CapturedLaunch>, String> {
+) -> Result<Vec<(NvidiaModernMmvqPlan, u64, [u8; 32])>, String> {
     if nvidia_modern_iq1s_mmvq_has_fusion(kernel_name) {
         return Err(format!(
             "kernel '{kernel_name}' has fused MMVQ semantics; set HETGPU_QWEN_IQ1S_DISABLE_CUDA_FUSION=1 in the patched llama.cpp runtime"
@@ -10414,10 +10414,8 @@ unsafe fn nvidia_capture_modern_iq1s_xrt_mmvq(
                 plan.signature.nrows_x,
                 row_stride_bytes,
             )?;
-            super::iq1s_tmatmul::capture_vec_launch(
-                plan.matrix_ptr,
-                plan.activation_ptr,
-                plan.output_ptr,
+            Ok((
+                plan,
                 identity
                     .as_ref()
                     .map(|identity| identity.allocation_generation)
@@ -10426,6 +10424,57 @@ unsafe fn nvidia_capture_modern_iq1s_xrt_mmvq(
                     .as_ref()
                     .map(|identity| identity.content_hash)
                     .unwrap_or([0; 32]),
+            ))
+        })
+        .collect()
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+unsafe fn nvidia_capture_modern_iq1s_xrt_mmvq(
+    kernel_name: &str,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    grid: (u32, u32, u32),
+) -> Result<Vec<super::iq1s_tmatmul::CapturedLaunch>, String> {
+    nvidia_plan_modern_iq1s_xrt_mmvq_launch(kernel_name, kernel_params, grid)?
+        .into_iter()
+        .map(|(plan, allocation_generation, content_hash)| {
+            super::iq1s_tmatmul::capture_vec_launch(
+                plan.matrix_ptr,
+                plan.activation_ptr,
+                plan.output_ptr,
+                allocation_generation,
+                content_hash,
+                plan.signature,
+            )
+        })
+        .collect()
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
+unsafe fn nvidia_capture_modern_iq1s_xrt_mmvq_activations(
+    kernel_name: &str,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    grid: (u32, u32, u32),
+) -> Result<Vec<super::iq1s_tmatmul::CapturedActivationLaunch>, String> {
+    nvidia_plan_modern_iq1s_xrt_mmvq_launch(kernel_name, kernel_params, grid)?
+        .into_iter()
+        .map(|(plan, allocation_generation, content_hash)| {
+            super::iq1s_tmatmul::capture_vec_activation(
+                plan.matrix_ptr,
+                plan.activation_ptr,
+                plan.output_ptr,
+                allocation_generation,
+                content_hash,
                 plan.signature,
             )
         })
@@ -10670,8 +10719,22 @@ impl std::fmt::Display for NvidiaIq1sDispatchError {
     not(feature = "intel"),
     not(feature = "tenstorrent")
 ))]
+fn nvidia_iq1s_layer_capture_capable(
+    cuda13_moe_mmq: bool,
+    modern_moe_mmvq: bool,
+    modern_multi: bool,
+) -> bool {
+    cuda13_moe_mmq || modern_moe_mmvq || modern_multi
+}
+
+#[cfg(all(
+    feature = "nvidia",
+    not(feature = "amd"),
+    not(feature = "intel"),
+    not(feature = "tenstorrent")
+))]
 fn nvidia_dispatch_iq1s_capture<E, A, F>(
-    modern_moe: bool,
+    layer_capture_capable: bool,
     strict_persistent: bool,
     stream: usize,
     layer_sink: &impl NvidiaIq1sLayerCaptureSink,
@@ -10684,14 +10747,14 @@ where
     A: FnOnce() -> Result<Vec<super::iq1s_tmatmul::CapturedActivationLaunch>, String>,
     F: FnOnce() -> Result<Vec<super::iq1s_tmatmul::CapturedLaunch>, String>,
 {
-    let transaction_open = modern_moe
+    let transaction_open = layer_capture_capable
         && layer_sink
             .has_open_transaction(stream)
             .map_err(NvidiaIq1sDispatchError::Capture)?;
-    if strict_persistent && (!modern_moe || !transaction_open) {
+    if strict_persistent && (!layer_capture_capable || !transaction_open) {
         eprintln!(
-            "[hetgpu-iq1s-layer] eligible_direct_route=1 modern_moe={} transaction_open={}",
-            u8::from(modern_moe),
+            "[hetgpu-iq1s-layer] eligible_direct_route=1 layer_capture_capable={} transaction_open={}",
+            u8::from(layer_capture_capable),
             u8::from(transaction_open)
         );
         return Err(NvidiaIq1sDispatchError::Capture(
@@ -10758,6 +10821,8 @@ pub(crate) unsafe fn nvidia_try_launch_named_xrt_tmatmul(
     let modern_moe = cuda13_moe_mmq || modern_moe_mmvq;
     let modern_multi = matches!(kernel_kind, NvidiaIq1sXrtKernel::Mmvq)
         && (modern_moe || nvidia_is_modern_iq1s_mmvq(kernel_name));
+    let layer_capture_capable =
+        nvidia_iq1s_layer_capture_capable(cuda13_moe_mmq, modern_moe_mmvq, modern_multi);
     if !modern_multi {
         if let Err(error) = super::bitnet_disagg::append_route_log_from_env(
             &decision,
@@ -10772,7 +10837,7 @@ pub(crate) unsafe fn nvidia_try_launch_named_xrt_tmatmul(
     let strict_persistent = nvidia_env_truthy("HETGPU_QWEN_IQ1S_PERSISTENT");
     let mut executor = super::iq1s_xrt::DirectCapturedLaunchExecutor;
     let dispatched = match nvidia_dispatch_iq1s_capture(
-        modern_moe,
+        layer_capture_capable,
         strict_persistent,
         stream.0 as usize,
         &NvidiaIq1sGlobalLayerCaptureSink,
@@ -10784,10 +10849,21 @@ pub(crate) unsafe fn nvidia_try_launch_named_xrt_tmatmul(
                     stream.0 as usize,
                 );
             }
-            if !modern_moe_mmvq {
-                return Err("activation-only capture requires a supported IQ1_S MoE launch".into());
+            if modern_moe_mmvq {
+                return nvidia_capture_modern_iq1s_xrt_moe_activations(
+                    kernel_name,
+                    kernel_params,
+                    grid,
+                );
             }
-            nvidia_capture_modern_iq1s_xrt_moe_activations(kernel_name, kernel_params, grid)
+            if modern_multi {
+                return nvidia_capture_modern_iq1s_xrt_mmvq_activations(
+                    kernel_name,
+                    kernel_params,
+                    grid,
+                );
+            }
+            Err("activation-only capture requires a supported IQ1_S layer launch".into())
         },
         || match kernel_kind {
             NvidiaIq1sXrtKernel::Mmq if cuda13_moe_mmq => {
@@ -10810,7 +10886,7 @@ pub(crate) unsafe fn nvidia_try_launch_named_xrt_tmatmul(
                 super::iq1s_persistent_runtime::poison_global_persistent_runtime(&error);
             }
             return Some(Err(format!(
-                "IQ1_S layer transaction capture failed without fallback: {error}"
+                "kernel '{kernel_name}' IQ1_S layer transaction capture failed without fallback: {error}"
             )));
         }
         Err(NvidiaIq1sDispatchError::Execute(error)) => {
@@ -12648,6 +12724,41 @@ mod nvidia_bitnet_route_tests {
         assert!(error.contains("no layer transaction"), "{error}");
         assert_eq!(lightweight_captures.load(Ordering::SeqCst), 0);
         assert_eq!(full_captures.load(Ordering::SeqCst), 0);
+        assert_eq!(execution_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn nvidia_generic_decode_mmvq_is_layer_capture_capable() {
+        assert!(super::nvidia_iq1s_layer_capture_capable(false, false, true));
+    }
+
+    #[test]
+    fn nvidia_generic_decode_mmvq_open_transaction_buffers_in_strict_mode() {
+        let captured_count = Arc::new(AtomicUsize::new(0));
+        let execution_count = Arc::new(AtomicUsize::new(0));
+        let sink = FakeLayerCaptureSink {
+            open: true,
+            capture_error: None,
+            captured: captured_count.clone(),
+        };
+        let mut executor = FakeCapturedExecutor {
+            executions: execution_count.clone(),
+        };
+        let layer_capture_capable = super::nvidia_iq1s_layer_capture_capable(false, false, true);
+
+        let disposition = super::nvidia_dispatch_iq1s_capture(
+            layer_capture_capable,
+            true,
+            0xabc0,
+            &sink,
+            || Ok(vec![nvidia_modern_iq1s_activation_fixture(); 10]),
+            || Ok(vec![nvidia_modern_iq1s_captured_fixture(); 10]),
+            &mut executor,
+        )
+        .unwrap();
+
+        assert!(matches!(disposition, super::NvidiaIq1sDispatch::Buffered));
+        assert_eq!(captured_count.load(Ordering::SeqCst), 10);
         assert_eq!(execution_count.load(Ordering::SeqCst), 0);
     }
 

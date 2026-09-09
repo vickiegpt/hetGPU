@@ -8,11 +8,11 @@ use super::iq1s_layer_trace::{
 };
 use super::iq1s_persistent_proof::{
     checked_proof_path_from_env, hex_sha256, PersistentPhaseRecord, PersistentProofLedger,
-    PhaseComparison, PhaseTimingsUs, LIBGGML_REFERENCE_BACKEND,
+    PhaseComparison, PhaseTimingsUs, CUDA_MMQ_ABSOLUTE_TOLERANCE, CUDA_MMQ_REFERENCE_BACKEND,
+    CUDA_MMQ_RELATIVE_TOLERANCE,
 };
 use super::iq1s_tmatmul::{
-    libggml_iq1s_reference_outputs, CapturedActivationLaunch, GgmlType19Signature,
-    Q8_1_MMQ_BYTES,
+    cuda_mmq_iq1s_reference_outputs, CapturedActivationLaunch, GgmlType19Signature, Q8_1_MMQ_BYTES,
 };
 use super::iq1s_trace::QWEN_MODEL_CONTEXT_LIMIT;
 use super::iq1s_weight_arena::{
@@ -55,7 +55,10 @@ fn qualified_persistent_xclbin_identity(name: &str, sha256: [u8; 32]) -> bool {
     matches!(
         (name, sha256),
         (PERSISTENT_XCLBIN_NAME, PERSISTENT_XCLBIN_SHA256)
-            | (GRIDROM_PERSISTENT_XCLBIN_NAME, GRIDROM_PERSISTENT_XCLBIN_SHA256)
+            | (
+                GRIDROM_PERSISTENT_XCLBIN_NAME,
+                GRIDROM_PERSISTENT_XCLBIN_SHA256
+            )
     )
 }
 
@@ -456,29 +459,26 @@ pub(crate) fn prepare_phase(
                 .collect::<Vec<_>>();
             let packed = pack_q8_lanes(&lane_bytes, k_records)?;
             let source_identity_sha256 = packed_activation_identity(&snapshot.key, lanes);
-            let cached_activation = activation_cache
-                .get(&source_identity_sha256)
-                .copied();
-            let (activation_offset, activation_is_new) =
-                if let Some(buffer_index) = cached_activation {
-                    let cached = activation_buffers
-                        .get(buffer_index)
-                        .ok_or("persistent IQ1_S activation cache index is invalid")?;
-                    let cached_manifest = activation_manifest
-                        .get(buffer_index)
-                        .ok_or("persistent IQ1_S activation manifest cache index is invalid")?;
-                    if cached.bytes != packed
-                        || cached_manifest.cuda_ptr != lanes[0].1.launch.activation_ptr
-                    {
-                        return Err(
-                            "persistent IQ1_S packed activation identity collision".to_string(),
-                        );
-                    }
-                    (cached.offset, false)
-                } else {
-                    activation_cursor = align_up(activation_cursor, ARENA_ALIGNMENT)?;
-                    (activation_cursor, true)
-                };
+            let cached_activation = activation_cache.get(&source_identity_sha256).copied();
+            let (activation_offset, activation_is_new) = if let Some(buffer_index) =
+                cached_activation
+            {
+                let cached = activation_buffers
+                    .get(buffer_index)
+                    .ok_or("persistent IQ1_S activation cache index is invalid")?;
+                let cached_manifest = activation_manifest
+                    .get(buffer_index)
+                    .ok_or("persistent IQ1_S activation manifest cache index is invalid")?;
+                if cached.bytes != packed
+                    || cached_manifest.cuda_ptr != lanes[0].1.launch.activation_ptr
+                {
+                    return Err("persistent IQ1_S packed activation identity collision".to_string());
+                }
+                (cached.offset, false)
+            } else {
+                activation_cursor = align_up(activation_cursor, ARENA_ALIGNMENT)?;
+                (activation_cursor, true)
+            };
             token_cursor = align_up(token_cursor, ARENA_ALIGNMENT)?;
             output_cursor = align_up(output_cursor, ARENA_ALIGNMENT)?;
             let token_offset = token_cursor;
@@ -560,10 +560,7 @@ pub(crate) fn prepare_phase(
                     offset: activation_offset,
                     bytes: packed,
                 });
-                activation_cache.insert(
-                    source_identity_sha256,
-                    activation_buffers.len() - 1,
-                );
+                activation_cache.insert(source_identity_sha256, activation_buffers.len() - 1);
                 activation_cursor = activation_offset
                     .checked_add(activation_buffers.last().unwrap().bytes.len() as u64)
                     .ok_or("persistent IQ1_S activation slab overflow")?;
@@ -832,20 +829,26 @@ struct FailureCaptureFile {
     sha256: String,
 }
 
-fn write_capture_file(
-    root: &Path,
-    name: &str,
-    bytes: &[u8],
-) -> Result<FailureCaptureFile, String> {
+fn write_capture_file(root: &Path, name: &str, bytes: &[u8]) -> Result<FailureCaptureFile, String> {
     let path = root.join(name);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
-        .map_err(|error| format!("create numerical failure capture {}: {error}", path.display()))?;
+        .map_err(|error| {
+            format!(
+                "create numerical failure capture {}: {error}",
+                path.display()
+            )
+        })?;
     file.write_all(bytes)
         .and_then(|_| file.sync_all())
-        .map_err(|error| format!("write numerical failure capture {}: {error}", path.display()))?;
+        .map_err(|error| {
+            format!(
+                "write numerical failure capture {}: {error}",
+                path.display()
+            )
+        })?;
     let digest: [u8; 32] = Sha256::digest(bytes).into();
     Ok(FailureCaptureFile {
         name: name.to_string(),
@@ -855,7 +858,10 @@ fn write_capture_file(
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
 }
 
 fn command_json(command: &super::iq1s_layer_abi::Iq1sCommand) -> serde_json::Value {
@@ -917,7 +923,11 @@ fn write_numerical_failure_capture_at(
         "reference.f32.bin",
         &f32_bytes(reference),
     )?);
-    files.push(write_capture_file(root, "actual.f32.bin", &f32_bytes(actual))?);
+    files.push(write_capture_file(
+        root,
+        "actual.f32.bin",
+        &f32_bytes(actual),
+    )?);
     for bank in 0..ARENA_BANK_COUNT {
         let commands = prepared.compiled.commands[bank]
             .iter()
@@ -1027,13 +1037,14 @@ fn compare_sampled_output(
         stride11: 1,
         ne0: tensor.ne[1],
     };
-    let reference = libggml_iq1s_reference_outputs(&signature, &matrix, &activation, None)?;
+    let reference = cuda_mmq_iq1s_reference_outputs(&signature, &matrix, &activation, None)?;
     let actual = output_values(actual)?;
     if reference.len() != actual.len() {
         return Err("persistent IQ1_S sampled reference/output length mismatch".into());
     }
     let mut max_abs_error = 0.0_f32;
     let mut max_rel_error = 0.0_f32;
+    let mut max_tolerance_ratio = 0.0_f32;
     for (index, (&reference_value, &actual_value)) in reference.iter().zip(&actual).enumerate() {
         if !reference_value.is_finite() || !actual_value.is_finite() {
             return Err(format!(
@@ -1046,9 +1057,12 @@ fn compare_sampled_output(
         } else {
             abs / reference_value.abs()
         };
+        let limit =
+            CUDA_MMQ_ABSOLUTE_TOLERANCE + CUDA_MMQ_RELATIVE_TOLERANCE * reference_value.abs();
+        let tolerance_ratio = abs / limit;
         max_abs_error = max_abs_error.max(abs);
         max_rel_error = max_rel_error.max(rel);
-        let limit = 1.0e-4 + 1.0e-3 * reference_value.abs();
+        max_tolerance_ratio = max_tolerance_ratio.max(tolerance_ratio);
         if abs > limit {
             let mismatch = NumericalMismatch {
                 index,
@@ -1058,7 +1072,7 @@ fn compare_sampled_output(
                 limit,
             };
             let original = format!(
-                "persistent IQ1_S libggml sample {index} is outside tolerance: actual={actual_value}, reference={reference_value}, absolute_error={abs}, limit={limit}"
+                "persistent IQ1_S CUDA-MMQ sample {index} is outside tolerance: actual={actual_value}, reference={reference_value}, absolute_error={abs}, limit={limit}"
             );
             write_numerical_failure_capture_at(
                 failure_capture_dir,
@@ -1072,7 +1086,9 @@ fn compare_sampled_output(
                 &actual,
                 mismatch,
             )
-            .map_err(|capture_error| format!("{original}; failure capture failed: {capture_error}"))?;
+            .map_err(|capture_error| {
+                format!("{original}; failure capture failed: {capture_error}")
+            })?;
             return Err(format!(
                 "{original}; failure_capture={}",
                 failure_capture_dir.display()
@@ -1080,10 +1096,11 @@ fn compare_sampled_output(
         }
     }
     PhaseComparison::sampled_pass(
-        LIBGGML_REFERENCE_BACKEND,
+        CUDA_MMQ_REFERENCE_BACKEND,
         actual.len(),
         max_abs_error,
         max_rel_error,
+        max_tolerance_ratio,
     )
 }
 
@@ -1161,7 +1178,10 @@ fn initialize_runtime_from_env() -> Result<PersistentRuntime, String> {
     );
     let xclbin_sha256 = sha256_file(&xclbin)?;
     if !qualified_persistent_xclbin_identity(
-        xclbin.file_name().and_then(|name| name.to_str()).unwrap_or(""),
+        xclbin
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(""),
         xclbin_sha256,
     ) {
         return Err("persistent IQ1_S xclbin name or SHA-256 is not qualified".to_string());
@@ -1184,8 +1204,7 @@ fn initialize_runtime_from_env() -> Result<PersistentRuntime, String> {
         .ok_or("persistent IQ1_S proof ledger has no parent")?
         .join("failure-capture");
     let mut progress = ProgressSink::create(&ledger_path, &identity)?;
-    let diagnostic_finite_only =
-        env_truthy("HETGPU_QWEN_IQ1S_DIAGNOSTIC_FINITE_ONLY");
+    let diagnostic_finite_only = env_truthy("HETGPU_QWEN_IQ1S_DIAGNOSTIC_FINITE_ONLY");
     if diagnostic_finite_only {
         progress.append(
             "diagnostic_finite_only_enabled",
@@ -1252,9 +1271,7 @@ fn initialize_runtime_from_env() -> Result<PersistentRuntime, String> {
         // This opt-in exists only to obtain diagnostic hardware timing from an
         // otherwise finite run. The strict proof validator still requires a
         // sampled libggml comparison and therefore rejects this mode.
-        sampled_comparison_complete: initial_sampled_comparison_complete(
-            diagnostic_finite_only,
-        ),
+        sampled_comparison_complete: initial_sampled_comparison_complete(diagnostic_finite_only),
         output_publisher: NativeResultPublisher::default(),
         poisoned: None,
     })
@@ -2142,14 +2159,14 @@ mod tests {
     #[test]
     fn iq1s_persistent_runtime_qualifies_complete_name_and_digest_pairs() {
         let original = [
-            0x9c, 0x83, 0xdc, 0xae, 0x07, 0xb4, 0xc7, 0xbf, 0x1d, 0x2e, 0x1c, 0xeb,
-            0xf4, 0x6c, 0xcf, 0x0f, 0xf1, 0xeb, 0xf8, 0x84, 0x8a, 0x43, 0x70, 0x35,
-            0xfe, 0xf1, 0x45, 0x1d, 0xee, 0x77, 0x70, 0xa3,
+            0x9c, 0x83, 0xdc, 0xae, 0x07, 0xb4, 0xc7, 0xbf, 0x1d, 0x2e, 0x1c, 0xeb, 0xf4, 0x6c,
+            0xcf, 0x0f, 0xf1, 0xeb, 0xf8, 0x84, 0x8a, 0x43, 0x70, 0x35, 0xfe, 0xf1, 0x45, 0x1d,
+            0xee, 0x77, 0x70, 0xa3,
         ];
         let gridrom = [
-            0xd7, 0x2f, 0xf7, 0x33, 0x6c, 0xb4, 0xdd, 0x49, 0x86, 0x7c, 0x5f, 0x22,
-            0x08, 0xa3, 0x43, 0x92, 0x81, 0xea, 0xab, 0x1b, 0x0a, 0x9e, 0x59, 0x4b,
-            0x45, 0x8a, 0x4f, 0xec, 0xc6, 0xb7, 0x99, 0x48,
+            0xd7, 0x2f, 0xf7, 0x33, 0x6c, 0xb4, 0xdd, 0x49, 0x86, 0x7c, 0x5f, 0x22, 0x08, 0xa3,
+            0x43, 0x92, 0x81, 0xea, 0xab, 0x1b, 0x0a, 0x9e, 0x59, 0x4b, 0x45, 0x8a, 0x4f, 0xec,
+            0xc6, 0xb7, 0x99, 0x48,
         ];
 
         assert!(qualified_persistent_xclbin_identity(
@@ -2329,32 +2346,45 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(std::fs::read(capture.join("matrix.iq1s.bin")).unwrap(), matrix);
-        assert_eq!(std::fs::read(capture.join("activation.q8_1.bin")).unwrap(), activation);
+        assert_eq!(
+            std::fs::read(capture.join("matrix.iq1s.bin")).unwrap(),
+            matrix
+        );
+        assert_eq!(
+            std::fs::read(capture.join("activation.q8_1.bin")).unwrap(),
+            activation
+        );
         assert_eq!(
             std::fs::read(capture.join("reference.f32.bin")).unwrap(),
-            reference.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>()
+            reference
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             std::fs::read(capture.join("actual.f32.bin")).unwrap(),
-            actual.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>()
+            actual
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
         );
         for bank in 0..ARENA_BANK_COUNT {
             assert!(capture.join(format!("bank-{bank}.commands.json")).is_file());
             assert!(capture.join(format!("bank-{bank}.program.bin")).is_file());
             assert!(capture.join(format!("bank-{bank}.program.asm")).is_file());
         }
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(capture.join("manifest.json")).unwrap(),
-        )
-        .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(capture.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["schema_version"], 1);
         assert_eq!(manifest["status"], "numerical_mismatch_nonproof");
         assert_eq!(manifest["trace_mode"], "handwritten");
         assert_eq!(manifest["transaction_id"], 71);
         assert_eq!(manifest["layer_id"], 7);
         assert_eq!(manifest["mismatch"]["index"], 0);
-        assert_eq!(manifest["binding"]["tensor_name"], "blk.7.ffn_gate_exps.weight");
+        assert_eq!(
+            manifest["binding"]["tensor_name"],
+            "blk.7.ffn_gate_exps.weight"
+        );
         assert_eq!(manifest["files"].as_array().unwrap().len(), 16);
         assert!(manifest.get("proof_status").is_none());
 

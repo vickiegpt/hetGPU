@@ -975,7 +975,7 @@ def valid_iq1s_routes():
 
 def persistent_phase(phase_name="A", sampled=True, transaction_id=17):
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "iq1s_persistent_phase",
         "transaction_id": transaction_id,
         "layer_id": 7,
@@ -989,10 +989,13 @@ def persistent_phase(phase_name="A", sampled=True, transaction_id=17):
         "weight_dma_bytes": 0,
         "eligible_direct_routes": 0,
         "comparison_sampled": sampled,
-        "reference_backend": "libggml_dequantize_row_iq1_s" if sampled else None,
+        "reference_backend": "llama_cuda_mmq_iq1_s_sm120_half2" if sampled else None,
         "checked_elements": 1024,
-        "max_abs_error": 2.5e-5 if sampled else 0.0,
-        "max_rel_error": 4.0e-4 if sampled else 0.0,
+        "absolute_tolerance": 5.0e-4 if sampled else 0.0,
+        "relative_tolerance": 1.0e-3 if sampled else 0.0,
+        "max_abs_error": 4.96387482e-4 if sampled else 0.0,
+        "max_rel_error": 4.0e-3 if sampled else 0.0,
+        "max_tolerance_ratio": 0.999 if sampled else 0.0,
         "nonfinite": 0,
         "comparison_status": "pass" if sampled else "finite_only",
         "timing_us": {
@@ -1021,12 +1024,13 @@ def test_parse_persistent_iq1s_routing_uses_ledger_without_direct_xrt_records():
     assert attention == 1
     assert comparison == {
         "status": "pass",
-        "reference_backend": "libggml_dequantize_row_iq1_s",
+        "reference_backend": "llama_cuda_mmq_iq1_s_sm120_half2",
         "checked_elements": 1024,
-        "atol": 1.0e-4,
+        "atol": 5.0e-4,
         "rtol": 1.0e-3,
-        "max_absolute_error": 2.5e-5,
-        "max_relative_error": 4.0e-4,
+        "max_absolute_error": 4.96387482e-4,
+        "max_relative_error": 4.0e-3,
+        "max_tolerance_ratio": 0.999,
         "phase": "pre_timed",
         "kernel": "iq1s_layer_persistent",
     }
