@@ -79,6 +79,30 @@
 
 \begin{document}
 
+\begin{abstract}
+GPUs anchor modern AI infrastructure, yet their software remains trapped in
+vendor silos: a binary compiled for one vendor's ISA executes nowhere else,
+and emerging spatial hardware is reachable only through entirely separate
+synthesis toolchains.  We present \sys, a heterogeneous GPU IR designed to be
+lowered everywhere.  \sys compiles CUDA programs once into a single
+vendor-neutral IR whose lane-packed mask-SSA micro-operations make SIMT
+semantics---active masks, predication, scoped memory, synchronization, and
+warp collectives---first-class, so that no lowering path has to recover them.
+Four lowering paths hang off this IR: JIT translation to PTX for NVIDIA,
+SPIR-V for AMD and Intel, TOSA/TT-MLIR for Tenstorrent's MIMD many-cores, and
+static spatialization into \circt circuits whose correctness against the PTX
+memory model is stated as a trace-refinement theorem.  A uniform runtime loads
+the IR on any backend, virtualizes threads, memory, and synchronization, and
+serializes execution state at compiler-identified safe points to live-migrate
+running kernels across heterogeneous GPUs.  A prototype executes the same
+unmodified GPU binary on NVIDIA H100, AMD RX~9070 XT, Intel Iris Xe, and
+Tenstorrent BlackHole with modest overhead, migrates kernels mid-execution
+between vendors with seconds of downtime, and a Verilator artifact executes
+real PTX-derived instruction streams as explicit RTL uses with zero
+mismatches.  \sys shows that one GPU IR can serve every silicon: vendor GPUs
+today, spatial fabrics next.
+\end{abstract}
+
 \maketitle
 
 \bibliographystyle{ACM-Reference-Format}
