@@ -885,6 +885,85 @@ theorem remains a refinement because PTX gives meaning to racy programs and
 because a conservative spatial compiler may deliberately choose a subset of
 legal source interleavings.
 
+\section{Runtime and Live Migration}
+\label{sec:runtime}
+
+\subsection{Device Abstraction and Launch}
+\label{sec:runtime-abstraction}
+
+The runtime is a library, \texttt{libconcordi.so}, exposing a CUDA-shaped
+API.  It discovers devices by PCI scan or configuration (Tenstorrent boards
+may not appear on a PCI scan) and loads vendor libraries dynamically
+(\texttt{dlopen} of \texttt{libcuda.so}, ROCm's \texttt{libhip}, OpenCL, or
+Level Zero), so no vendor is a hard dependency.  When
+\texttt{concordiLaunchKernel} is called, the runtime looks the kernel up by
+its compile-time identifier, JIT-compiles it for the current device if not
+cached (\S\ref{sec:jit}), and enqueues it: on NVIDIA/AMD/Intel through the
+device's stream or queue; on Tenstorrent through a core pool---allocating
+cores for the launch's blocks, loading instruction memory, triggering start,
+and polling a completion flag.  Memory allocations
+(\texttt{concordiMalloc}) wrap the vendor allocator and tag each device
+pointer with its owning device, keeping a pinned host mirror to make
+cross-device copies cheap if a buffer is later used elsewhere.
+
+\subsection{Cooperative Checkpointing}
+\label{sec:checkpoint}
+
+Migration needs a snapshot of running state.  Rather than relying on
+vendor-specific preemption, the runtime and compiler cooperate at the safe
+suspension points the IR already labels (\S\ref{sec:ir-ctx}).  The state
+representation is device-neutral: per-thread virtual-register files for
+every thread in a block, per-thread or per-warp program counters (a single
+PC where threads are uniform), active-mask metadata per warp, and a copy of
+shared-memory contents.
+
+Capture is two-phase.  First, the runtime sets a \texttt{pause\_flag} for
+the target stream's kernels---a global-memory symbol on NVIDIA, an
+equivalent device buffer on AMD/Intel, a polled memory flag on
+Tenstorrent---so that after the next barrier no new work starts.  Second,
+compiler-injected checks at each safe point test the flag; when set, a
+thread block copies its live virtual registers and PCs to a global buffer
+and exits.  Because all threads must reach the barrier anyway, the snapshot
+is automatically race-free at block granularity: either all threads of a
+block arrive and dump, or the block has not reached a safe point yet.
+\texttt{concordiCheckpoint} then composes the per-block blobs with a copy of
+global memory into a state object on the host.
+
+Restore inverts the process.  \texttt{concordiRestore(state, device)}
+allocates blocks on the target device, launches a resume kernel, and
+reconstructs registers through shared memory on SIMT GPUs: thread~0 copies
+the saved register file into shared memory,
+\texttt{\_\_syncthreads()}, and each thread loads its own values---the
+only portable channel into per-thread registers on hardware that disallows
+register initialization at launch.  Shared-memory contents are restored the
+same way.  Resuming mid-kernel uses the IR's labeled points: potential
+resume positions carry segment IDs, and the resume kernel switches on the
+passed ID to jump to the saved basic block.  On Tenstorrent, an assembly
+prologue loads vector and scalar register files directly from memory.
+
+The compiler also segments persistent kernels: a global barrier every $X$
+iterations turns a long-running kernel into a chain of standard launches
+whose boundary state is exactly a snapshot.  Migration then ends the current
+segment early on the source device and starts the next segment on the
+destination, using the snapshot as input.  This trades generality---pausing
+at an arbitrary instruction is not supported---for reliability: no
+arbitrary PC mapping across ISAs is ever required.
+
+\subsection{Migration Protocol and Limits}
+\label{sec:migration}
+
+Moving a kernel from device A to device B transfers the state object and
+global memory (device-to-host-to-device, or peer-to-peer where available),
+allocates equivalent buffers, fixes up base addresses, and re-derives the
+destination's JIT cache entry.  Data movement dominates downtime; the
+protocol's cost is bounded by memory footprint, not kernel complexity
+(\S\ref{sec:eval-migration}).  Instrumentation is enabled only when a
+checkpoint is planned---barrier-flag checks are cheap, but always-on
+instrumentation is not---so surprise preemption is out of scope today; a
+hardware-supported pause would remove this limit.  Migration targets GPU
+backends; extending state serialization to spatial circuits is future work
+(\S\ref{sec:limitations}).
+
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
 
