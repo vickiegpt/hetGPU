@@ -1,0 +1,87 @@
+\documentclass[sigplan,nonacm]{acmart}
+\settopmatter{printfolios=true}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+
+\usepackage{tikz}
+\usepackage{float}
+\usepackage{amsmath}
+\usepackage{amsthm}
+\usepackage{xspace}
+\usepackage{cleveref}
+\usepackage{balance}
+\usepackage{url}
+\usepackage{siunitx}
+\usepackage{comment}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\newcommand*\circled[1]{\tikz[baseline=(char.base)]{
+            \node[shape=circle,draw=black!80,line width=0.2mm,inner sep=0.1pt] (char) {#1};}}
+
+\newcommand{\sys}{\textsc{Concordia}\xspace}
+\newcommand{\uop}{\ensuremath{\mu}\textsc{op}\xspace}
+\newcommand{\uops}{\ensuremath{\mu}\textsc{ops}\xspace}
+\newcommand{\circt}{CIRCT\xspace}
+\newcommand{\mlir}{MLIR\xspace}
+\newcommand{\ptx}{PTX\xspace}
+\newcommand{\eg}{e.g.,\xspace}
+\newcommand{\ie}{i.e.,\xspace}
+\newcommand{\etc}{etc.\xspace}
+
+% Cleveref formatting
+\crefname{algocf}{algorithm}{algorithms}
+\Crefname{algocf}{Algorithm}{Algorithms}
+\crefformat{section}{\S#2#1#3}
+\Crefformat{section}{Section~#2#1#3}
+\crefformat{subsection}{\S#2#1#3}
+\Crefformat{subsection}{Section~#2#1#3}
+\crefformat{subsubsection}{\S#2#1#3}
+\Crefformat{subsubsection}{\S#2#1#3}
+\crefformat{figure}{figure~#2#1#3}
+\Crefformat{figure}{Figure~#2#1#3}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  breaklines=true
+}
+
+%%% co-author discussion macros
+\newenvironment{smenumerate}%
+  {\begin{enumerate}[itemsep=-0pt, parsep=0pt, topsep=0pt, leftmargin=2pc]}
+  {\end{enumerate}}
+\newenvironment{smsmenumerate}%
+  {\begin{list}{$\bullet$}%
+    {\setlength{\parsep}{0pt}%
+      \setlength{\topsep}{0pt}%
+      \setlength{\leftmargin}{2pc}%
+      \setlength{\itemsep}{1pt}}}
+  {\end{list}}
+\newcommand{\grumbler}[3]{\noindent{\color{#1}{\bf \fbox{#2}} {\it #3}}}
+\newcommand{\arq}[1]{\grumbler{red}{ARQ}{#1}}
+\newcommand{\yy}[1]{\grumbler{blue}{YY}{#1}}
+\newcommand{\yusheng}[1]{\grumbler{green}{YS}{#1}}
+\newcommand{\todo}[1]{\grumbler{olive}{todo}{#1}}
+
+\title{\sys: A Heterogeneous GPU IR for All}
+
+\author{Anonymous Authors}
+
+\begin{document}
+
+\maketitle
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\end{document}
