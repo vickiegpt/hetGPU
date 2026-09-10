@@ -105,6 +105,108 @@ today, spatial fabrics next.
 
 \maketitle
 
+\section{Introduction}
+\label{sec:intro}
+
+Modern computing runs on GPUs, yet GPU software remains locked to the vendor
+that compiled it.  A CUDA binary executes on NVIDIA hardware and nowhere
+else: ISAs, execution models, and driver interfaces are incompatible across
+NVIDIA, AMD, and Intel, and emerging accelerators such as Tenstorrent's
+RISC-V many-cores add a third organization with no warp hardware at
+all~\cite{lustig2019ptx,chen2018tvm,lattner2021mlir}.  This lock-in is
+becoming more costly along a second axis.  Spatial accelerators---FPGAs,
+CGRAs, and dataflow fabrics---replace instruction fetch with circuits whose
+behavior is largely fixed at compile time, but their toolchains enter from
+the source level through HLS and spatial DSLs
+\cite{koeplinger2018spatial,prabhakar2017plasticine,ye2021scalehls}.  The
+enormous ecosystem of deployed GPU kernels, distributed as PTX or embedded in
+framework JIT caches, is reachable from spatial hardware only after source
+recovery, rewriting, or manual porting.  Two silos---vendor silos and
+device-type silos---share one root cause: there is no GPU intermediate
+representation that any hardware can lower.
+
+Source-level portability layers do not close the gap.  OpenCL, SYCL/oneAPI,
+and HIP unify the programming model but still compile per vendor, and they
+cannot help binary-only dependencies at all.  The operational cost of
+non-portable binaries falls on everyone downstream: teams maintain parallel
+builds and divergent debugging workflows; schedulers pin jobs to
+vendor-specific pools while other GPUs sit idle; maintenance and failures
+force draining jobs rather than moving
+them~\cite{xiao2018gandiva,gu2019tiresias,narayanan2020gavel,yu2020salus}.
+Cluster schedulers already rely on iteration-level checkpointing to juggle
+workloads~\cite{narayanan2020gavel}, but without a portable binary substrate
+they cannot treat a heterogeneous fleet as one fungible pool, and
+CUDA-on-X translation systems that do exist stop at processor
+backends~\cite{huang2023cupbop}.
+
+We present \sys, a heterogeneous GPU IR designed to be lowered everywhere.
+\sys compiles CUDA programs once into a single vendor-neutral IR that
+captures GPU parallel semantics---thread hierarchies, memory spaces,
+barriers---and, crucially, makes SIMT \emph{execution} semantics
+first-class: every value is a lane-packed vector paired with an active-lane
+mask, and predication, scoped memory ordering, and warp collectives are IR
+constructs rather than facts each backend must recover.  Four lowering paths
+hang off this IR.  At run time, a JIT translates it to PTX for NVIDIA,
+SPIR-V for AMD and Intel, and TOSA/TT-MLIR for Tenstorrent's MIMD cores.  As
+a second axis, the same IR-level semantics spatialize into statically
+scheduled \circt circuits for spatial hardware: regular regions become fixed
+pipelines, and only barriers, atomics, and unresolved memory dependences
+become control-token boundaries.  The claim packed into ``for all'' is
+precise: one IR, every lowering, and no semantic recovery per target.
+
+Three obstacles stand in the way, and each is answered inside the IR.
+First, execution organizations differ: SIMT designs execute lockstep lanes
+with implicit reconvergence, Tenstorrent schedules independent cores, and
+spatial fabrics fix schedules statically.  The \sys µop layer carries
+masks and lane packing explicitly, so each backend maps or emulates SIMT
+semantics from the same representation instead of reconstructing it.  Second,
+memory and synchronization semantics are uneven across vendors, and PTX's
+memory model is weak, scoped, and deliberately not data-race-free---racy
+programs still have defined
+behaviors~\cite{lustig2019ptx}.  \sys attaches order and scope labels to
+every memory operation in the IR and requires each lowering to implement and
+be checked against them; for the spatial path this obligation is discharged
+by a trace-refinement theorem under an explicit backend memory contract.
+Third, portability must extend to execution \emph{state}, not just code, so
+that preemption and live migration work across backends with different
+grouping granularities; \sys marks safe suspension points in the IR and
+defines a device-neutral state representation over virtual registers,
+program counters, and active masks.
+
+This paper makes four contributions:
+\begin{itemize}
+  \item \textbf{The Concordia IR}: a vendor- and hardware-form-agnostic GPU
+  IR whose lane-packed mask-SSA µops make SIMT semantics---masks,
+  predication, state spaces, scoped memory, synchronization, warp
+  collectives---first-class (\S\ref{sec:ir}).
+  \item \textbf{Four lowering paths from one IR}: JIT translation to PTX,
+  SPIR-V, and TOSA/TT-MLIR on GPU backends, and static-first spatialization
+  into \circt with if-converted mask-SSA regions, tokenized fallbacks for
+  non-static effects, and a memory planner that separates affine streams
+  from tokenized islands (\S\ref{sec:compilation}).
+  \item \textbf{Correctness and migration substrate}: a trace-refinement
+  theorem for spatialization against the PTX memory model
+  (\S\ref{sec:formal}), plus a uniform runtime with cooperative
+  checkpointing and device-neutral state serialization enabling live
+  migration across vendor GPUs (\S\ref{sec:runtime}).
+  \item \textbf{A working prototype}: the same unmodified GPU binary running
+  on NVIDIA H100, AMD RX~9070 XT, Intel Iris Xe, and Tenstorrent BlackHole
+  with modest overhead; kernels migrated mid-execution between vendors with
+  seconds of downtime; and a Verilator artifact executing real PTX-derived
+  instruction streams---five kernels plus a 40-trace Qwen corpus---as
+  explicit RTL uses with zero mismatches (\S\ref{sec:impl},
+  \S\ref{sec:eval}).
+\end{itemize}
+
+The remainder of the paper reviews the hardware and portability landscape
+(\S\ref{sec:background}), presents the IR (\S\ref{sec:ir}), its compilation
+paths (\S\ref{sec:compilation}), and its correctness theory
+(\S\ref{sec:formal}), describes the runtime and migration
+(\S\ref{sec:runtime}) and prototype (\S\ref{sec:impl}), evaluates the system
+(\S\ref{sec:eval}), and discusses related work and limitations
+(\S\ref{sec:related}--\S\ref{sec:limitations}).
+
+
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
 
