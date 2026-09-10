@@ -28,3 +28,16 @@ bench/concordia_delta_checkpoint/*.ptx
 ze_runner*
 *sb
 *ppt
+
+# LaTeX build artifacts (paper/)
+paper/main.aux
+paper/main.bbl
+paper/main.blg
+paper/main.fdb_latexmk
+paper/main.fls
+paper/main.log
+paper/main.out
+paper/main.pdf
+paper/main.synctex.gz
+paper/main.toc
+paper/*.spl
