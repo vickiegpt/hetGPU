@@ -964,6 +964,37 @@ hardware-supported pause would remove this limit.  Migration targets GPU
 backends; extending state serialization to spatial circuits is future work
 (\S\ref{sec:limitations}).
 
+\section{Implementation}
+\label{sec:impl}
+
+The prototype targets four platforms: an NVIDIA H100 (Hopper, 96\,GB), an
+AMD Radeon RX~9070 XT (RDNA4, 16\,GB), Intel Iris Xe (Xe-LPG, 512\,MB), and
+a Tenstorrent BlackHole dev board with 120 Tensix cores (32\,GB), on Ubuntu
+24.04 hosts.  The compiler extends LLVM~22; the runtime is
+\texttt{libconcordi.so}; the \texttt{CTXTarget} backend and the four
+translation modules of \S\ref{sec:compilation} are integrated into the
+runtime's JIT.  The spatial path is implemented as a pass pipeline over the
+same IR: the PTXSpatial pass defines the mask-aware µop data structures,
+region strategies, and proof obligations; the memory planner separates
+static affine streams from tokenized groups; and the packaging bridge emits
+runtime metadata, CXL shell metadata, RTL, and a generated Verilator
+testbench.
+
+The paper's spatial artifact distills that pipeline into a self-contained
+RTL core and testbench rather than requiring the full workspace build,
+which pulls in LLVM/CUDA/Level-Zero platform tooling.  It keeps the same
+conceptual stages---PTX input, SIMT-aware normalization, an ordered use
+sequence, lane-packed RTL state, token boundaries---and comprises two
+executable flows: a \emph{semantic RTL slice} (five PTX scenarios executed
+on an instruction-ROM RTL core with mask-guarded updates, checked against
+deterministic PTX oracles) and an \emph{LLM trace route} (40 real Qwen
+Triton-cache PTX traces classified structurally, emitted as CIRCT FIRRTL,
+lowered with \texttt{firtool}, and simulated under Verilator).  All
+evaluation scripts write JSON as the source of truth and derive Markdown
+and \LaTeX{} tables from it, recording tool versions and command lines
+beside the results, so every table in \S\ref{sec:eval} can be regenerated
+rather than hand-entered.
+
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
 
