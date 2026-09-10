@@ -995,6 +995,346 @@ and \LaTeX{} tables from it, recording tool versions and command lines
 beside the results, so every table in \S\ref{sec:eval} can be regenerated
 rather than hand-entered.
 
+\section{Evaluation}
+\label{sec:eval}
+
+We evaluate along five dimensions: functional portability, performance
+overhead relative to native, real-world workloads, live migration, and the
+spatial path's executable evidence.  Experiments ran on Linux hosts with an
+Intel Xeon CPU and four GPUs: NVIDIA H100 (96\,GB), AMD RX~9070 XT (16\,GB),
+Intel Iris Xe (512\,MB), and Tenstorrent BlackHole (32\,GB), using CUDA~12,
+ROCm~6.4.1, Intel oneAPI Level Zero~1.6, and Tenstorrent tt-metal v0.58.0.
+Kernels use default optimizations with migration support off for pure
+performance runs; baselines are native toolchains (CUDA via
+\texttt{nvcc}, HIP via \texttt{hipcc}, hand-written Level Zero, optimized
+Metalium).
+
+\subsection{Portability and Correctness}
+\label{sec:eval-portability}
+
+A single CTX binary containing ten kernels---vector addition, SAXPY, tiled
+matrix multiplication, reduction, inclusive scan with warp shuffle, warp-vote
+bitcount, Monte Carlo $\pi$ with divergence and atomics, and a small
+neural-network layer---runs unmodified on all four platforms with outputs
+matching known-correct references.  Two kernels exercised emulation paths:
+the scan's shuffle used a \texttt{VOTE\_ANY}-based loop where
+\texttt{SHUFFLE} was not yet implemented, and \texttt{atomicAdd} on
+Tenstorrent used a global-memory spin lock.  Compiling from CUDA source and
+executing on AMD required no AMD-specific code and no \texttt{hipcc}
+invocation.  OpenCL C input is future work.
+
+\subsection{Performance vs.\ Native}
+\label{sec:eval-perf}
+
+\begin{figure*}[htb]
+   \centering
+    \begin{subfigure}[b]{0.4\columnwidth}
+       \includegraphics[width=\textwidth]{figs/concordi_fig_vector_add.pdf}
+       \caption{Vector Add}
+       \label{fig:vector_add}
+   \end{subfigure}
+    \begin{subfigure}[b]{0.4\columnwidth}
+       \includegraphics[width=\textwidth]{figs/concordi_fig_divergent_pi.pdf}
+       \caption{Divergent Pi}
+       \label{fig:divergent_pi}
+   \end{subfigure}
+    \begin{subfigure}[b]{0.4\columnwidth}
+       \includegraphics[width=\textwidth]{figs/concordi_fig_gemm_tflops.pdf}
+       \caption{Matrix Multiplication}
+       \label{fig:showcase}
+   \end{subfigure}
+    \begin{subfigure}[b]{0.4\columnwidth}
+       \includegraphics[width=\textwidth]{figs/concordi_fig_reduction.pdf}
+       \caption{Reduction}
+       \label{fig:scale}
+   \end{subfigure}
+   \caption{Microbenchmark performance vs.\ native across vendors.}
+   \label{fig:combined}
+\end{figure*}
+
+Figure~\ref{fig:combined} reports microbenchmark timings.  Vector add
+(1\,M elements) on H100: 0.11\,ms native, 0.13\,ms on first run including
+JIT, 0.11\,ms cached; on the 9070 XT 0.14\,ms native vs.\ 0.16\,ms; Iris Xe
+0.70\,ms vs.\ 0.72\,ms; Tenstorrent 0.95\,ms vs.\ 0.72\,ms for a
+hand-optimized Metalium version, the gap being synchronous DMA in our
+prototype.  Matrix multiply ($1024^2$, 4\,096 blocks of 256 threads): H100
+\texttt{cublas} peaks near 9\,TFLOPs on tensor cores, native CUDA without
+tensor cores reaches $\sim$3.8\,TFLOPs, \sys 3.5\,TFLOPs ($<$8\% overhead);
+\texttt{hipBLAS} $\sim$7\,TFLOPs vs.\ \sys $\sim$3.3\,TFLOPs ($<$6\% over
+the equivalent HIP kernel); Tenstorrent reaches $\sim$80\% of its optimized
+kernel.  Reduction (1\,M): 0.16\,ms vs.\ 0.17\,ms (NVIDIA), 0.18\,ms vs.\
+0.20\,ms (AMD), 0.71\,ms vs.\ 0.73\,ms (Intel), 1.4\,ms (Tenstorrent)---
+overheads of 5--15\%.  The divergent Monte Carlo $\pi$ kernel shows the
+execution-organization bridge at work: on Tenstorrent, independent-thread
+(MIMD) mode across 120 cores reaches $\sim$25\,M points/s while vectorized
+warp mode reaches $\sim$18\,M, so the runtime's per-kernel mode selection
+matters for irregular kernels; on NVIDIA and AMD the overhead is under
+2\%.
+
+First-execution JIT translation takes 50--100\,ms for nontrivial kernels
+on NVIDIA (PTX$\rightarrow$SASS via \texttt{ptxas}), 100--200\,ms on AMD
+(LLVM$\rightarrow$GCN), $\sim$80\,ms on Intel (SPIR-V), and $\sim$30\,ms on
+Tenstorrent (TT-MLIR)---Figure~\ref{fig:jit}---acceptable for long-running
+programs and amortizable by precompilation.  The abstraction layer adds
+negligible overhead to memory operations (microseconds on synchronous
+calls).
+
+\begin{figure}[b]
+    \centering
+    \includegraphics[width=\linewidth]{figs/concordi_fig_jit_overhead.pdf}
+    \caption{\sys JIT overhead on first execution.}
+    \label{fig:jit}
+\end{figure}
+
+\subsection{Real-World LLM Workloads}
+\label{sec:eval-llm}
+
+Table~\ref{tab:realworld} reports tokens per second for three 8B-class
+models, unmodified, on NVIDIA and AMD.  Translation overhead exists but
+stays within production-acceptable bounds; the penalty varies with model
+architecture, and simpler or well-optimized models degrade least.  For
+cloud deployments where hardware availability and price fluctuate, this
+trade---modest overhead for the ability to place or migrate workloads
+across heterogeneous GPUs---is the operating point \sys targets.
+
+\begin{table*}[h]
+  \centering
+  \caption{Real-world LLM inference throughput (tokens per second).}
+  \begin{tabular}{lcccc}
+  \toprule
+  Model & Native NVIDIA & \sys NVIDIA & Native AMD & \sys AMD \\
+  \midrule
+  Qwen/Qwen3-8B & 13.6 & 11.3 & 12.8 & 9.6 \\
+  deepseek-ai/DeepSeek-R1-Distill-Llama-8B & 23.5 & 18.6 & 18.0 & 12.2 \\
+  meta-llama/Meta-Llama-3-8B & 32.3 & 22.1 & 22.9 & 21.5 \\
+  \bottomrule
+  \end{tabular}
+  \label{tab:realworld}
+\end{table*}
+
+\subsection{Use Case: Cross-GPU Live Migration}
+\label{sec:eval-migration}
+
+We live-migrate a long-running iterative tiled matmul squaring a
+$16\,384 \times 16\,384$ matrix: H100 $\rightarrow$ RX~9070 XT
+$\rightarrow$ BlackHole.  Checkpointing at an iteration boundary took
+$\sim$0.5\,s (2\,GB of matrix data to host over PCIe); restore on the AMD
+card took $\sim$0.6\,s (PCIe 5.0); the final hop to the Tenstorrent board
+took $\sim$1.1\,s.  Total downtime was $\sim$2.2\,s in a $\sim$30\,s job,
+and the migrated run produced the same result as the non-migrated run
+within floating-point tolerance.  We also migrated a CNN training iteration
+from H100 to Iris Xe at a batch boundary ($\sim$3\,s to move $\sim$4\,GB of
+parameters and activations); training resumed and converged normally,
+confirming multi-kernel sequences survive migration
+(Figure~\ref{fig:migration}).
+
+\begin{figure}[b]
+    \centering
+    \includegraphics[width=\linewidth]{figs/concordi_fig_migration.pdf}
+    \caption{Cross-vendor live migration timeline.}
+    \label{fig:migration}
+\end{figure}
+
+\subsection{Spatial Artifact: Executing PTX Streams as RTL}
+\label{sec:eval-rtl}
+
+The spatial path's evidence is a Verilator artifact that executes
+PTX/SIMT instruction streams as explicit RTL uses.  The RTL core holds an
+instruction ROM selected per benchmark scenario---a PTX/SIMT instruction-use
+stream, not a source-level loop body---lane-packed 32-element state guarded
+by the active mask on every update, and PTX-event-level memory accounting
+(a full-warp load contributes 32 memory events; a serialized atomic
+contributes one per active lane).  The runner records the Verilator version
+(5.050) and command line beside machine-readable results.
+Table~\ref{tab:benchmarks} ties each benchmark to the lowering route it
+exercises; Table~\ref{tab:verilator} reports results.
+
+\begin{table*}[t]
+\centering
+\caption{Benchmarks and RTL lowering routes used by the Verilator artifact.}
+\label{tab:benchmarks}
+\small
+\begin{tabular}{p{0.16\textwidth}p{0.25\textwidth}p{0.25\textwidth}p{0.22\textwidth}}
+\toprule
+Family & Benchmark & Stressed feature & RTL route \\
+\midrule
+Lane arithmetic &
+\texttt{vector\_add} &
+Two global loads, lane-packed add, global store &
+\texttt{static\_lane\_packed}. \\
+Warp collective &
+\texttt{shfl\_down} &
+\texttt{\%laneid}, \texttt{shfl.sync}, valid mask, barrier &
+\texttt{mask\_shuffle\_barrier}. \\
+Affine stream &
+\texttt{affine\_load\_store} &
+Affine address generation and static memory events &
+\texttt{static\_affine\_stream}. \\
+Atomic serialization &
+\texttt{atomic\_histogram} &
+Scoped read-modify-write fallback and hotspot serialization &
+\texttt{tokenized\_atomic}. \\
+Irregular memory &
+\texttt{indexed\_gather} &
+Dynamic index load, table load, lane-packed store &
+\texttt{tokenized\_indexed\_memory}. \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{table}[t]
+\centering
+\caption{Verilator results from the spatial RTL artifact.}
+\label{tab:verilator}
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Benchmark & Cycles & Mem.\ events & Writes & Token waits & Mismatches \\
+\midrule
+\texttt{vector\_add} & 5 & 96 & 32 & 0 & 0 \\
+\texttt{shfl\_down} & 6 & 31 & 31 & 1 & 0 \\
+\texttt{affine\_load\_store} & 5 & 64 & 32 & 0 & 0 \\
+\texttt{atomic\_histogram} & 36 & 36 & 4 & 32 & 0 \\
+\texttt{indexed\_gather} & 36 & 96 & 32 & 32 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All five scenarios complete with zero mismatches.  The static lane-packed
+cases finish in five cycles (four semantic instructions plus exit) with no
+token waits, exactly the static-region expectation; their differing
+memory-event counts (96 vs.\ 64) reflect two full-warp loads plus a store
+versus one load plus a store.  The shuffle case exercises the mask-value
+invariant in hardware: \texttt{shfl.down}-by-one yields valid data for
+lanes 0--30 (valid mask \texttt{0x7fffffff}) and an invalid source for lane
+31; the checksum covers only valid lanes and matches the expected 496---an
+implementation that silently wrote lane 31 would fail.  The tokenized cases
+are deliberately slower: the atomic histogram serializes 32 lane updates
+behind token steps (36 cycles, four bins of eight lanes each), and the
+indexed gather spends two memory events per lane (96 total, checksum
+34\,480 matching the deterministic oracle).  These rows demonstrate the
+fallback rule in hardware: unresolved or ordered memory effects serialize
+without leaving the PTX behavior set.  Three narrow claims are supported:
+static PTX regions are directly representable as ordered use sequences;
+SIMT features that scalar lowering loses (shuffle validity, active masks)
+survive into RTL and are checked; and unsafe-to-static effects become
+correct by tokenization, with their cost visible as token waits.
+
+\subsection{Real PTX Traces: Qwen Corpus to CIRCT and Verilator}
+\label{sec:eval-qwen}
+
+A second flow tests the route on a real LLM PTX corpus.  A
+Qwen2.5-0.5B-Instruct workload (20 prompts, 50 new tokens, 1000 output
+tokens) ran natively at 158.64 tokens/s in 6.30\,s on the capture host;
+because eager execution used prebuilt CUDA kernels, the runtime PTX preload
+hook captured nothing, so the corpus was collected from
+TorchInductor/Triton compiled-forward cache entries for the same model
+family---76 traces on the remote cache, of which the artifact stores a
+deterministic 40-trace sample.  This experiment measures a different level
+from Table~\ref{tab:verilator}: it does not execute Qwen's numerics.  It
+tests the compiler-route mechanics---parse PTX, count SIMT instructions and
+memory events, classify routes, emit a CIRCT FIRRTL summary, lower with
+\texttt{firtool}~1.62.0, and simulate under Verilator.
+
+\begin{table*}[t]
+\centering
+\caption{CIRCT-lowered Verilator benchmark for the 40-trace Qwen PTX trace corpus.}
+\label{tab:qwen-trace-verilator}
+\small
+\begin{tabular}{lrrrrrrrr}
+\toprule
+Run & Traces & Cycles & Instr. & Mem. events & Token waits & Barriers & Shuffles & Max trace \\
+\midrule
+Qwen PTX trace corpus & 40 & 11634 & 9094 & 152512 & 2540 & 87 & 127 & 32 (2359) \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{table*}[t]
+\centering
+\caption{Route breakdown extracted from the real Qwen PTX traces.}
+\label{tab:qwen-trace-route}
+\small
+\begin{tabular}{lrrrrrrrr}
+\toprule
+Route & Traces & Instr. & Mem. events & Token waits & Cycles & Barriers & Shuffles & Branches \\
+\midrule
+cooperative\_reduction & 21 & 6644 & 132160 & 1996 & 8640 & 87 & 127 & 275 \\
+static\_affine\_stream & 14 & 542 & 4224 & 0 & 542 & 0 & 0 & 14 \\
+tokenized\_control\_memory & 5 & 1908 & 16128 & 544 & 2452 & 0 & 0 & 117 \\
+\midrule
+Total & 40 & 9094 & 152512 & 2540 & 11634 & 87 & 127 & 406 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{table*}[t]
+\centering
+\caption{Highest-cycle Qwen PTX traces in the 40-trace corpus (family names from Triton kernel names).}
+\label{tab:qwen-trace-top}
+\small
+\begin{tabular}{rlrrrrr}
+\toprule
+ID & Family & Instr. & Mem. events & Token waits & Cycles & Route \\
+\midrule
+32 & rotary\_bmm\_copy & 1790 & 21504 & 569 & 2359 & cooperative\_reduction \\
+27 & rotary\_bmm\_copy & 940 & 9728 & 297 & 1237 & cooperative\_reduction \\
+7 & rotary\_bmm\_copy & 530 & 4864 & 161 & 691 & cooperative\_reduction \\
+15 & rotary\_bmm\_copy & 515 & 5376 & 161 & 676 & cooperative\_reduction \\
+10 & attention\_copy & 472 & 3840 & 136 & 608 & tokenized\_control\_memory \\
+3 & rotary\_bmm\_copy & 470 & 3968 & 136 & 606 & tokenized\_control\_memory \\
+36 & attention\_copy & 444 & 3840 & 136 & 580 & tokenized\_control\_memory \\
+26 & rmsnorm\_embedding & 330 & 24064 & 180 & 510 & cooperative\_reduction \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+The corpus aggregates 9\,094 parsed PTX instructions, 152\,512 memory-event
+slots, 87 barriers, 127 shuffles, and 406 branches across 11\,634 simulated
+cycles (Table~\ref{tab:qwen-trace-verilator}).  The route breakdown makes
+the corpus useful for the paper's central distinction
+(Table~\ref{tab:qwen-trace-route}): 14 traces are static affine streams
+with zero token waits---the closest cases to pure instruction-string
+spatialization; 21 are cooperative reductions whose barriers and shuffles
+are carried as explicit SIMT collective uses; and 5 are branch-heavy,
+local-memory control traces kept tokenized, their cost exposed as token
+waits rather than hidden.  The heaviest trace (ID 32, a fused
+rotary/BMM/copy kernel: 1\,790 instructions, 21\,504 memory-event slots) is
+exactly the kind of framework-JIT-specialized kernel for which a
+source-level HLS view is least helpful---the source abstraction was already
+rewritten by the framework JIT.  Attention-copy traces enter the tokenized
+route on branch-heavy guard logic and index-derived addressing even with
+fewer instructions, which is the concrete argument for keeping both routes:
+forcing them into one dynamic dataflow graph would waste their static
+structure, while pretending their accesses are affine would lose behavioral
+guard information.
+
+\subsection{Correctness Checks and Differential Execution}
+\label{sec:eval-correctness}
+
+The Verilator harness checks deterministic final outputs, and the structure
+of the checks mirrors Theorem~\ref{thm:refinement}: a source-side PTX/SIMT
+oracle in the testbench computes expected values per active lane, and the
+observable projection covers final checksums, memory-event counts, write
+counts, token waits, and valid masks---cycle counts are reported but never
+used as an equivalence condition.  Shuffle equality is guarded by the
+validity mask, matching the PTX rule for invalid source lanes; the barrier
+check verifies that a barrier token delays release and that post-barrier
+stores are not emitted early; atomics and indexed memory verify the
+conservative-token principle.  The artifact is a bounded executable witness,
+not a replacement for translation validation of arbitrary regions.  In a
+full build, every scheduled region should emit source-side µop and
+target-side circuit formulas for region-local LEC through CIRCT's
+\texttt{verif} infrastructure, with bounded model checking for
+protocol-heavy subcircuits (barrier epoch advance, FIFO no-drop/no-duplicate,
+atomic one-return-per-operation).  The longer-term plan is differential
+execution against four baselines: native NVIDIA via NVVM/NVPTX, native AMD
+via ROCDL/AMDGPU where a source baseline exists, a portable SPIR-V path
+where the fragment is representable, and a PTX interpreter oracle such as
+Ocelot for binary-only cases---integer outputs exact, floating point under
+documented tolerance, and racy kernels compared against the source behavior
+set rather than one interleaving.
+
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
 
