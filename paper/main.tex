@@ -401,6 +401,250 @@ suspension point}; and a DWARF-style map links live virtual registers,
 program-counter positions, and active masks to the device-neutral snapshot
 representation the runtime checkpoints (\S\ref{sec:runtime}).
 
+\section{Compilation}
+\label{sec:compilation}
+
+\subsection{Front End}
+\label{sec:frontend}
+
+The \sys compiler is built on LLVM's CUDA toolchain.  Clang's CUDA code
+generation is modified to emit device-agnostic LLVM IR: calls that Clang
+would normally lower to NVIDIA builtins are remapped to \sys intrinsics
+(\texttt{llvm.concordi.barrier}, \texttt{llvm.concordi.ld.shared},
+\texttt{llvm.concordi.shfl}, \etc), which carry SIMT and memory semantics
+through the optimization pipeline.  A custom LLVM backend, \texttt{CTXTarget},
+then emits CTX assembly.  Optimizations at IR level are target-agnostic by
+policy: device-independent transformations are welcome, but anything that
+assumes hardware characteristics---warp-size-specific unrolling, for
+example---is deferred to the per-backend JIT so it can be tuned per device.
+The backend also attaches the state annotations of \S\ref{sec:ir-ctx}: safe
+suspension points at barriers and exits, and the source-to-IR value map used
+for checkpointing.
+
+\subsection{GPU Lowering Paths}
+\label{sec:gpu-lowering}
+
+Each GPU backend is a translation module from CTX to the vendor's ingest
+format, integrated into the runtime's JIT (\S\ref{sec:jit}); a new vendor is
+a new module, not a new compiler.
+
+\paragraph{NVIDIA/PTX.} CTX is converted to an in-memory PTX IR (reusing
+NVVM structures where possible), mapping each CTX instruction to one or more
+PTX instructions: special-register reads become \texttt{ctaid}/\texttt{tid}
+reads, predicated regions become \texttt{@predicate}-guarded instructions or
+PTX control flow, and barriers become \texttt{bar.sync}.  The driver's JIT
+(\texttt{ptxas} via the CUDA driver API) then produces a cubin, with
+\texttt{.target} directives matched to the device's compute capability.
+
+\paragraph{AMD/ROCm.} CTX is converted to SPIR-V using SPIRV-Tools and
+compiled through ROCm's stack.  \texttt{LD\_GLOBAL} maps to
+\texttt{OpLoad} from \texttt{CrossWorkgroup}; \texttt{LD\_SHARED} maps to
+\texttt{Workgroup} storage with a declared workgroup array per kernel;
+barriers become \texttt{OpControlBarrier} with workgroup scope.  Predication
+requires structure: SPIR-V demands structured merges, so if--else regions
+emit \texttt{OpSelectionMerge} and \texttt{OpBranchConditional} with a
+single reconvergence point per divergent region.
+
+\paragraph{Intel/Level Zero.} The same SPIR-V path serves Intel through
+Level Zero, which compiles SPIR-V to the hardware ISA.
+
+\paragraph{Tenstorrent/TOSA.} CTX is lowered to TOSA MLIR and passed through
+Tenstorrent's TT-MLIR pipeline to a device binary.  Registers map to TOSA
+tensors (scalars become 0-dimensional tensors, 32-lane vectors become
+\texttt{tensor<32xf32>}); an unpredicated \texttt{FADD.F32} becomes
+\texttt{tosa.add} over 32-element tensors, and a predicated one becomes
+\texttt{tosa.add} under a \texttt{tosa.select}; global memory accesses
+become \texttt{tosa.gather}/\texttt{tosa.slice} by indexing pattern; shared
+memory uses MLIR memory-space attributes; and synchronization points are
+emitted as markers that the Tenstorrent lowering implements on the mesh.
+
+\subsection{Spatial Lowering}
+\label{sec:spatial}
+
+The fourth path does not lower to another processor at all: it spatializes
+the PTX-level instruction stream into statically scheduled \circt circuits.
+The positioning matters.  \sys spatialization is not HLS.  HLS starts from
+source whose loops, arrays, and types are still the author's abstractions,
+and its correctness target is source behavior after transformation.  The
+unit of work here is a PTX instruction under an active lane mask---by the
+time a kernel has passed through CUDA, LLVM, NVVM, and \texttt{ptxas}, the
+source abstraction is gone, and the compiler's job is to preserve what the
+binary-level SIMT program does, not to re-synthesize what a recovered C
+program might mean.  Table~\ref{tab:hls-diff} summarizes the contrast; the
+correctness target column is the substantive difference, and
+\S\ref{sec:formal} discharges it.
+
+\begin{table}[t]
+\centering
+\caption{Concordia spatialization compared with conventional HLS.}
+\label{tab:hls-diff}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.31\linewidth}p{0.33\linewidth}}
+\toprule
+Axis & Conventional HLS & \sys spatial path \\
+\midrule
+Input contract & Source C/C++ or DSL with loops, arrays, pragmas. &
+PTX virtual ISA with SIMT masks, state spaces, scopes, explicit
+synchronization. \\
+Scheduling unit & Source operations inside loop/control regions. &
+PTX instructions under an active-lane mask. \\
+Hardware use & Compiler infers datapath/control from source structure. &
+Compiler lays out a use sequence: load, ALU, shuffle, barrier, atomic,
+store. \\
+Memory facts & Supplied by source types, arrays, pragmas. & Recovered from
+address expressions, state spaces, memory-event labels. \\
+Correctness target & Source behavior after HLS transformations. & Trace
+refinement against legal PTX behavior. \\
+Fallback path & Designer rewrites source or adds pragmas. & Compiler cuts
+to tokenized memory/control while preserving PTX events. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Decoder and normalizer.} The front end of the spatial path parses
+PTX, builds a CFG, resolves labels, and converts register and predicate
+files to SSA.  Normalization makes four SIMT facts explicit: all predication
+becomes a guard input on the µop it controls; special-register reads
+(\texttt{\%tid.x}, \texttt{\%laneid}, \texttt{\%ctaid.x}) become pure µops
+parameterized by the launch configuration; state spaces are preserved as
+address-space attributes; and order/scope labels are attached to every load,
+store, atomic, and fence \emph{before} optimization.
+
+\paragraph{Region formation.} The compiler must decide where static
+schedules are safe.  Algorithm~\ref{alg:regions} is deliberately
+conservative: the CFG is cut at barriers, fences, ordered atomics, calls,
+unsupported operations, and unresolved inter-region memory effects, and each
+cut component becomes a warp region.  If-conversion of short divergent
+diamonds into mask-SSA hyperblocks is cost-driven---favored when both arms
+are short and side-effect-free or provably disjoint, avoided when an arm
+contains long-latency memory, atomics, barriers, or unspecializable loops.
+The semantic point is that the choice is local: either representation must
+preserve the same mask-value relation at the region exit.
+
+\begin{algorithm}[t]
+\caption{Region formation in the spatial path.}
+\label{alg:regions}
+\begin{algorithmic}[1]
+\STATE Build a PTX CFG after normalization and SSA conversion.
+\STATE Cut the CFG at barriers, fences, ordered atomics, calls,
+unsupported operations, and unresolved inter-region memory effects.
+\FOR{each cut component}
+  \STATE Form single-entry/single-exit warp regions.
+  \STATE If-convert short divergent diamonds into mask-SSA hyperblocks.
+  \STATE Keep large or irregular control as separate mask-token regions.
+  \STATE Mark memory-waiting boundaries for tokenized lowering.
+\ENDFOR
+\STATE Emit region interfaces containing masks, live values, memory
+phase, and token dependencies.
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Static-first SIMT scheduling.} The scheduling unit is the
+normalized PTX instruction string, not a recovered loop body.  Within a
+region, the compiler first preserves the program order each active lane
+observes; the initial schedule for a straight-line region is the identity
+schedule, which maps every µop to a concrete hardware use---arithmetic slot,
+predicate slot, permuter, scratchpad port, load-store issue slot, or token
+sequencer.  Optimization is then constrained compaction: two µops may share
+a cycle or pipeline only where SSA, predicate, memory-effect, and token
+edges allow.  The fallback schedule is therefore already a faithful
+hardware spelling of the PTX string, which also gives translation validation
+a one-to-one comparison at a fixed granularity.  Masks are part of the
+schedule, not a side condition: a scheduled stage has mask inputs, a masked
+lane is architecturally silent, and a predicated store depends on its
+predicate vector as a real operand.  A \texttt{shfl.sync} becomes one
+permuter use over a lane-packed vector and a participant mask---producing a
+value vector and a validity mask---rather than 32 scalarized lane
+controllers.
+
+\paragraph{Token islands.} Effects that must not be pretended static are
+isolated behind a small interface,
+\[
+  (m, v_0,\ldots,v_k, t_{in}) \rightarrow
+  (m', v'_0,\ldots,v'_j, t_{out}, E),
+\]
+where $E$ is the ordered summary of memory or synchronization events the
+island emits.  An island may take many target cycles but occupies a single
+source position in the region schedule.  Atomics are the simplest island: a
+backend without a matching scoped atomic serializes enabled lanes in a
+deterministic order, choosing one interleaving from the PTX behavior set
+rather than inventing a new one.  Barriers are islands with participant
+accounting: an epoch register, arrival bits, and a release condition that
+fires only when every required non-exited participant has arrived in the
+current phase.  Indexed or data-dependent memory is a third island: address
+computation stays lane-packed, but the sequencer emits per-lane events
+behind the token interface.
+
+\paragraph{CIRCT lowering.} Straight-line and regular pipelined regions
+lower to \texttt{pipeline.scheduled}; controllers, barriers, atomics,
+scratchpads, and loops needing non-unit initiation intervals lower directly
+to \texttt{hw}/\texttt{comb}/\texttt{seq}; irregular memory islands may
+lower through \texttt{handshake} or \texttt{dc}.  Table~\ref{tab:circt}
+summarizes the routes and their risks.  The division also serves
+validation: scheduled compute regions check by combinational or bounded
+equivalence after stage alignment, while barrier and FIFO controllers check
+better as bounded protocol properties.
+
+\begin{table}[t]
+\centering
+\caption{CIRCT lowering choices.}
+\label{tab:circt}
+\small
+\begin{tabular}{p{0.29\linewidth}p{0.32\linewidth}p{0.24\linewidth}}
+\toprule
+Route & Use & Risk \\
+\midrule
+\texttt{pipeline.scheduled} $\rightarrow$ HW & Regular fixed-stage
+regions & Awkward for custom backpressure. \\
+Direct \texttt{hw}/\texttt{seq} & Controllers, barriers, atomics,
+scratchpads & More code generation work. \\
+\texttt{handshake} $\rightarrow$ HW & Variable-latency memory islands &
+Dynamic overhead on regular code. \\
+\texttt{dc} $\rightarrow$ HW/ESI & Explicit token control & Additional
+lowering complexity. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{MemoryPlan: Static Streams vs.\ Tokenized Memory}
+\label{sec:memoryplan}
+
+Spatial efficiency normally wants address generators and stream FSMs, while
+PTX exposes per-thread address arithmetic.  \sys therefore treats streaming
+as a validated optimization, not the default memory lowering.  After
+lifting and region formation, a MemoryPlan groups memory events per region.
+A group becomes a static affine stream only when its address expression is a
+base plus an affine function of launch-specialized symbols---\texttt{\%tid},
+\texttt{\%ctaid}, lane id, loop induction, parameters, constants---and then
+lowers to an address-generation FSM plus a ready/valid path, with the proof
+obligation that emitted stream addresses, masks, kinds, orders, and scopes
+equal the source µop's memory events for every active lane.  Groups with
+dynamic inner indices (row pointers, gathers) become hybrid indexed streams:
+spatial phase controller, tokenized memory island.  If address recovery,
+alias checks, or ordering checks fail, the group stays opaque token memory.
+This matters for real workloads: captured Qwen prefill kernels contain
+regular outer control over non-affine inner indexing, and MemoryPlan is what
+keeps them compilable without pretending their memory is uniform.
+
+\subsection{JIT Specialization and Caching}
+\label{sec:jit}
+
+All four paths share one specialization discipline.  The JIT specializes on
+launch geometry, dynamic shared-memory size, constant kernel arguments,
+subgroup width, and backend resource profile, keyed by
+\[
+\kappa =
+(\mathrm{hash}(K),\lambda,\eta,H,\mathrm{PTXVersion},
+\mathrm{LLVM/CIRCTRevision}).
+\]
+Cold compilation runs decode, region formation (spatial path), scheduling,
+lowering, and validation; warm execution reuses the compiled artifact and
+replays only launch-time parameterization.  Version pinning is part of the
+key because PTX, NVVM IR, LLVM backends, and \circt dialects all evolve.
+For NVIDIA targets the runtime may also carry a native cubin in the CTX
+module as a fat-binary fallback, though the prototype relies on
+translation.
+
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
 
