@@ -404,6 +404,15 @@ representation the runtime checkpoints (\S\ref{sec:runtime}).
 \section{Compilation}
 \label{sec:compilation}
 
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{figs/hetgpu-arch.pdf}
+    \caption{The \sys software stack: one IR feeding four lowering paths
+    (PTX, SPIR-V, TOSA/TT-MLIR, CIRCT) behind a uniform runtime.}
+    \label{fig:sys}
+\end{figure}
+Figure~\ref{fig:sys} gives the system overview.
+
 \subsection{Front End}
 \label{sec:frontend}
 
@@ -1334,6 +1343,115 @@ where the fragment is representable, and a PTX interpreter oracle such as
 Ocelot for binary-only cases---integer outputs exact, floating point under
 documented tolerance, and racy kernels compared against the source behavior
 set rather than one interleaving.
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{GPU virtualization and API emulation.} rCUDA and VirtualCL
+forward API calls to remote or virtualized
+GPUs~\cite{pavlidakis2024scale,kato2012gdev}; gVirt virtualizes at the
+device level~\cite{gvim}; Cricket checkpoints CUDA applications via RPC.
+All assume NVIDIA hardware on both ends and stop short of translating
+execution to different architectures.  \sys generalizes the virtual GPU
+beyond a single vendor, and beyond GPUs to spatial fabrics.
+
+\paragraph{Binary translation and cross-ISA execution.} GPU Ocelot
+JIT-compiled PTX for non-NVIDIA hardware~\cite{diamos2010ocelot}; ZLUDA
+translates PTX through LLVM for AMD/Intel~\cite{zluda,janik_zluda}; CuPBoP
+retargets CUDA to CPU-style runtimes~\cite{huang2023cupbop}.  These systems
+demonstrate PTX's viability as a portable execution interface, and their
+coverage difficulties motivated designing an IR rather than translating
+PTX directly.  \sys differs in target and obligation: lowerings go to
+vendor GPU ISAs and to spatial circuits, correctness on the spatial path is
+stated against a PTX semantics, and live execution state is part of the
+contract.
+
+\paragraph{Portable IRs and compilers.} SPIR-V provides vendor-neutral
+ingest but no execution-state story; HSAIL saw limited adoption;
+SYCL/oneAPI compiles per target.  TVM and MLIR are compiler
+infrastructures, not runtimes~\cite{chen2018tvm,lattner2021mlir}: MLIR's
+GPU, NVVM, and ROCDL dialects model launch structure, thread/block IDs,
+barriers, and subgroup operations~\cite{mlir_gpu_dialect,
+mlir_nvvm_dialect,mlir_rocdl_dialect}, and \sys builds on that
+infrastructure---but neither ships a binary that runs across vendors or
+spatializes to hardware.  \sys's CTX offers GPU-level semantics (barriers,
+masks, thread indices, scopes) that LLVM IR does not carry, and couples
+them to a runtime.
+
+\paragraph{Spatial and HLS compilers.} Warp processing translated hot
+binary regions into FPGA circuits for scalar programs~\cite{vahid2008warp};
+Plasticine and Spatial demonstrate spatial architectures and
+hardware-centric source abstractions~\cite{prabhakar2017plasticine,
+koeplinger2018spatial}; ScaleHLS organizes HLS optimization in
+MLIR~\cite{ye2021scalehls}; DASS and Dynamatic explore the
+static/dynamic scheduling trade-off~\cite{cheng2022dass,
+josipovic2020dynamatic}.  \sys borrows the hybrid-scheduling lesson but
+changes the input level: PTX binaries rather than C/C++, DSLs, or high-level
+MLIR, with SIMT masks as first-class schedule inputs
+(\S\ref{sec:spatial}).  Research on warp emulation for non-SIMT
+hardware~\cite{bauer2014singe,wang2019ffgs} informs the execution-organization
+bridge.
+
+\paragraph{GPU semantics and verification.} Lustig et al.'s PTX memory-model
+analysis is the basis for treating PTX as a weak, scoped, non-DRF-only
+model~\cite{lustig2019ptxmemory}; GPUVerify checks source-level CUDA/OpenCL
+properties~\cite{donaldson2014gpuverify}; K-CIRCT demonstrates executable
+formal semantics for CIRCT subsets~\cite{zhao2024kcirct}; and CIRCT's
+\texttt{verif}/\texttt{smt} dialects, LEC, and BMC make region-wise
+translation validation practical~\cite{circt_verif,circt_tools,circt_bmc,
+circt_smt}.
+
+\paragraph{Checkpoint/restart and heterogeneous scheduling.} CRIUgpu and
+Cricket capture GPU state but restore only on identical
+hardware~\cite{lee2019gpusnapshot,nukada2023checkpoint}; cluster schedulers
+(Gandiva, Tiresias, Salus, Gavel) preempt at iteration boundaries within
+single-vendor pools~\cite{xiao2018gandiva,gu2019tiresias,yu2020salus,
+narayanan2020gavel}.  \sys's barrier-segment checkpointing with a
+device-neutral state representation enables cross-architecture restore,
+turning scheduler placement policies into live-migration operations.
+
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+\sys is fragment-based.  The correctness theorem excludes tensor-core
+instructions, asynchronous bulk copy, cluster-scope synchronization,
+textures and surfaces, dynamic parallelism, and inline target assembly, and
+it does not claim cycle accuracy against NVIDIA arbitration or preservation
+of every legal interleaving for racy programs---conservative alias analysis
+and atomic sequencing intentionally serialize legal behaviors.  On the
+systems side, checkpointing is cooperative (surprise preemption needs
+always-on instrumentation), migration data movement dominates downtime, the
+IR currently leaves vendor-specific features such as tensor cores
+unexploited, and migration targets GPU backends only: extending the same
+mask-SSA state serialization across spatial backends is the natural next
+step, since the front-end obligations largely coincide.  The spatial
+evidence is Verilator-level, not place-and-route; the Qwen corpus is a
+deterministic 40-trace sample, and the right future metric is end-to-end
+runtime coverage of accepted traces under a fixed serving configuration.
+Future work follows directly: tensor instructions and cluster barriers in
+the fragment; profile-guided region cloning; a mechanized µop semantics in
+the K-CIRCT style~\cite{zhao2024kcirct}; board-level memory-order validation
+on the CXL Type-2 shell, draining observed memory-command traces and
+checking them against the expected refinement edges; pre-copy and
+peer-to-peer migration paths; and hardware pause support to make
+checkpointing non-cooperative.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented \sys, a heterogeneous GPU IR designed to be lowered everywhere.
+Its lane-packed mask-SSA µops make SIMT execution semantics explicit once,
+so that a CUDA program compiled a single time can be JIT-translated to PTX,
+SPIR-V, or TOSA/TT-MLIR on NVIDIA, AMD, Intel, and Tenstorrent hardware,
+spatialized into statically scheduled \circt circuits under a
+trace-refinement guarantee, and migrated between backends mid-execution by
+a runtime that checkpoints device-neutral state at compiler-identified safe
+points.  The prototype runs unmodified binaries across all four vendor
+platforms with modest overhead, migrates kernels with seconds of downtime,
+and its spatial path is witnessed by a Verilator artifact executing real
+PTX instruction streams---five kernels and a 40-trace Qwen corpus---with
+zero mismatches.  One IR, every lowering: vendor GPUs today, spatial
+fabrics next.
 
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
