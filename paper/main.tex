@@ -227,8 +227,9 @@ which eases state capture but remains largely invisible to software.
 providing workgroup-scoped scratchpad memory, and code compiled via LLVM
 through HIP or OpenCL.  \textbf{Intel} GPUs expose subgroups of 8--32 lanes
 through SYCL/oneAPI or OpenCL, consume SPIR-V, and compile through Level
-Zero; integrated parts share coherent memory with the host, discrete parts do
-not.  \textbf{Tenstorrent}'s BlackHole departs from SIMT entirely: it is a
+Zero~\cite{spirv,levelzero}; integrated parts share coherent memory with the host, discrete parts do
+not.  \textbf{Tenstorrent}'s BlackHole departs from SIMT
+totally~\cite{tenstorrent}: it is a
 mesh of 120+ independent RISC-V Tensix cores, each with a 32-lane vector
 unit, private local memory, and explicit DMA for off-chip traffic.  Running a
 CUDA-style kernel on it requires either executing a warp on one core's vector
@@ -274,7 +275,8 @@ GPU idioms, and \S\ref{sec:formal} gives it precise semantics.
 \label{sec:existing}
 
 Source-level frameworks unify code, not binaries.  OpenCL and SPIR-V provide
-a standard ingest format, but SPIR-V is a static code representation
+a standard ingest format~\cite{spirv}, but SPIR-V is a static code
+representation
 targeting driver-side compilation; it encapsulates no execution state and
 leaves subgroup mapping vendor-specific.  HIP and SYCL/oneAPI ease
 maintaining one source tree, but every placement still compiles per vendor,
@@ -304,10 +306,50 @@ target.
 \section{The Concordia IR}
 \label{sec:ir}
 
+\begin{figure}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{2pt}
+\newcommand{\stackbox}[2]{\fcolorbox{black!60}{#1}{\parbox{0.955\columnwidth}{\centering #2}}}
+\newcommand{\pathbox}[2]{\fcolorbox{black!60}{black!12}{\parbox{0.222\columnwidth}{\centering #1\\#2}}}
+\begin{tabular}{c}
+\stackbox{black!5}{\textbf{CUDA application} (source or distributed PTX)}\\[1pt]
+$\downarrow$\\[1pt]
+\stackbox{black!5}{\textbf{\sys frontend}: CUDA via Clang/LLVM, or captured PTX $\rightarrow$ \textbf{CTX} assembly}\\[1pt]
+$\downarrow$\\[1pt]
+\stackbox{red!8}{\textbf{Concordia IR}: lane-packed mask-SSA µops --- active masks, state spaces,\\
+order/scope labels, warp collectives, tokens\ \,+\,\ state metadata (safe points, value maps)}\\[1pt]
+$\downarrow$\\[1pt]
+\begin{tabular}{cccc}
+\pathbox{CTX $\rightarrow$ PTX}{NVIDIA} &
+\pathbox{CTX $\rightarrow$ SPIR-V}{AMD / Intel} &
+\pathbox{CTX $\rightarrow$ TOSA}{Tenstorrent} &
+\pathbox{CTX $\rightarrow$ \circt}{spatial}\\
+\end{tabular}\\[1pt]
+$\downarrow$\\[1pt]
+\stackbox{black!5}{\textbf{Runtime}: launch \& JIT cache $\cdot$ memory $\cdot$ synchronization $\cdot$ SIMT$\leftrightarrow$MIMD bridge\\
+$\cdot$ cooperative checkpoint / live migration}\\[1pt]
+$\downarrow$\\[1pt]
+\begin{tabular}{ccccc}
+\pathbox{NVIDIA}{H100 (SIMT)} &
+\pathbox{AMD}{RX (wavefront)} &
+\pathbox{Intel}{Xe (subgroup)} &
+\pathbox{Tenstorrent}{BlackHole (MIMD)} &
+\fcolorbox{black!60}{white}{\parbox{0.148\columnwidth}{\centering \circt fabric\\(future)}}\\
+\end{tabular}
+\end{tabular}
+\caption{The \sys software stack: one IR feeding four lowering paths behind
+a uniform runtime.}
+\label{fig:sys}
+\end{figure}
+
 \subsection{Design Principles}
 \label{sec:ir-principles}
 
-The IR is designed around four principles.  \textbf{Capture GPU semantics,
+Figure~\ref{fig:sys} shows the stack: a CUDA application (or a captured PTX
+module) enters the frontend, becomes CTX, and the IR is lowered by one of
+four paths behind a uniform runtime.  The IR is designed around four
+principles.  \textbf{Capture GPU semantics,
 not vendor syntax.}  A kernel in the IR is an SPMD program over a grid of
 CTAs with explicit synchronization, explicit predication, and unified memory
 operations; the IR preserves what every vendor implements---grids, blocks,
@@ -389,7 +431,8 @@ model permits.
 \subsection{CTX: The Serialized Program Form}
 \label{sec:ir-ctx}
 
-The IR ships as \textbf{CTX}, a text assembly form with SSA virtual
+The IR ships as \textbf{CTX} (\textbf{C}oncordia \textbf{T}hread
+e\textbf{X}ecution), a text assembly form with SSA virtual
 registers (an effectively infinite set; backends allocate physical
 registers), PTX-like directives, and inline annotations.  Text was chosen for
 debuggability and late binding: a CTX module is inspectable, diffable, and
@@ -403,15 +446,6 @@ representation the runtime checkpoints (\S\ref{sec:runtime}).
 
 \section{Compilation}
 \label{sec:compilation}
-
-\begin{figure}[t]
-    \centering
-    \includegraphics[width=\columnwidth]{figs/hetgpu-arch.pdf}
-    \caption{The \sys software stack: one IR feeding four lowering paths
-    (PTX, SPIR-V, TOSA/TT-MLIR, CIRCT) behind a uniform runtime.}
-    \label{fig:sys}
-\end{figure}
-Figure~\ref{fig:sys} gives the system overview.
 
 \subsection{Front End}
 \label{sec:frontend}
@@ -1021,11 +1055,12 @@ Metalium).
 \subsection{Portability and Correctness}
 \label{sec:eval-portability}
 
-A single CTX binary containing ten kernels---vector addition, SAXPY, tiled
-matrix multiplication, reduction, inclusive scan with warp shuffle, warp-vote
-bitcount, Monte Carlo $\pi$ with divergence and atomics, and a small
-neural-network layer---runs unmodified on all four platforms with outputs
-matching known-correct references.  Two kernels exercised emulation paths:
+A single CTX binary with a ten-kernel suite---including vector addition,
+SAXPY, tiled ($16\times16$ shared-memory tiles) matrix multiplication,
+reduction, inclusive scan with warp shuffle, warp-vote bitcount, Monte Carlo
+$\pi$ with divergence and atomics, and a small neural-network layer---runs
+unmodified on all four platforms with outputs matching known-correct
+references.  Two kernels exercised emulation paths:
 the scan's shuffle used a \texttt{VOTE\_ANY}-based loop where
 \texttt{SHUFFLE} was not yet implemented, and \texttt{atomicAdd} on
 Tenstorrent used a global-memory spin lock.  Compiling from CUDA source and
@@ -1066,25 +1101,29 @@ Figure~\ref{fig:combined} reports microbenchmark timings.  Vector add
 JIT, 0.11\,ms cached; on the 9070 XT 0.14\,ms native vs.\ 0.16\,ms; Iris Xe
 0.70\,ms vs.\ 0.72\,ms; Tenstorrent 0.95\,ms vs.\ 0.72\,ms for a
 hand-optimized Metalium version, the gap being synchronous DMA in our
-prototype.  Matrix multiply ($1024^2$, 4\,096 blocks of 256 threads): H100
-\texttt{cublas} peaks near 9\,TFLOPs on tensor cores, native CUDA without
-tensor cores reaches $\sim$3.8\,TFLOPs, \sys 3.5\,TFLOPs ($<$8\% overhead);
-\texttt{hipBLAS} $\sim$7\,TFLOPs vs.\ \sys $\sim$3.3\,TFLOPs ($<$6\% over
-the equivalent HIP kernel); Tenstorrent reaches $\sim$80\% of its optimized
-kernel.  Reduction (1\,M): 0.16\,ms vs.\ 0.17\,ms (NVIDIA), 0.18\,ms vs.\
+prototype.  Matrix multiply ($1024^2$, 4\,096 blocks of 256 threads): on
+H100, \texttt{cublas} peaks near 9\,TFLOPs on tensor cores, native CUDA
+without tensor cores reaches $\sim$3.8\,TFLOPs, and \sys 3.5\,TFLOPs
+($<$8\% overhead); on AMD, \texttt{hipBLAS} reaches $\sim$7\,TFLOPs on
+matrix cores, the equivalent native HIP kernel 3.5\,TFLOPs, and \sys
+$\sim$3.3\,TFLOPs ($<$6\% over the HIP kernel); on Tenstorrent, \sys
+reaches $\sim$80\% of its hand-optimized kernel.  Reduction (1\,M):
+0.16\,ms vs.\ 0.17\,ms (NVIDIA), 0.18\,ms vs.\
 0.20\,ms (AMD), 0.71\,ms vs.\ 0.73\,ms (Intel), 1.4\,ms (Tenstorrent)---
 overheads of 5--15\%.  The divergent Monte Carlo $\pi$ kernel shows the
 execution-organization bridge at work: on Tenstorrent, independent-thread
 (MIMD) mode across 120 cores reaches $\sim$25\,M points/s while vectorized
 warp mode reaches $\sim$18\,M, so the runtime's per-kernel mode selection
-matters for irregular kernels; on NVIDIA and AMD the overhead is under
-2\%.
+matters for irregular kernels.  Elsewhere the overhead is 1.3\% on NVIDIA
+($\sim$150\,M vs.\ 148\,M points/s), $\sim$4\% on AMD (140\,M vs.\ 135\,M),
+and on Intel \sys reaches $\sim$25\,M points/s against 10\,M for the native
+OpenCL baseline, whose divergent-kernel path underperforms here.
 
 First-execution JIT translation takes 50--100\,ms for nontrivial kernels
 on NVIDIA (PTX$\rightarrow$SASS via \texttt{ptxas}), 100--200\,ms on AMD
 (LLVM$\rightarrow$GCN), $\sim$80\,ms on Intel (SPIR-V), and $\sim$30\,ms on
-Tenstorrent (TT-MLIR)---Figure~\ref{fig:jit}---acceptable for long-running
-programs and amortizable by precompilation.  The abstraction layer adds
+Tenstorrent (TT-MLIR), as Figure~\ref{fig:jit} shows---acceptable for
+long-running programs and amortizable by precompilation.  The abstraction layer adds
 negligible overhead to memory operations (microseconds on synchronous
 calls).
 
