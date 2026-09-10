@@ -206,6 +206,100 @@ paths (\S\ref{sec:compilation}), and its correctness theory
 (\S\ref{sec:eval}), and discusses related work and limitations
 (\S\ref{sec:related}--\S\ref{sec:limitations}).
 
+\section{Background and Motivation}
+\label{sec:background}
+
+\subsection{A Landscape of Execution Organizations}
+\label{sec:vendors}
+
+GPUs from different vendors share the goal of massively parallel execution
+but implement it with different architectural
+philosophies~\cite{diamos2010ocelot,huang2023cupbop}.
+\textbf{NVIDIA} GPUs organize execution as Streaming Multiprocessors running
+warps of 32 lanes in lockstep SIMT, with divergence handled by masking until
+reconvergence; CUDA compiles through the PTX virtual ISA to SASS, and memory
+is a hierarchy of per-thread registers, CTA-scoped shared memory, and device
+global memory whose consistency is ensured at synchronization points.  Since
+Volta, independent thread scheduling gives each lane its own program counter,
+which eases state capture but remains largely invisible to software.
+\textbf{AMD} GPUs are structurally similar: Compute Units schedule wavefronts
+(histories of 64 lanes on GCN, 32 on RDNA) in lockstep, with Local Data Share
+providing workgroup-scoped scratchpad memory, and code compiled via LLVM
+through HIP or OpenCL.  \textbf{Intel} GPUs expose subgroups of 8--32 lanes
+through SYCL/oneAPI or OpenCL, consume SPIR-V, and compile through Level
+Zero; integrated parts share coherent memory with the host, discrete parts do
+not.  \textbf{Tenstorrent}'s BlackHole departs from SIMT entirely: it is a
+mesh of 120+ independent RISC-V Tensix cores, each with a 32-lane vector
+unit, private local memory, and explicit DMA for off-chip traffic.  Running a
+CUDA-style kernel on it requires either executing a warp on one core's vector
+lanes under explicit masks, or partitioning a block across cores with explicit
+inter-core synchronization---an execution-organization bridge any portable
+substrate must build.  These four organizations differ in warp width, memory
+hierarchy, scope lattices, and scheduling model; they agree, roughly, on the
+CUDA programming model's grid/block/thread semantics, which is the level our
+IR preserves.
+
+\subsection{PTX as a Structured Binary Interface}
+\label{sec:ptx-interface}
+
+PTX is a virtual ISA for parallel thread execution, traditionally consumed by
+NVIDIA's driver JIT, but its exposed abstractions are much richer than those
+of a scalar processor binary~\cite{nvidia_ptx_isa_93,nvidia_cuda_platform}.
+PTX kernels launch over a grid of CTAs; threads are identified through
+special registers; and each instruction executes in the context of a lane and,
+operationally, a warp.  Named state spaces separate per-thread registers,
+CTA-shared memory, thread-local memory, launch parameters, and device global
+memory.  Several PTX features matter directly to any consumer of GPU
+binaries.  Predication makes if-conversion a native idiom rather than a
+recovery pass.  Branch divergence is defined at the SIMT control level, so
+inactive lanes must be represented, not silently discarded.  \texttt{bar.sync}
+defines CTA-level phase boundaries; \texttt{membar}-style operations define
+scoped memory-ordering constraints; \texttt{atom.*} operations emit ordered
+read-modify-write events; and warp collectives such as \texttt{shfl.sync}
+communicate between lanes under an explicit participant mask.  A consumer
+that erases this structure---as LLVM-level lowering tends to do---must later
+recover it or get the semantics wrong.
+
+PTX also contains features no compiler should quietly claim to support:
+cluster memory, asynchronous bulk-copy families, tensor instructions,
+texture/surface legacy spaces, and architecture-dependent
+extensions~\cite{nvidia_ptx_isa_93}.  A defensible treatment is a stated
+fragment---arithmetic, predication, branches, special-register reads, loads
+and stores across the five state spaces, \texttt{bar.sync}, scoped fences,
+atomics, and \texttt{shfl.sync}---with unsupported features rejected up
+front.  This fragment is small enough to specify and rich enough for common
+GPU idioms, and \S\ref{sec:formal} gives it precise semantics.
+
+\subsection{Existing Portability Paths and Why They Fall Short}
+\label{sec:existing}
+
+Source-level frameworks unify code, not binaries.  OpenCL and SPIR-V provide
+a standard ingest format, but SPIR-V is a static code representation
+targeting driver-side compilation; it encapsulates no execution state and
+leaves subgroup mapping vendor-specific.  HIP and SYCL/oneAPI ease
+maintaining one source tree, but every placement still compiles per vendor,
+and binary-only dependencies do not port.  Virtualization and checkpoint
+tools decouple applications from physical devices---rCUDA forwards API calls
+to remote GPUs, Cricket checkpoints CUDA via RPC, CRIUgpu dumps driver
+state---but all assume NVIDIA hardware on both ends, treating the GPU as a
+device to freeze and restore on identical silicon~\cite{kato2012gdev}.
+Binary translation systems are closest in spirit: GPU Ocelot JIT-compiled
+PTX for non-NVIDIA hardware~\cite{diamos2010ocelot}, and ZLUDA translates
+PTX through LLVM for AMD/Intel GPUs~\cite{zluda}; CuPBoP retargets CUDA to
+CPU-style parallel runtimes~\cite{huang2023cupbop}.  These systems
+demonstrate that PTX can serve as a portable execution interface, but they
+translate it to another \emph{processor} runtime: none lower GPU binaries to
+spatial hardware, none design the IR to avoid direct-translation pitfalls,
+and none couple binary portability with live migration of running state.
+
+The gap is thus twofold.  No existing system provides binary-level
+portability across NVIDIA, AMD, Intel, and Tenstorrent with live state
+migration; and no system treats PTX-level GPU semantics as a binary-level
+interface to spatial hardware.  \sys addresses both from one IR: the
+portability substrate of a virtualized GPU binary, with execution semantics
+kept explicit enough that a spatial fabric can be just another lowering
+target.
+
 
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
