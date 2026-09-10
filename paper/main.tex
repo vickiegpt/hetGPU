@@ -301,6 +301,106 @@ kept explicit enough that a spatial fabric can be just another lowering
 target.
 
 
+\section{The Concordia IR}
+\label{sec:ir}
+
+\subsection{Design Principles}
+\label{sec:ir-principles}
+
+The IR is designed around four principles.  \textbf{Capture GPU semantics,
+not vendor syntax.}  A kernel in the IR is an SPMD program over a grid of
+CTAs with explicit synchronization, explicit predication, and unified memory
+operations; the IR preserves what every vendor implements---grids, blocks,
+threads, barriers, state spaces---and abstracts what only one vendor spells a
+particular way.  \textbf{Make SIMT execution explicit.}  Every value is a
+lane-packed vector paired with an active-lane mask.  Divergence, predication,
+and warp collectives are IR constructs, so no lowering path starts from a
+representation in which SIMT facts have been lost and must be recovered.
+\textbf{Carry memory semantics from the front end.}  State spaces, memory
+orders, and scopes are attached to memory operations when the IR is created
+and are never erased by optimization; backends consume these labels rather
+than re-deriving them from address arithmetic.  \textbf{Expose state, not
+just code.}  The IR travels with metadata naming safe suspension points and
+mapping IR values to a device-neutral state representation, making
+checkpointing and migration runtime capabilities rather than per-backend
+reverse-engineering projects.
+
+\subsection{Structure: Lane-Packed Mask-SSA Micro-Operations}
+\label{sec:ir-uops}
+
+The IR's value representation has three types,
+\[
+  \texttt{vec}\langle W,\tau\rangle,\qquad
+  \texttt{mask}\langle W\rangle,\qquad
+  \texttt{token},
+\]
+where $W$ is the warp width of the region.  A \emph{compute µop} consumes
+lane-packed vectors and a mask and produces a lane-packed vector.  A
+\emph{control µop} consumes and produces masks or tokens.  A \emph{memory
+µop} carries address space, order, scope, access width, and coalescing
+metadata on top of its data operands.  The IR provides explicit nodes for
+\texttt{split}, \texttt{merge}, \texttt{barrier}, \texttt{fence},
+\texttt{atomic}, \texttt{shuffle}, \texttt{load}, and \texttt{store}; the
+only PTX-specific names that survive are semantic attributes such as state
+space, scope, and special-register identity.
+
+The representation choice follows from SIMT semantics.  Scalar per-lane SSA
+is precise but explodes graph size and hides warp collectives behind dozens
+of identical scalar operations; plain lane-packed vector SSA is compact but
+cannot represent divergence or inactive lanes.  Lane-packed \emph{mask}-SSA
+matches predication, divergence, and \texttt{shfl.sync} directly, at the
+cost of precise mask merge/split invariants; where effects must not be
+reordered---barriers, fences, ordered atomics, long-latency memory---the IR
+adds explicit \texttt{token} values so that scheduling can never move an
+effect across its boundary.
+
+The invariant that makes this representation sound is the \emph{mask-value
+invariant}: on every live data edge, the value is a pair $(m, v)$ of an
+active mask and a lane-packed vector, where for every lane $\ell$ with
+$m[\ell]=1$, $v[\ell]$ equals the PTX value held by lane $\ell$ at the
+corresponding program point, and for $m[\ell]=0$, $v[\ell]$ is
+unconstrained.  A lane outside the mask cannot update a live output, issue a
+memory event, or arrive at a barrier.  \S\ref{sec:formal} makes this
+invariant precise and builds the correctness theorem on it.
+
+\subsection{The Memory and Synchronization Contract}
+\label{sec:ir-memory}
+
+Every memory µop names its state space---\texttt{global},
+\texttt{shared}, \texttt{local}, \texttt{const}, or \texttt{param}---as an
+address-space attribute rather than a flat pointer, and carries a memory
+order in \{$\mathsf{weak}$, $\mathsf{relaxed}$, $\mathsf{acquire}$,
+$\mathsf{release}$, $\mathsf{acq\_rel}$, $\mathsf{sc}$\} and a scope in
+\{$\mathsf{cta}$, $\mathsf{gpu}$, $\mathsf{sys}$\}.  Barriers are CTA-level
+phase events: the IR models arrival and release as separate effects so that
+no backend can let a lane pass a barrier its phase has not reached.  Shuffle
+µops produce their value vector \emph{and} a validity mask, making the
+PTX rule explicit that a shuffle whose source lane is outside the participant
+set yields an unconstrained value.
+
+These labels constitute a contract each backend must implement and be
+checked against.  On the GPU paths, the labels map onto vendor memory-model
+documented behavior (address spaces and scopes for PTX, ROCm, and SPIR-V).
+On the spatial path, the labels become events in the refinement theorem's
+backend memory contract $B$: a lowering may serialize or delay labeled
+effects, but it may not drop or reorder them outside what the PTX memory
+model permits.
+
+\subsection{CTX: The Serialized Program Form}
+\label{sec:ir-ctx}
+
+The IR ships as \textbf{CTX}, a text assembly form with SSA virtual
+registers (an effectively infinite set; backends allocate physical
+registers), PTX-like directives, and inline annotations.  Text was chosen for
+debuggability and late binding: a CTX module is inspectable, diffable, and
+decoupled from any vendor's object format.  Kernels are identified by a
+compile-time identifier so the runtime's JIT cache can key translated
+artifacts per device (\S\ref{sec:compilation}).  Two kinds of annotation
+matter for state.  Every barrier and kernel exit is a labeled \emph{safe
+suspension point}; and a DWARF-style map links live virtual registers,
+program-counter positions, and active masks to the device-neutral snapshot
+representation the runtime checkpoints (\S\ref{sec:runtime}).
+
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
 
