@@ -645,6 +645,246 @@ For NVIDIA targets the runtime may also carry a native cubin in the CTX
 module as a fat-binary fallback, though the prototype relies on
 translation.
 
+\section{Formal Correctness}
+\label{sec:formal}
+
+The refinement theorem of this section grounds the spatial path of
+\S\ref{sec:spatial}: every externally visible behavior of the emitted
+circuit must be a legal PTX behavior of the source kernel.  The GPU JIT
+paths are held to the same functional standard by differential testing
+against vendor baselines (\S\ref{sec:eval}).  The intent here is not to
+formalize all of PTX but to define a fragment precise enough for the theorem
+and small enough for translation validation.
+
+\subsection{Source Fragment}
+\label{sec:fragment}
+
+Figure~\ref{fig:ptx-core} sketches the PTX core.  It contains scalar integer
+and floating-point types, predicates, the five named address spaces, scoped
+memory orderings, predicated instructions, branches, barriers, fences,
+atomics, and warp shuffles.  It excludes tensor instructions, textures and
+surfaces, dynamic parallelism, cluster-scope operations, asynchronous copy
+families, inline target assembly, and driver-defined environment registers.
+
+\begin{figure}[t]
+\begin{lstlisting}
+t    ::= pred | i1 | i8 | i16 | i32 | i64 | f16 | f32 | f64
+as   ::= global | shared | local | const | param
+ord  ::= weak | relaxed | acquire | release | acq_rel | sc
+scp  ::= cta | gpu | sys
+
+i ::= mov x, y
+    | ld.as.ord.scp x, [a]
+    | st.as.ord.scp [a], x
+    | atom.as.op.ord.scp x, [a], y
+    | setp q, cmp, x, y
+    | selp x, y, z, q
+    | @q i
+    | bra L
+    | shfl.sync mode, d, a, b, c, membermask
+    | bar.sync n
+    | membar.scp
+    | exit
+\end{lstlisting}
+\caption{The PTX core supported by \sys.}
+\label{fig:ptx-core}
+\end{figure}
+
+The well-formedness judgment rejects unsupported features and PTX undefined
+behaviors that would make the theorem vacuous: every dynamic
+\texttt{bar.sync} instance must be reached convergently by its participating
+non-exited threads; a shuffle source lane must be active whenever the
+returned value is used without checking the validity predicate; and
+address-space casts must preserve state-space provenance.
+
+\subsection{Source Semantics}
+\label{sec:source-sem}
+
+For a CTA, the source machine state is
+\[
+  \Sigma =
+  \langle
+    M_g, M_s,
+    M_l,
+    (R_\ell,P_\ell,pc_\ell,alive_\ell)_{\ell<|T|},
+    \mathsf{Bar},
+    \mathsf{WarpCtl}
+  \rangle ,
+\]
+with $M_g$ global memory, $M_s$ CTA shared memory, $M_l$ per-thread local
+memory, per-lane register/predicate files $R_\ell, P_\ell$, program counters
+$pc_\ell$, liveness flags $alive_\ell$, barrier phase state $\mathsf{Bar}$,
+and per-warp active masks and reconvergence stacks $\mathsf{WarpCtl}$.
+Parameter and constant spaces are immutable launch-supplied maps.  The
+transition relation
+$K,\lambda \vdash \Sigma \xrightarrow{\alpha} \Sigma'$
+executes the instruction at a warp's active program counter; $\alpha$ is
+either silent, a vector of memory events, or a control event (barrier
+arrival, exit).  Let $A_w$ be warp $w$'s active mask; a predicated
+instruction $@p\,i$ has enabled lanes
+$E = \{\ell \in A_w \mid alive_\ell \wedge P_\ell(p)=1\}$, and lanes in
+$A_w \setminus E$ advance without changing destination state.
+
+Memory instructions emit events
+$e = \langle \mathit{cta}, \mathit{tid}, \mathit{kind}, \mathit{as},
+\mathit{addr}, \mathit{val}, \mathit{ord}, \mathit{scope} \rangle$, and
+$\mathrm{Obs}_{\mathrm{PTX}}(K,\lambda)$ is the set of event traces
+consistent with PTX control semantics and the PTX memory axioms.  The
+event-trace view is required because PTX is weakly ordered and scoped and
+does not require data-race freedom for a program to have
+meaning~\cite{lustig2019ptxmemory}.
+
+Two rules illustrate the style.  Arithmetic and moves are lane-wise:
+\[
+\frac{
+  i = x \leftarrow f(y_1,\ldots,y_k)
+  \qquad
+  v_\ell = f(R_\ell(y_1),\ldots,R_\ell(y_k))
+}{
+  K,\lambda \vdash \Sigma
+  \xrightarrow{\epsilon}
+  \Sigma[
+    R_\ell(x) := v_\ell,\ pc_\ell := pc_\ell+1
+  ]_{\ell\in E}
+}
+\]
+with predicate-disabled lanes leaving state unchanged, and lanes outside
+$A_w$ suspended until their reconvergence frame resumes.  Loads emit one
+read event per enabled lane and constrain the loaded value to one allowed by
+the PTX memory model:
+\[
+\frac{
+  a_\ell = R_\ell(a)
+  \qquad
+  e_\ell=\langle cta,tid_\ell,\mathsf{rd},as,a_\ell,v_\ell,ord,scp\rangle
+}{
+  K,\lambda \vdash \Sigma
+  \xrightarrow{(e_\ell)_{\ell\in E}}
+  \Sigma[R_\ell(x):=v_\ell,\ pc_\ell:=pc_\ell+1]_{\ell\in E}
+}
+\]
+Stores and atomics are analogous (write and read-modify-write events per
+enabled lane, the atomic's old value written to the destination); fences
+emit scope-labelled fence events and change no registers.  Divergent
+branches partition $A_w$ into taken and fall-through masks under a
+reconvergence frame, in either order, preserving per-lane program order.
+\texttt{shfl.sync}, \texttt{vote}, and \texttt{redux.sync} operate on the
+intersection of $A_w$, the member mask, and non-exited lanes; a shuffle
+whose source lane is outside the participant set yields an unconstrained
+value with a false validity predicate, and well-formed programs use such a
+value only under that predicate.  \texttt{bar.sync} is a CTA phase rule:
+lanes record the current barrier epoch in $\mathsf{Bar}[b]$ and block; the
+barrier releases only when the required participants for that dynamic
+instance have arrived in the same epoch.  \texttt{exit} clears
+$alive_\ell$.
+
+\subsection{The µop Machine and the Target Circuit}
+\label{sec:uop-sem}
+
+The IR-side state mirrors the source but over explicit masks and tokens:
+\[
+  \Omega =
+  \langle
+    V, M_g, M_s, M_l, \mathsf{Tok}, \mathsf{BarT},
+    \mathsf{Ready}, cycle
+  \rangle ,
+\]
+where $V$ maps each µop result to a pair $(m,v)$ obeying the mask-value
+invariant of \S\ref{sec:ir-uops}.  A pure µop fires when its data,
+predicate, memory, and control dependencies are in $\mathsf{Ready}$,
+evaluates its mask and value lane-wise, and leaves lanes outside its mask as
+dead-lane don't-cares.  Memory µops emit the same event kind, state space,
+order, and scope as their source rules; atomics and fences are hard region
+cuts, so no schedule may move memory effects across them without an explicit
+dependency.  Shuffle and collective µops use the same participant-set rule
+as the source machine over the explicit input mask, and barrier µops inherit
+the epoch discipline of $\mathsf{Bar}$ through $\mathsf{BarT}$: no token
+leaves a barrier region until the dynamic participant count for the epoch
+has arrived.  Control µops update tokens and masks; a short branch may be
+represented either as mask-SSA select/merge or as tokenized control, and
+both must produce the same exit mask and live values.
+
+The target is a synchronous transition system
+$C = \langle S_C, I_C, O_C, \delta_C, \lambda_C \rangle$ whose state
+comprises pipeline and mask registers, control-token state, barrier
+counters, pending memory transactions, and scratchpads.  Each compiled
+region is a µop graph
+$G_r = (U_r, E_r^{data} \cup E_r^{ctrl} \cup E_r^{mem})$ with schedule
+$\sigma_r : U_r \rightarrow \mathbb{N}$ and placement
+$\pi_r : U_r \rightarrow R_H$ subject to dependence constraints
+($\sigma_r(v)-\sigma_r(u) \geq \mathrm{lat}(u)$ for every edge
+$u \rightarrow v$) and resource constraints
+($|\{u \mid \pi_r(u)=q \wedge \sigma_r(u)=t\}| \leq \mathrm{cap}(q)$).
+Static scheduling does not require compile-time completion cycles:
+scheduled regions stall on memory backpressure or token boundaries, and
+stalls are stuttering steps.
+
+\subsection{Correctness}
+\label{sec:correctness}
+
+The simulation relation is built on the mask-value invariant: masked lanes
+carry PTX values, unmasked lanes are unconstrained, and unconstrained
+components cannot influence subsequent well-formed instructions because
+later uses are masked by the reconverged active mask.
+
+\begin{lemma}[Mask-$\phi$]
+\label{lem:maskphi}
+Suppose a branch splits mask $m$ into disjoint masks $m_1$ and $m_2$,
+computes $x_1$ under $m_1$ and $x_2$ under $m_2$, and emits
+$x = \mathrm{merge}(m_1:x_1,m_2:x_2)$.  For every live lane $\ell$,
+$x[\ell]$ equals the PTX value selected at the reconvergence point.
+\end{lemma}
+
+\begin{theorem}[Trace refinement]
+\label{thm:refinement}
+Let $K$ be a well-defined kernel in the supported fragment, $\lambda$ a
+legal launch, $\eta$ a specialization environment, $H$ a spatial backend
+profile, and $B$ a backend memory contract.  Assume:
+\begin{enumerate}
+  \item $K$ contains no unsupported PTX feature.
+  \item $K$ does not execute a fragment-excluded undefined behavior.
+  \item Register, predicate, and memory alias analyses are conservative.
+  \item $B$ preserves the order and scope labels of emitted atomic and
+  fence events.
+  \item CTA scheduling by the runtime is fair.
+\end{enumerate}
+If $C=\mathcal{T}(K,\lambda,\eta,H,B)$, then
+\[
+  \pi(\mathrm{Traces}(C)) \subseteq
+  \mathrm{Obs}_{\mathrm{PTX}}(K,\lambda),
+\]
+where $\pi$ erases cycle counts, ready/valid handshakes, internal tokens,
+and other non-observable circuit details.
+\end{theorem}
+
+\noindent
+The proof is a forward simulation up to stuttering.  Lifting maps each
+source rule to a µop rule with the same enabled mask, value update, and
+memory-event label; region formation cuts at barriers, fences, atomics,
+calls, and unsupported operations, so local transformations cannot cross
+semantic phase boundaries; static scheduling preserves the partial order of
+data, control, and memory dependences, and scheduled stalls are stuttering
+steps erased by $\pi$.  Barrier templates preserve phase separation because
+a token cannot leave a barrier until the required participants have arrived
+in the current phase; atomics and fences preserve PTX event labels by
+assumption $B$; and conservative alias edges may serialize legal PTX
+behaviors but cannot introduce illegal ones.  Replicating or
+time-multiplexing CTA engines corresponds to choosing one legal CTA
+interleaving.
+
+\begin{corollary}[Deterministic kernels]
+\label{cor:deterministic}
+If $K$ is deterministic under the PTX memory model---for example because it
+is single-CTA, or scope-race-free with explicit synchronization---then $C$
+and $K$ produce identical final host-visible memory states and kernel
+outputs.
+\end{corollary}
+
+The corollary is the user-facing result for common GPU kernels.  The general
+theorem remains a refinement because PTX gives meaning to racy programs and
+because a conservative spatial compiler may deliberately choose a subset of
+legal source interleavings.
+
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
 
